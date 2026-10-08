@@ -8,7 +8,7 @@ import ScrapingWarning from "/snippets/web-scraping-warning.mdx";
 
 ## Overview
 
-[Apify](https://apify.com) is a platform for web scraping and browser automation. Its [Apify Store](https://apify.com/store) has thousands of ready-made scrapers, called Actors, for sites like Google Maps, Amazon and Instagram. Actors run on Apify's infrastructure and proxies, so your task sends one API call instead of scraping from Trigger.dev's servers.
+[Apify](https://apify.com) is a platform for web scraping and browser automation. Its [Apify Store](https://apify.com/store) has thousands of ready-made scrapers, called Actors, for sites like Google Maps, Amazon and Instagram. Actors run on Apify's infrastructure and proxies, so your task calls the Apify API instead of scraping from Trigger.dev's servers.
 
 Here are two ways to run an Actor from a Trigger.dev task:
 
@@ -206,7 +206,7 @@ Trigger the task from the Trigger.dev dashboard with the same payload as Example
 
 <Note>
   Cancelling a Trigger.dev run doesn't stop the Actor run it started. Abort the Actor run in
-  [Apify Console](https://console.apify.com) or with `apify.run(runId).abort()`.
+  [Apify Console](https://console.apify.com?utm_source=trigger.dev&utm_medium=integrations) or with `apify.run(runId).abort()`.
 </Note>
 
 ## Learn more
