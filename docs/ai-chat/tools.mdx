@@ -184,6 +184,150 @@ const messages = await convertToModelMessages(uiMessages, {
 return streamText({ model: anthropic("claude-sonnet-4-5"), messages, tools });
 ```
 
+## Example: web scraping tools with Apify
+
+This agent finds a scraper in the [Apify Store](https://apify.com/store), reads its input schema, and runs it after the user approves. The tools use the Apify client and the `apify-long-actor-run` task from the [Apify Actor run example](/guides/examples/apify-actor-run), so set that up first, including the `APIFY_TOKEN` environment variable.
+
+```ts trigger/apify-tools.ts
+import { tool } from "ai";
+import { z } from "zod";
+import { apify } from "./apify";
+import { apifyLongActorRun } from "./apify-long-actor-run";
+
+export const searchApifyActors = tool({
+  description:
+    "Search the Apify Store for a pre-built scraper (Actor) that can extract data " +
+    "from a specific website or platform. Use this before running an Actor when you " +
+    "don't already know which one to use.",
+  inputSchema: z.object({
+    query: z.string().describe('What to scrape, e.g. "google maps reviews"'),
+    limit: z.number().int().min(1).max(10).default(5),
+  }),
+  execute: async ({ query, limit }) => {
+    const { items } = await apify.store().list({ search: query, limit });
+
+    return items.map((actor) => ({
+      actorId: `${actor.username}/${actor.name}`,
+      title: actor.title,
+      description: actor.description,
+      monthlyUsers: actor.stats?.totalUsers30Days,
+      pricing: actor.currentPricingInfo?.pricingModel,
+    }));
+  },
+});
+
+type ActorInputSchema = {
+  required?: string[];
+  properties?: Record<
+    string,
+    { type?: string; title?: string; description?: string; default?: unknown; prefill?: unknown; enum?: unknown[] }
+  >;
+};
+
+export const getApifyActorInputSchema = tool({
+  description:
+    "Get the input fields an Apify Actor accepts. Call this before runApifyActor " +
+    "so the input matches the Actor's schema.",
+  inputSchema: z.object({
+    actorId: z.string().describe('Actor ID, e.g. "apify/website-content-crawler"'),
+  }),
+  execute: async ({ actorId }) => {
+    const build = await (await apify.actor(actorId).defaultBuild()).get();
+    const schema = build?.actorDefinition?.input as ActorInputSchema | undefined;
+
+    // Full schemas can be tens of kilobytes; descriptions are cut to keep the context small
+    const properties = Object.fromEntries(
+      Object.entries(schema?.properties ?? {}).map(([name, field]) => [
+        name,
+        {
+          type: field.type,
+          description: (field.description ?? field.title)?.slice(0, 200),
+          default: field.default,
+          prefill: field.prefill,
+          enum: field.enum,
+        },
+      ]),
+    );
+
+    return { required: schema?.required ?? [], properties };
+  },
+});
+
+async function runActor(actorId: string, input: Record<string, unknown>) {
+  const result = await apifyLongActorRun.triggerAndWait({ actorId, input });
+
+  if (!result.ok) {
+    return { error: `Actor run failed: ${result.error}` };
+  }
+
+  return {
+    itemCount: result.output.items.length,
+    datasetId: result.output.datasetId,
+    items: result.output.items.slice(0, 50),
+    truncated: result.output.items.length > 50,
+  };
+}
+
+// The AI SDK runs approved tool calls in parallel, but a task can only wait on one subtask at a time
+let runQueue: Promise<unknown> = Promise.resolve();
+
+export const runApifyActor = tool({
+  description:
+    "Run an Apify Actor to scrape structured data from the web. Apify executes on " +
+    "its own infrastructure and IP pool. Returns the scraped dataset.",
+  inputSchema: z.object({
+    actorId: z.string().describe('Actor ID, e.g. "apify/website-content-crawler"'),
+    input: z.record(z.string(), z.unknown()).describe("Actor input object, per its input schema"),
+  }),
+  needsApproval: true, // scrapes cost money; drop for fully autonomous agents
+  execute: ({ actorId, input }) => {
+    const run = runQueue.then(() => runActor(actorId, input));
+    runQueue = run.catch(() => {});
+    return run;
+  },
+});
+```
+
+```ts trigger/research-agent.ts
+import { anthropic } from "@ai-sdk/anthropic";
+import { chat } from "@trigger.dev/sdk/ai";
+import { stepCountIs } from "ai";
+import { getApifyActorInputSchema, runApifyActor, searchApifyActors } from "./apify-tools";
+
+const tools = { searchApifyActors, getApifyActorInputSchema, runApifyActor };
+
+export const researchAgent = chat.agent({
+  id: "research-agent",
+  tools,
+  system:
+    "You are a web research agent. To get data from a specific site, first " +
+    "search for a suitable Apify Actor, read its input schema, then run it.",
+  run: async ({ messages, tools, signal, streamText }) =>
+    streamText({
+      tools,
+      model: anthropic("claude-sonnet-4-5"),
+      messages,
+      abortSignal: signal,
+      stopWhen: stepCountIs(15),
+    }),
+});
+```
+
+How the tools work together:
+
+- **Discovery:** `searchApifyActors` lets the model pick a scraper at runtime instead of you hardcoding one. It returns monthly users and the pricing model, so the model can prefer widely used Actors over obscure ones.
+- **Input schema:** without `getApifyActorInputSchema`, the model guesses input field names, and Apify rejects the run.
+- **Approval:** `needsApproval: true` pauses the turn before `runApifyActor` spends money, as long as `tools` goes on the agent config and on the `streamText` from the `run` payload. See [Human-in-the-loop](/ai-chat/patterns/human-in-the-loop) for the frontend side.
+- **Subtask:** `runApifyActor` calls `apifyLongActorRun.triggerAndWait()` instead of the Apify API directly, so each scrape gets its own retries and trace, and the agent run doesn't count towards compute while the Actor works.
+- **One run at a time:** when the user approves several calls at once, the AI SDK runs them in parallel, but a task can only wait on one subtask at a time. `runQueue` runs them one after another.
+- **Truncation:** datasets can be much larger than the context window, so the tool returns at most 50 items, a `truncated` flag, and the `datasetId` for fetching the rest.
+
+<Note>
+  Some Actors need extra account permissions before the API can run them. `runApifyActor` returns
+  Apify's error with a link to approve them in Apify Console, and the model can pick a different
+  Actor instead.
+</Note>
+
 ## Learn more
 
 - [Human-in-the-loop](/ai-chat/patterns/human-in-the-loop): tools that pause for approval.
