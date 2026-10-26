@@ -1,3 +1,4 @@
+import { errAsync, type ResultAsync } from "neverthrow";
 import { MachinePresetName, tryCatch } from "@trigger.dev/core/v3";
 import type { RuntimeEnvironmentType } from "@trigger.dev/database";
 import {
@@ -43,6 +44,11 @@ import { newProjectPath, organizationBillingPath } from "~/utils/pathBuilder";
 import { singleton } from "~/utils/singleton";
 import { RedisCacheStore } from "./unkey/redisCacheStore.server";
 import { $replica } from "~/db.server";
+import {
+  enqueueGithubBuildWithClient,
+  type EnqueueGithubBuildOptions,
+  type EnqueueBuildError,
+} from "./enqueueGithubBuild.server";
 import { metrics } from "@opentelemetry/api";
 
 function initializeClient() {
@@ -202,6 +208,16 @@ function initializePlatformCache() {
       fresh: 60_000,
       stale: 120_000,
     }),
+    // Own context: getCachedPlans' loader throws on failure, and the default context would
+    // leave a failed background refresh as an unhandled rejection.
+    plans: new Namespace<PlansResult>(
+      { waitUntil: (p) => void p.catch(() => {}) },
+      {
+        stores: [memory, redisCacheStore],
+        fresh: 60_000,
+        stale: 120_000,
+      }
+    ),
   });
 
   return cache;
@@ -379,6 +395,18 @@ export async function getCurrentPlan(orgId: string) {
   }
 }
 
+export async function getCurrentPlanOrThrow(orgId: string) {
+  if (!client) return undefined;
+
+  const result = await client.currentPlan(orgId);
+  if (!result.success) {
+    recordPlatformFailure("getCurrentPlanOrThrow", "no_success");
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
 export type SelfServePurchaseBlockReason = "plan_unavailable" | "managed_billing";
 
 /**
@@ -549,6 +577,31 @@ export async function getPlans() {
   }
 }
 
+type PlansResult = NonNullable<Awaited<ReturnType<typeof getPlans>>>;
+
+/**
+ * {@link getPlans} behind a short SWR cache, for pages that poll. The catalog is the same for
+ * every org, so it is cached under one key. The loader throws on failure because `swr` stores
+ * whatever it returns, `undefined` included, which would overwrite a good stale catalog. A
+ * failed background refresh therefore keeps the stale value; a failed cold fetch returns
+ * `undefined`.
+ */
+export async function getCachedPlans(): Promise<PlansResult | undefined> {
+  if (!client) return undefined;
+
+  try {
+    const result = await platformCache.plans.swr("all", async () => {
+      const plans = await getPlans();
+      if (!plans) throw new Error("getPlans failed");
+      return plans;
+    });
+    return result.err ? undefined : result.val;
+  } catch (_e) {
+    recordPlatformFailure("getPlans", "caught");
+    return undefined;
+  }
+}
+
 export async function activateFreePlan(
   organizationId: string,
   userId: string,
@@ -577,6 +630,24 @@ export async function activateFreePlan(
   opts?.invalidateBillingCache?.(organizationId);
   invalidatePlanDerivedCaches(organizationId);
   return { success: true };
+}
+
+export async function cancelSubscription(orgId: string) {
+  if (!client) return undefined;
+
+  const [error, result] = await tryCatch(client.cancelSubscription(orgId));
+  if (error) {
+    recordPlatformFailure("cancelSubscription", "caught");
+    throw error;
+  }
+
+  if (result.success) {
+    invalidatePlanDerivedCaches(orgId);
+  } else {
+    recordPlatformFailure("cancelSubscription", "no_success");
+  }
+
+  return result;
 }
 
 export async function setPlan(
@@ -1145,6 +1216,19 @@ export async function enqueueBuild(
   }
 
   return result;
+}
+
+export function enqueueGithubBuild(
+  projectId: string,
+  deploymentId: string,
+  github: { commitSha: string; ref: string },
+  options: EnqueueGithubBuildOptions = {}
+): ResultAsync<{ buildId: string }, EnqueueBuildError> {
+  if (!client) return errAsync({ type: "billing_not_configured" as const });
+  // The published client's enqueueBuild request type predates the github source.
+  return enqueueGithubBuildWithClient(client, projectId, deploymentId, github, options, (kind) =>
+    recordPlatformFailure("enqueueGithubBuild", kind)
+  );
 }
 
 export async function getPrivateLinks(

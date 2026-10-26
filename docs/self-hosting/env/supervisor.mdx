@@ -14,6 +14,7 @@ mode: "wide"
 | `OTEL_EXPORTER_OTLP_ENDPOINT`               | Yes      | —           | OTel exporter endpoint. Point at: `<webapp-url>/otel`       |
 | **Worker instance**                         |          |             |                                                             |
 | `TRIGGER_WORKER_INSTANCE_NAME`              | No       | random UUID | Worker instance name. Set to `spec.nodeName` on k8s.        |
+| `TRIGGER_WORKER_CELL_NAME`                  | No       | —           | Name of the worker cluster this supervisor serves. Stamped on each run it starts. |
 | `TRIGGER_WORKER_HEARTBEAT_INTERVAL_SECONDS` | No       | 30          | Worker heartbeat interval (seconds).                        |
 | **Workload API settings**                   |          |             |                                                             |
 | `TRIGGER_WORKLOAD_API_ENABLED`              | No       | true        | Enable workload API. Runs use this to perform actions.      |
@@ -51,6 +52,7 @@ mode: "wide"
 | `KUBERNETES_IMAGE_PULL_SECRETS`             | No       | —           | Image pull secrets (CSV).                                   |
 | `KUBERNETES_EPHEMERAL_STORAGE_SIZE_LIMIT`   | No       | 10Gi        | Ephemeral storage size limit. Applies to all runs.          |
 | `KUBERNETES_EPHEMERAL_STORAGE_SIZE_REQUEST` | No       | 2Gi         | Ephemeral storage size request. Applies to all runs.        |
+| `KUBERNETES_POD_RESERVED_SOURCE_PORTS`      | No       | —           | Ports runs never use as the source port of an outbound connection, so they can't clash with services on those ports. CSV of ports or ranges, e.g. `50080,50081` or `50080-50090`. Sets the pod's `net.ipv4.ip_local_reserved_ports` sysctl. |
 | **Metrics**                                 |          |             |                                                             |
 | `METRICS_ENABLED`                           | No       | true        | Enable metrics.                                             |
 | `METRICS_COLLECT_DEFAULTS`                  | No       | true        | Collect default metrics.                                    |
@@ -64,6 +66,7 @@ mode: "wide"
 | `FAILED_POD_HANDLER_ENABLED`                | No       | true        | Enable failed pod handler.                                  |
 | `FAILED_POD_HANDLER_RECONNECT_INTERVAL_MS`  | No       | 1000 (1s)   | Failed pod handler reconnect interval (ms).                 |
 | `FAILED_POD_HANDLER_WATCH_TIMEOUT_SECONDS`  | No       | 300 (5m)    | How long the server keeps each failed pod watch open (s).   |
+| `RUNNER_KILL_REPORTS_ENABLED`               | No       | true        | Fail a run straight away when its pod is killed, as out of memory only if Kubernetes reports `OOMKilled`. |
 | **Debug**                                   |          |             |                                                             |
 | `DEBUG`                                     | No       | false       | Enable debug logs.                                          |
 | `SEND_RUN_DEBUG_LOGS`                       | No       | false       | Send run debug logs to the platform.                        |

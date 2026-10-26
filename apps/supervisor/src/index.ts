@@ -20,12 +20,15 @@ import {
 import { KubernetesWorkloadManager } from "./workloadManager/kubernetes.js";
 import {
   RunCrdWorkloadManager,
+  RunnerKillInformer,
   RunnerRestoreInformer,
+  reportTemplateKeyRefusal,
   settleRestoreFailure,
+  type RunnerStartFailure,
 } from "./workloadManager/runCrd.js";
+import { workerLaneFor, type WorkloadManagerBackend } from "./workerLane.js";
 import { RestoreWatcher, type RestoreFailure } from "./services/restoreWatcher.js";
 import { DockerWorkloadManager } from "./workloadManager/docker.js";
-import { ComputeWorkloadManager } from "./workloadManager/compute.js";
 import {
   HttpServer,
   CheckpointClient,
@@ -38,15 +41,15 @@ import { collectDefaultMetrics, Counter, Gauge, Histogram } from "prom-client";
 import { register } from "./metrics.js";
 import { PodCleaner } from "./services/podCleaner.js";
 import { FailedPodHandler } from "./services/failedPodHandler.js";
+import { RunnerKillReporter } from "./services/runnerKills.js";
 import { DequeueDrain } from "./services/dequeueDrain.js";
 import { getWorkerToken } from "./workerToken.js";
 import { mintDeploymentToken } from "./workloadToken.js";
-import { OtlpTraceService } from "./services/otlpTraceService.js";
 import {
   WarmStartVerificationService,
   type WarmStartTimings,
 } from "./services/warmStartVerificationService.js";
-import { extractTraceparent, getRestoreRunnerId } from "./util.js";
+import { extractTraceparent } from "./util.js";
 import { Redis } from "ioredis";
 import { BackpressureMonitor } from "./backpressure/backpressureMonitor.js";
 import { RedisBackpressureSignalSource } from "./backpressure/redisBackpressureSignalSource.js";
@@ -88,6 +91,20 @@ const outboundRequestDuration = new Histogram({
   registers: [register],
 });
 
+const startReportsTotal = new Counter({
+  name: "supervisor_start_reports_total",
+  help: "Cold starts the operator failed before they began, moved to the fallback lane through the platform, by result: ok, conflict when the run had already moved on, or error.",
+  labelNames: ["result"],
+  registers: [register],
+});
+
+const templateKeyRefusalsTotal = new Counter({
+  name: "supervisor_template_key_refusals_total",
+  help: "Dequeued runs this lane created no Runner for, as they had no valid template key, by outcome (fallback or fail) and result: ok, conflict when the run had already moved on, or error.",
+  labelNames: ["outcome", "result"],
+  registers: [register],
+});
+
 const restoreReportsTotal = new Counter({
   name: "supervisor_restore_reports_total",
   help: "Failed restores reported to the platform, by outcome (requeue or fail) and result: ok, conflict when the run had already moved on, or error.",
@@ -101,11 +118,12 @@ class ManagedSupervisor {
   private readonly metricsServer?: HttpServer;
   private readonly workloadServer: WorkloadServer;
   private readonly workloadManager: WorkloadManager;
-  private readonly workloadManagerBackend: "compute" | "kubernetes" | "run-crd" | "docker";
-  private readonly computeManager?: ComputeWorkloadManager;
+  private readonly workloadManagerBackend: WorkloadManagerBackend;
   private readonly runCrdManager?: RunCrdWorkloadManager;
   private readonly restoreInformer?: RunnerRestoreInformer;
   private readonly restoreWatcher?: RestoreWatcher;
+  private readonly runnerKillReporter?: RunnerKillReporter;
+  private readonly runnerKillInformer?: RunnerKillInformer;
   private readonly logger = new SimpleStructuredLogger("managed-supervisor");
   private readonly resourceMonitor: ResourceMonitor;
   private readonly checkpointClient?: CheckpointClient;
@@ -113,7 +131,6 @@ class ManagedSupervisor {
 
   private readonly podCleaner?: PodCleaner;
   private readonly failedPodHandler?: FailedPodHandler;
-  private readonly tracing?: OtlpTraceService;
   private readonly backpressureMonitors: BackpressureMonitor[] = [];
   private readonly backpressureRedis?: Redis;
 
@@ -135,7 +152,6 @@ class ManagedSupervisor {
     const {
       TRIGGER_WORKER_TOKEN,
       MANAGED_WORKER_SECRET,
-      COMPUTE_GATEWAY_AUTH_TOKEN,
       DOCKER_REGISTRY_PASSWORD,
       TRIGGER_DEQUEUE_BACKPRESSURE_REDIS_PASSWORD,
       WORKLOAD_TOKEN_SECRET,
@@ -172,48 +188,25 @@ class ManagedSupervisor {
         : new DockerResourceMonitor(new Docker())
       : new NoopResourceMonitor();
 
-    if (env.COMPUTE_GATEWAY_URL) {
-      if (!env.TRIGGER_WORKLOAD_API_DOMAIN) {
-        throw new Error("TRIGGER_WORKLOAD_API_DOMAIN is not set, cannot create compute manager");
-      }
-
-      const callbackUrl = `${env.TRIGGER_WORKLOAD_API_PROTOCOL}://${env.TRIGGER_WORKLOAD_API_DOMAIN}:${env.TRIGGER_WORKLOAD_API_PORT_EXTERNAL}/api/v1/compute/snapshot-complete`;
-
-      if (env.COMPUTE_TRACE_SPANS_ENABLED) {
-        this.tracing = new OtlpTraceService({
-          endpointUrl: env.COMPUTE_TRACE_OTLP_ENDPOINT,
+    if (this.isKubernetes && env.RUNNER_KILL_REPORTS_ENABLED) {
+      const killReporter = new RunnerKillReporter({
+        register,
+        client: () => this.workerSession.httpClient,
+      });
+      this.runnerKillReporter = killReporter;
+      // Separate from the run CRD manager: the process that sees Runners fail need not run them.
+      if (env.KUBERNETES_RUNNER_KILL_INFORMER_ENABLED) {
+        this.runnerKillInformer = new RunnerKillInformer({
+          namespace: env.KUBERNETES_NAMESPACE,
+          onRunnerKilled: (runnerId, kill) => void killReporter.onRunnerKilled(runnerId, kill),
+          ...(env.KUBERNETES_RUN_CRD_ENABLED
+            ? { onRunnerStartFailed: (failure) => void this.reportStartFailure(failure) }
+            : {}),
         });
       }
+    }
 
-      const computeManager = new ComputeWorkloadManager({
-        ...workloadManagerOptions,
-        gateway: {
-          url: env.COMPUTE_GATEWAY_URL,
-          authToken: env.COMPUTE_GATEWAY_AUTH_TOKEN,
-          timeoutMs: env.COMPUTE_GATEWAY_TIMEOUT_MS,
-        },
-        snapshots: {
-          enabled: env.COMPUTE_SNAPSHOTS_ENABLED,
-          delayMs: env.COMPUTE_SNAPSHOT_DELAY_MS,
-          dispatchLimit: env.COMPUTE_SNAPSHOT_DISPATCH_LIMIT,
-          callbackUrl,
-        },
-        tracing: this.tracing,
-        runner: {
-          instanceName: env.TRIGGER_WORKER_INSTANCE_NAME,
-          otelEndpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT,
-          prettyLogs: env.RUNNER_PRETTY_LOGS,
-          sendRunDebugLogs: env.SEND_RUN_DEBUG_LOGS,
-        },
-        createRetry: {
-          maxAttempts: env.COMPUTE_INSTANCE_CREATE_MAX_ATTEMPTS,
-          baseDelayMs: env.COMPUTE_INSTANCE_CREATE_RETRY_BASE_DELAY_MS,
-        },
-      });
-      this.computeManager = computeManager;
-      this.workloadManager = computeManager;
-      this.workloadManagerBackend = "compute";
-    } else if (this.isKubernetes && env.KUBERNETES_RUN_CRD_ENABLED) {
+    if (this.isKubernetes && env.KUBERNETES_RUN_CRD_ENABLED) {
       // Only a process that dequeues creates resumes, and only the microvm lane restores.
       if (
         env.KUBERNETES_RUNNER_RESTORE_INFORMER_ENABLED &&
@@ -223,10 +216,16 @@ class ManagedSupervisor {
         this.restoreInformer = new RunnerRestoreInformer({
           namespace: env.KUBERNETES_NAMESPACE,
           onUnwatchedFailure: (failure) => void this.restoreWatcher?.report(failure),
-          onUnwatchedRestore: ({ runnerId, uid, runFriendlyId, snapshotFriendlyId }) => {
+          onUnwatchedRestore: ({
+            runnerId,
+            uid,
+            runFriendlyId,
+            snapshotFriendlyId,
+            environmentId,
+          }) => {
             if (runFriendlyId && snapshotFriendlyId) {
               void this.restoreWatcher?.watch(
-                { runFriendlyId, snapshotFriendlyId },
+                { runFriendlyId, snapshotFriendlyId, environmentId },
                 { runnerId, uid }
               );
             }
@@ -293,6 +292,9 @@ class ManagedSupervisor {
           namespace: env.KUBERNETES_NAMESPACE,
           reconnectIntervalMs: env.FAILED_POD_HANDLER_RECONNECT_INTERVAL_MS,
           watchTimeoutSeconds: env.FAILED_POD_HANDLER_WATCH_TIMEOUT_SECONDS,
+          onRunnerKilled: this.runnerKillReporter
+            ? (runnerId, kill) => this.runnerKillReporter!.onRunnerKilled(runnerId, kill)
+            : undefined,
         });
       } else {
         this.logger.warn("Failed pod handler disabled");
@@ -385,7 +387,13 @@ class ManagedSupervisor {
 
     const workerToken = getWorkerToken();
 
+    const workerStamp = {
+      workerCell: env.TRIGGER_WORKER_CELL_NAME,
+      workerLane: workerLaneFor(this.workloadManagerBackend, env.KUBERNETES_RUNNER_RUNTIME),
+    };
+
     this.workerSession = new SupervisorSession({
+      metadata: workerStamp,
       resolveResponseSchema,
       workerToken,
       apiUrl: env.TRIGGER_API_URL,
@@ -522,65 +530,14 @@ class ManagedSupervisor {
 
             const { checkpoint, ...rest } = message;
 
-            // Register trace context early so snapshot spans work for all paths
-            // (cold create, restore, warm start). Re-registration on restore is safe
-            // since dequeue always provides fresh context.
-            if (this.computeManager?.traceSpansEnabled && traceparent) {
-              this.workloadServer.registerRunTraceContext(message.run.friendlyId, {
-                traceparent,
-                envId: message.environment.id,
-                orgId: message.organization.id,
-                projectId: message.project.id,
-              });
+            if (this.runCrdManager && (await this.refuseWithoutTemplateKey(message))) {
+              setExtra(fromContext(), "path_taken", "no_template_key");
+              return;
             }
 
             if (checkpoint) {
               setExtra(fromContext(), "path_taken", "restore");
               this.logger.debug("Restoring run", { runId: message.run.id });
-
-              if (this.computeManager) {
-                const restoreStart = performance.now();
-                try {
-                  const runnerId = getRestoreRunnerId(message.run.friendlyId, checkpoint.id);
-
-                  const didRestore = await this.computeManager.restore({
-                    snapshotId: checkpoint.location,
-                    runnerId,
-                    runFriendlyId: message.run.friendlyId,
-                    snapshotFriendlyId: message.snapshot.friendlyId,
-                    machine: message.run.machine,
-                    traceContext: message.run.traceContext,
-                    envId: message.environment.id,
-                    orgId: message.organization.id,
-                    projectId: message.project.id,
-                    hasPrivateLink: message.organization.hasPrivateLink,
-                    dequeuedAt: message.dequeuedAt,
-                  });
-                  recordPhaseSince("restore", restoreStart, undefined);
-                  setExtra(fromContext(), "did_restore", didRestore);
-
-                  if (didRestore) {
-                    this.logger.debug("Compute restore successful", {
-                      runId: message.run.id,
-                      runnerId,
-                    });
-                  } else {
-                    this.logger.error("Compute restore failed", {
-                      runId: message.run.id,
-                      runnerId,
-                    });
-                  }
-                } catch (error) {
-                  recordPhaseSince(
-                    "restore",
-                    restoreStart,
-                    error instanceof Error ? error : new Error(String(error))
-                  );
-                  this.logger.error("Failed to restore run (compute)", { error });
-                }
-
-                return;
-              }
 
               if (this.runCrdManager?.restores(checkpoint)) {
                 await this.restoreRunner(this.runCrdManager, message, checkpoint);
@@ -669,16 +626,15 @@ class ManagedSupervisor {
 
     // Responds to workload requests only
     this.workloadServer = new WorkloadServer({
+      workerStamp,
       port: env.TRIGGER_WORKLOAD_API_PORT_INTERNAL,
       host: env.TRIGGER_WORKLOAD_API_HOST_INTERNAL,
       workerClient: this.workerSession.httpClient,
       checkpointClient: this.checkpointClient,
-      computeManager: this.computeManager,
       runnerSnapshotter: this.runCrdManager,
-      tracing: this.tracing,
-      snapshotCallbackSecret: workerToken,
       wideEventOpts: this.wideEventOpts,
       wideEventsNoisyRoutes: this.wideEventsNoisyRoutes,
+      continueRetryBudgetMs: env.TRIGGER_CONTINUE_RETRY_BUDGET_MS,
     });
 
     this.workloadServer.on("runConnected", this.onRunConnected.bind(this));
@@ -729,6 +685,7 @@ class ManagedSupervisor {
       envId: message.environment.id,
       envType: message.environment.type,
       image: message.image,
+      templateKey: message.templateKey,
       machine: message.run.machine,
       orgId: message.organization.id,
       projectId: message.project.id,
@@ -765,6 +722,7 @@ class ManagedSupervisor {
         {
           runFriendlyId: message.run.friendlyId,
           snapshotFriendlyId: message.snapshot.friendlyId,
+          environmentId: message.environment.id,
         },
         restore
       );
@@ -808,6 +766,7 @@ class ManagedSupervisor {
   private async reportRestoreFailure({
     runFriendlyId,
     snapshotFriendlyId,
+    environmentId,
     runnerId,
     outcome,
   }: RestoreFailure) {
@@ -834,7 +793,8 @@ class ManagedSupervisor {
             runFriendlyId,
             snapshotFriendlyId,
             body,
-            runnerId
+            runnerId,
+            environmentId
           ),
       }
     );
@@ -876,6 +836,105 @@ class ManagedSupervisor {
             ...fields,
             error: settled.cleanupError,
           });
+        }
+    }
+  }
+
+  /** Reports a run this lane needs a template key for and has none, rather than starting it. */
+  private async refuseWithoutTemplateKey(message: DequeuedMessage): Promise<boolean> {
+    const refused = await reportTemplateKeyRefusal(
+      {
+        runtime: env.KUBERNETES_RUNNER_RUNTIME,
+        templateKey: message.templateKey,
+        checkpoint: message.checkpoint,
+      },
+      (body) =>
+        this.workerSession.httpClient.reportRestoreOutcome(
+          message.run.friendlyId,
+          message.snapshot.friendlyId,
+          body,
+          undefined,
+          message.environment.id
+        )
+    );
+    if (!refused) {
+      return false;
+    }
+    templateKeyRefusalsTotal.inc({ outcome: refused.outcome, result: refused.result });
+    const fields = {
+      runId: message.run.friendlyId,
+      snapshotId: message.snapshot.friendlyId,
+      outcome: refused.outcome,
+      reason: refused.reason,
+      result: refused.result,
+    };
+    if (refused.result === "error") {
+      this.logger.error("No Runner created without a template key, and the report failed", {
+        ...fields,
+        error: refused.error,
+      });
+    } else {
+      this.logger.warn("No Runner created without a template key", fields);
+    }
+    return true;
+  }
+
+  /**
+   * Moves a cold start the operator failed before its attempt began to the platform's fallback
+   * lane, rather than leaving it to the stall timeout. Without one it is requeued here, and the
+   * queue's redelivery budget bounds how often a run comes back this way.
+   */
+  private async reportStartFailure(failure: RunnerStartFailure) {
+    const { runFriendlyId, snapshotFriendlyId, runnerId, environmentId, outcome } = failure;
+    const fields = { runFriendlyId, snapshotFriendlyId, runnerId, reason: outcome.reason };
+    this.logger.warn("Runner start failed (run-crd)", { ...fields, error: outcome.error });
+    const manager = this.runCrdManager;
+    if (!manager) {
+      this.logger.warn(
+        "Runner start failure left to the stall timeout, no run-crd manager",
+        fields
+      );
+      return;
+    }
+    await this.workerSession.httpClient.sendDebugLog(runFriendlyId, {
+      time: new Date(),
+      message: "runner failed to start on the node",
+      properties: { runnerId, error: outcome.error },
+    });
+    const settled = await settleRestoreFailure(
+      { runnerId, outcome, action: { outcome: "fallback", deleteRunner: true } },
+      {
+        deleteRunner: (name, uid) => manager.deleteFailedRunner(name, uid),
+        report: (body) =>
+          this.workerSession.httpClient.reportRestoreOutcome(
+            runFriendlyId,
+            snapshotFriendlyId,
+            body,
+            runnerId,
+            environmentId
+          ),
+      }
+    );
+    switch (settled.action) {
+      case "none":
+        return;
+      case "kept":
+        this.logger.warn("Failed start Runner not deleted, so the run was not moved", {
+          ...fields,
+          error: settled.error,
+        });
+        return;
+      case "reported":
+        startReportsTotal.inc({ result: settled.result });
+        if (settled.result === "error") {
+          this.logger.warn("Start failure report failed", { ...fields, error: settled.error });
+        } else {
+          this.logger.info(
+            settled.result === "conflict"
+              ? "Start failure not applied, the run has moved on"
+              : "Start failure reported, the run was moved",
+            fields
+          );
         }
     }
   }
@@ -992,6 +1051,7 @@ class ManagedSupervisor {
     await this.podCleaner?.start();
     await this.failedPodHandler?.start();
     await this.restoreInformer?.start();
+    await this.runnerKillInformer?.start();
     await this.metricsServer?.start();
 
     if (env.TRIGGER_WORKLOAD_API_ENABLED) {
@@ -1018,6 +1078,7 @@ class ManagedSupervisor {
     // The next process adopts the restores and recovers the suspends left unanswered.
     await this.restoreWatcher?.stop();
     await this.restoreInformer?.stop();
+    await this.runnerKillInformer?.stop();
 
     // Optional services
     this.backpressureMonitors.forEach((m) => m.stop());

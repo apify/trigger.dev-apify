@@ -11,22 +11,36 @@ import type {
 import { assertNever } from "assert-never";
 import { WaitpointCompletionGuardArmedError } from "../errors.js";
 import { buildCompletedWaitpointRecords } from "./completedWaitpointResolver.js";
+import { resolveCompletedWaitpointRecords } from "./completedWaitpointRecordAdapter.js";
 import { sendNotificationToWorker } from "../eventBus.js";
 import { isFinalRunStatus } from "../statuses.js";
 import { LegacyPostgresWaitpointCoordinator } from "../waitpointCoordinator/legacyPostgresCoordinator.js";
-import type { WaitpointCoordinator } from "../waitpointCoordinator/types.js";
+import type { WaitpointStoreCoordinator } from "../waitpointCoordinator/storeCoordinator.js";
+import type { RunBlockEdge, WaitpointCoordinator } from "../waitpointCoordinator/types.js";
 import type { EnqueueSystem } from "./enqueueSystem.js";
 import type { ExecutionSnapshotSystem } from "./executionSnapshotSystem.js";
-import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
+import {
+  getLatestExecutionSnapshot,
+  isExpiredSnapshotOfFinishedRun,
+} from "./executionSnapshotSystem.js";
 import type { SystemResources } from "./systems.js";
-import { snapshotRouteFromSnapshot } from "@internal/run-store";
+import { snapshotRouteFromSnapshot, type CompletedWaitpointRecord } from "@internal/run-store";
 
 export type WaitpointSystemOptions = {
+  waitpointStoreEnabled?: (
+    organizationId: string,
+    organizationFlags?: unknown
+  ) => boolean | Promise<boolean>;
   resources: SystemResources;
   executionSnapshotSystem: ExecutionSnapshotSystem;
   enqueueSystem: EnqueueSystem;
-  /** Grace before an unacked completion guard fires. Short in tests. Defaults to 30s. */
+  /** Grace before an unacked completion guard fires. Defaults to 30s. */
   completionGuardDelayMs?: number;
+  /**
+   * Reads store-format waitpoint records for a redis-primary resume. Undefined keeps the resolver
+   * Postgres-only, the only reachable state until store-format minting is wired.
+   */
+  waitpointStore?: Pick<WaitpointStoreCoordinator, "readCompletedRecords">;
 };
 
 const DEFAULT_COMPLETION_GUARD_DELAY_MS = 30_000;
@@ -53,16 +67,17 @@ export class WaitpointSystem {
   private readonly enqueueSystem: EnqueueSystem;
   private readonly coordinator: WaitpointCoordinator;
   private readonly completionGuardDelayMs: number;
+  readonly #waitpointStore?: Pick<WaitpointStoreCoordinator, "readCompletedRecords">;
 
   constructor(private readonly options: WaitpointSystemOptions) {
     this.$ = options.resources;
     this.executionSnapshotSystem = options.executionSnapshotSystem;
     this.enqueueSystem = options.enqueueSystem;
+    this.#waitpointStore = options.waitpointStore;
     this.completionGuardDelayMs =
       options.completionGuardDelayMs ?? DEFAULT_COMPLETION_GUARD_DELAY_MS;
     this.coordinator = new LegacyPostgresWaitpointCoordinator({
-      // Read the store live from the shared resources object (mutated in place by setRunStore), so a
-      // post-boot store swap reaches the coordinator instead of freezing the construction-time store.
+      // A getter, so a `setRunStore` swap (a test seam) also reaches the coordinator.
       runStore: () => this.$.runStore,
       prisma: this.$.prisma,
       logger: this.$.logger,
@@ -81,8 +96,7 @@ export class WaitpointSystem {
     return deleted.count;
   }
 
-  /** This completes a waitpoint and updates all entries so the run isn't blocked,
-   * if they're no longer blocked. This doesn't suffer from race conditions. */
+  /** Completes a waitpoint and schedules a continue for each run it blocked. Safe under races. */
   async completeWaitpoint({
     id,
     output,
@@ -94,22 +108,17 @@ export class WaitpointSystem {
       type?: string;
       isError: boolean;
     };
-    /**
-     * Arm the write-ahead completion guard before the mutation (the manual/API path sets this when
-     * the flag is on). The guard's own replay calls with `armGuard: false` so it never re-arms.
-     */
+    /** Arms the write-ahead completion guard first. The guard's replay passes false. */
     armGuard?: boolean;
   }): Promise<Waitpoint> {
-    // Armed BEFORE the first mutation, so a committed completion can never exist without a durable
-    // watcher. If this arm itself fails (e.g. the guard's Redis enqueue), the error propagates raw and
-    // is NOT wrapped below, so the caller never mistakes an un-armed failure for a durable one.
+    // Armed before the first mutation, so a committed completion always has a durable watcher. An
+    // arm failure is not wrapped, so the caller cannot mistake it for one the guard will replay.
     if (armGuard) {
       await this.#scheduleCompletionGuard(id, output);
     }
 
-    // Past this point the guard is persisted and owns eventual completion, so a later failure is
-    // wrapped as WaitpointCompletionGuardArmedError: the API boundary may then return success for a
-    // retryable cause, knowing the guard will replay it.
+    // From here the guard owns eventual completion. A failure is wrapped as
+    // WaitpointCompletionGuardArmedError, so the API can return success and let the guard replay.
     try {
       const { waitpoint, blockedRuns } = await this.coordinator.complete({
         waitpointId: id,
@@ -122,10 +131,8 @@ export class WaitpointSystem {
         });
       }
 
-      // 3. Schedule trying to continue the runs
       for (const run of blockedRuns) {
         const jobId = `continueRunIfUnblocked:${run.taskRunId}`;
-        //50ms in the future
         const availableAt = new Date(Date.now() + 50);
 
         this.$.logger.debug(`completeWaitpoint: enqueueing continueRunIfUnblocked`, {
@@ -136,14 +143,13 @@ export class WaitpointSystem {
         });
 
         await this.$.worker.enqueue({
-          //this will debounce the call
+          // The fixed job id debounces repeat enqueues.
           id: jobId,
           job: "continueRunIfUnblocked",
           payload: { runId: run.taskRunId },
           availableAt,
         });
 
-        // emit an event to complete associated cached runs
         if (run.spanIdToComplete) {
           this.$.eventBus.emit("cachedRunCompleted", {
             time: new Date(),
@@ -158,8 +164,7 @@ export class WaitpointSystem {
         }
       }
 
-      // Ack only now: the transition committed and every blocked-run fanout was enqueued, so the guard
-      // has nothing left to re-deliver. If we died before here, the unacked guard fires and replays.
+      // Ack only after the commit and the fanout. If the process dies first, the guard replays.
       if (armGuard) {
         await this.#ackCompletionGuard(id);
       }
@@ -177,9 +182,8 @@ export class WaitpointSystem {
     return `ensureWaitpointCompleted:${waitpointId}`;
   }
 
-  // Arm the write-ahead guard with the FIRST writer's output (enqueueOnce never overwrites an armed
-  // guard), delayed so the inline path has time to finish and ack it. The winning output is anchored
-  // by the status-guarded update regardless, so a replay never overwrites it.
+  // enqueueOnce keeps the first writer's output. The delay gives the inline path time to ack. The
+  // status-guarded update fixes the winning output, so a replay never overwrites it.
   async #scheduleCompletionGuard(
     waitpointId: string,
     output?: { value: string; type?: string; isError: boolean }
@@ -197,10 +201,9 @@ export class WaitpointSystem {
   }
 
   /**
-   * Redelivery handler for the completion guard: replays the completion + fanout idempotently when
-   * the inline path died after arming. `armGuard: false` so it never re-arms itself; the status-guarded
-   * update makes the transition a no-op on replay and the debounced continueRunIfUnblocked makes each
-   * resume happen exactly once. Redis-worker retries this job until it succeeds (blip passes).
+   * Completion guard redelivery: replays the completion and fanout when the inline path died after
+   * arming. The status-guarded update and the debounced continue make the replay idempotent. The
+   * worker retries this job until it succeeds.
    */
   public async ensureWaitpointCompleted({
     waitpointId,
@@ -213,8 +216,8 @@ export class WaitpointSystem {
   }
 
   /**
-   * This creates a DATETIME waitpoint, that will be completed automatically when the specified date is reached.
-   * If you pass an `idempotencyKey`, the waitpoint will be created only if it doesn't already exist.
+   * Creates a DATETIME waitpoint that completes at `completedAfter`. With an `idempotencyKey`, an
+   * existing waitpoint is returned.
    */
   async createDateTimeWaitpoint({
     runId,
@@ -254,9 +257,7 @@ export class WaitpointSystem {
     return { waitpoint: result.waitpoint, isCached: false };
   }
 
-  /** This creates a MANUAL waitpoint, that can be explicitly completed (or failed).
-   * If you pass an `idempotencyKey` and it already exists, it will return the existing waitpoint.
-   */
+  /** Creates a MANUAL waitpoint. With an `idempotencyKey`, an existing waitpoint is returned. */
   async createManualWaitpoint({
     runId,
     environmentId,
@@ -275,9 +276,8 @@ export class WaitpointSystem {
     idempotencyKeyExpiresAt?: Date;
     timeout?: Date;
     tags?: string[];
-    // For a STANDALONE token (no owning `runId`): the residency the env's mint kind resolves to, so
-    // the token lands on the run-ops DB (NEW) in a fully-minted-new deployment instead of defaulting
-    // to LEGACY by its cuid id-shape. Ignored when `runId` is set (co-location wins).
+    // Standalone token only (no `runId`): the env's mint residency, so the token does not default
+    // to LEGACY by its cuid id shape. Ignored when `runId` is set.
     standaloneResidency?: "NEW" | "LEGACY";
     standaloneShardKey?: ShardKey;
   }): Promise<{ waitpoint: Waitpoint; isCached: boolean }> {
@@ -297,7 +297,6 @@ export class WaitpointSystem {
       return { waitpoint: result.waitpoint, isCached: true };
     }
 
-    //schedule the timeout
     if (timeout) {
       await this.$.worker.enqueue({
         id: `finishWaitpoint.${result.waitpoint.id}`,
@@ -314,22 +313,15 @@ export class WaitpointSystem {
   }
 
   /**
-   * Prevents a run from continuing until the waitpoint is completed.
+   * Blocks a run until the waitpoints complete.
    *
-   * The block edge is written via the run-ops store, routed by the owning run id so it co-resides
-   * with the run (`blockRunWithWaitpointEdges`). It is NOT pinned to the caller's control-plane tx:
-   * doing so joined `Waitpoint` on the wrong DB for a run whose waitpoint lives on the run-ops DB,
-   * wrote 0 edges, and silently never suspended the parent. Like `blockRunWithCreatedBatch`, this is
-   * a routed, run-co-resident write rather than part of the control-plane trigger tx — there is no
-   * cross-DB transaction. The edge write is idempotent (ON CONFLICT DO NOTHING) and the snapshot
-   * transition is re-derivable, so a crash between the two leaves no corruption: a retry re-writes
-   * the same edge and re-checks the pending count.
+   * The edge write is routed by run id to the run's store. Pinning it to the caller's control-plane
+   * tx would join `Waitpoint` on the wrong DB and write 0 edges, so the parent never suspends. The
+   * edge write is idempotent, so a retry after a crash before the snapshot write is safe.
    *
-   * The pending check is a SEPARATE store call (not folded into the edge write) on purpose: under
-   * PostgreSQL READ COMMITTED each statement gets its own snapshot, so if a concurrent
-   * `completeWaitpoint` commits between the edge write and the check, this fresh query still sees the
-   * COMPLETED status. It queries ALL requested waitpoint IDs (not just the ones inserted): a row
-   * that already existed (ON CONFLICT skipped the insert) but is still PENDING must still block.
+   * The pending check is a separate statement on purpose: under READ COMMITTED it sees a completion
+   * that commits after the edge write. It checks every requested id, because an existing edge to a
+   * PENDING waitpoint must still block.
    */
   async blockRunWithWaitpoint({
     runId,
@@ -369,9 +361,7 @@ export class WaitpointSystem {
         organizationId
       );
 
-      // Insert the blocking + historical connections and re-check the pending count. The
-      // coordinator keeps these as two separate store statements, in this order, for the READ
-      // COMMITTED reason documented on the method and in the doc comment above.
+      // Two statements, in this order: see the READ COMMITTED note on the method.
       const { pendingCount } = await this.coordinator.registerBlocks({
         runId,
         waitpointIds: $waitpoints,
@@ -392,7 +382,6 @@ export class WaitpointSystem {
         newStatus = "EXECUTING_WITH_WAITPOINTS";
       }
 
-      //if the state has changed, create a new snapshot
       if (newStatus !== snapshot.executionStatus) {
         snapshot = await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
           run: {
@@ -410,13 +399,13 @@ export class WaitpointSystem {
           environmentType: snapshot.environmentType,
           projectId: snapshot.projectId,
           organizationId,
-          // Do NOT carry over the batchId from the previous snapshot
+          // Never carry over the previous snapshot's batchId.
           batchId: batch?.id,
           workerId,
           runnerId,
         });
 
-        // Let the worker know immediately, so it can suspend the run
+        // Tell the worker now, so it can suspend the run.
         await sendNotificationToWorker({ runId, snapshot, eventBus: this.$.eventBus });
       }
 
@@ -434,15 +423,12 @@ export class WaitpointSystem {
         }
       }
 
-      //no pending waitpoint, schedule unblocking the run
-      //debounce if we're rapidly adding waitpoints
       if (!isRunBlocked) {
         await this.$.worker.enqueue({
-          //this will debounce the call
+          // The fixed job id debounces rapid repeat blocks.
           id: `continueRunIfUnblocked:${runId}`,
           job: "continueRunIfUnblocked",
           payload: { runId: runId },
-          //in the near future
           availableAt: new Date(Date.now() + 50),
         });
       }
@@ -452,16 +438,9 @@ export class WaitpointSystem {
   }
 
   /**
-   * Lockless version of blockRunWithWaitpoint for batch item processing.
-   *
-   * When processing batchTriggerAndWait items, blockRunWithCreatedBatch has already
-   * transitioned the parent run to EXECUTING_WITH_WAITPOINTS before any items are
-   * processed. Per-item calls to blockRunWithWaitpoint would all compete for the same
-   * parent run lock just to insert a TaskRunWaitpoint row — causing lock contention
-   * and LockAcquisitionTimeoutError with large batches.
-   *
-   * This method performs only the CTE insert (which is idempotent via ON CONFLICT DO
-   * NOTHING) and timeout scheduling, without acquiring the parent run lock.
+   * blockRunWithWaitpoint without the run lock, for batch items. blockRunWithCreatedBatch has
+   * already moved the parent to EXECUTING_WITH_WAITPOINTS, and a per-item lock causes
+   * LockAcquisitionTimeoutError on large batches. Writes only the idempotent edges and timeouts.
    */
   async blockRunWithWaitpointLockless({
     runId,
@@ -480,9 +459,6 @@ export class WaitpointSystem {
   }): Promise<void> {
     const $waitpoints = typeof waitpoints === "string" ? [waitpoints] : waitpoints;
 
-    // Same routed edge write as blockRunWithWaitpoint. No lock needed: ON CONFLICT DO NOTHING
-    // makes concurrent inserts safe, and the parent snapshot is already
-    // EXECUTING_WITH_WAITPOINTS from blockRunWithCreatedBatch. No pending count here.
     await this.coordinator.registerBlocksLockless({
       runId,
       waitpointIds: $waitpoints,
@@ -492,7 +468,6 @@ export class WaitpointSystem {
       batchIndex: batch.index,
     });
 
-    // Schedule timeout jobs if needed
     if (timeout) {
       for (const waitpoint of $waitpoints) {
         await this.$.worker.enqueue({
@@ -509,11 +484,8 @@ export class WaitpointSystem {
   }
 
   /**
-   * Blocks a run with a waitpoint and immediately completes the waitpoint.
-   *
-   * Used when creating a pre-failed child run: the parent needs to be blocked
-   * by the waitpoint so it can receive the error output, but the waitpoint is
-   * already resolved because the child run is terminal from the start.
+   * For a pre-failed child run: blocks the parent so it receives the error output, then completes
+   * the waitpoint.
    */
   async blockRunAndCompleteWaitpoint({
     runId,
@@ -556,10 +528,8 @@ export class WaitpointSystem {
     await this.$.raceSimulationSystem.waitForRacepoint({ runId });
 
     return await this.$.runLock.lock("continueRunIfUnblocked", [runId], async () => {
-      // 1. Get the any blocking waitpoints
       const blockingWaitpoints = await this.coordinator.readRunBlockState(runId);
 
-      // 2. There are blockers still, so do nothing
       if (blockingWaitpoints.some((w) => w.waitpoint.status !== "COMPLETED")) {
         this.$.logger.debug(`continueRunIfUnblocked: blocking waitpoints still exist`, {
           runId,
@@ -572,8 +542,7 @@ export class WaitpointSystem {
         };
       }
 
-      // 3. Get the run (run-ops scalars) + resolve its environment via the control-plane resolver,
-      // so the run-ops DB can split without a cross-provider join.
+      // The environment comes from the control-plane resolver, so there is no cross-provider join.
       const run = await this.$.runStore.findRun(
         {
           id: runId,
@@ -600,14 +569,27 @@ export class WaitpointSystem {
         );
       }
 
-      //4. Continue the run whether it's executing or not
-      const snapshot = await getLatestExecutionSnapshot(
-        this.$.prisma,
-        runId,
-        this.$.runStore,
-        undefined,
-        env.organizationId
-      );
+      let snapshot: Awaited<ReturnType<typeof getLatestExecutionSnapshot>>;
+      try {
+        snapshot = await getLatestExecutionSnapshot(
+          this.$.prisma,
+          runId,
+          this.$.runStore,
+          undefined,
+          env.organizationId
+        );
+      } catch (error) {
+        if (!isExpiredSnapshotOfFinishedRun(error, run.status)) {
+          throw error;
+        }
+        this.$.logger.warn("continueRunIfUnblocked: snapshot state expired, run already finished", {
+          runId,
+        });
+        return {
+          status: "skipped",
+          reason: "run is finished",
+        };
+      }
 
       switch (snapshot.executionStatus) {
         case "RUN_CREATED": {
@@ -695,6 +677,11 @@ export class WaitpointSystem {
           };
         }
         case "EXECUTING_WITH_WAITPOINTS": {
+          const resolveCompletedWaitpointRecords = await this.#completedWaitpointRecordsResolver(
+            runId,
+            snapshot,
+            blockingWaitpoints
+          );
           const newSnapshot = await this.executionSnapshotSystem.createExecutionSnapshot(
             this.$.prisma,
             {
@@ -713,13 +700,12 @@ export class WaitpointSystem {
               environmentType: snapshot.environmentType,
               projectId: snapshot.projectId,
               organizationId: snapshot.organizationId,
-              batchId: snapshot.batchId ?? undefined,
+              batchId: this.#resumeBatchId(runId, snapshot.batchId, blockingWaitpoints),
               completedWaitpoints: blockingWaitpoints.map((b) => ({
                 id: b.waitpoint.id,
                 index: b.batchIndex ?? undefined,
               })),
-              resolveCompletedWaitpointRecords: () =>
-                this.#buildCompletedWaitpointRecords(runId, blockingWaitpoints),
+              resolveCompletedWaitpointRecords,
             }
           );
 
@@ -744,9 +730,7 @@ export class WaitpointSystem {
         }
         case "SUSPENDED": {
           if (!snapshot.checkpointId || !snapshot.checkpoint) {
-            // A run canceled mid-suspend has its checkpoint cleared by the
-            // cancel path; reaching here just means cancel won the race.
-            // Skip rather than throw — there's nothing to resume.
+            // Cancel clears the checkpoint of a run canceled mid-suspend: nothing to resume.
             if (snapshot.runStatus === "CANCELED") {
               this.$.logger.warn(
                 `continueRunIfUnblocked: run was canceled while suspended, skipping`,
@@ -774,8 +758,12 @@ export class WaitpointSystem {
             );
           }
 
-          //put it back in the queue, with the original timestamp (w/ priority)
-          //this prioritizes dequeuing waiting runs over new runs
+          // Re-enqueue with the original timestamp, so waiting runs dequeue before new runs.
+          const resolveCompletedWaitpointRecords = await this.#completedWaitpointRecordsResolver(
+            runId,
+            snapshot,
+            blockingWaitpoints
+          );
           const newSnapshot = await this.enqueueSystem.enqueueRun({
             run,
             env,
@@ -785,13 +773,12 @@ export class WaitpointSystem {
               status: "QUEUED",
               description: "Run was QUEUED, because all waitpoints are completed",
             },
-            batchId: snapshot.batchId ?? undefined,
+            batchId: this.#resumeBatchId(runId, snapshot.batchId, blockingWaitpoints),
             completedWaitpoints: blockingWaitpoints.map((b) => ({
               id: b.waitpoint.id,
               index: b.batchIndex ?? undefined,
             })),
-            resolveCompletedWaitpointRecords: () =>
-              this.#buildCompletedWaitpointRecords(runId, blockingWaitpoints),
+            resolveCompletedWaitpointRecords,
             checkpoint: snapshot.checkpoint,
           });
 
@@ -811,7 +798,6 @@ export class WaitpointSystem {
       }
 
       if (blockingWaitpoints.length > 0) {
-        //5. Remove the blocking waitpoints
         await this.coordinator.clearRunBlockState({
           runId,
           edgeIds: blockingWaitpoints.map((b) => b.id),
@@ -827,23 +813,112 @@ export class WaitpointSystem {
         status: "unblocked",
         waitpoints: blockingWaitpoints.map((w) => w.waitpoint),
       };
-    }); // end of runlock
+    });
   }
 
-  // The blocking edges carry only a 4-field waitpoint pick, but a redis-primary snapshot needs the FULL
-  // rows to reproduce the Postgres join. Passed to the snapshot store as a resolver thunk so this fetch
-  // runs ONLY when a redis-primary cycle actually needs it, never on a postgres-resident resume. Routed
-  // by runId with per-id shard fallback so a cross-shard token still resolves.
-  async #buildCompletedWaitpointRecords(
+  // A retried batch create can block an already-waiting run, leaving the snapshot on the first batch.
+  // Child results carry their real batch on the edge, and the SDK matches results by it.
+  #resumeBatchId(
     runId: string,
+    snapshotBatchId: string | null,
+    blockingWaitpoints: RunBlockEdge[]
+  ): string | undefined {
+    const childBatchIds: string[] = [];
+    for (const edge of blockingWaitpoints) {
+      // Only child-result edges carry a batchIndex. A batch's own waitpoint edge doesn't, and
+      // counting it would add the abandoned batch from a retried create.
+      if (edge.batchIndex !== null && edge.batchId && !childBatchIds.includes(edge.batchId)) {
+        childBatchIds.push(edge.batchId);
+      }
+    }
+
+    if (childBatchIds.length === 1) {
+      const childBatchId = childBatchIds[0];
+      if (childBatchId !== snapshotBatchId) {
+        this.$.logger.warn("continueRunIfUnblocked: resuming with the child results' batch", {
+          runId,
+          snapshotBatchId,
+          batchId: childBatchId,
+        });
+      }
+      return childBatchId;
+    }
+
+    if (childBatchIds.length > 1) {
+      this.$.logger.warn("continueRunIfUnblocked: child results belong to more than one batch", {
+        runId,
+        snapshotBatchId,
+        batchIds: childBatchIds,
+      });
+    }
+
+    return snapshotBatchId ?? undefined;
+  }
+
+  // A redis-primary cycle is built inside the owning Postgres transaction. Fetching its records
+  // there waits for a second pooled connection, and concurrent resumes can exhaust the pool. So a
+  // redis-primary resume fetches them here, before the transaction opens. Otherwise the thunk stays
+  // lazy, and the store calls it only for a redis-primary write, never for postgres or mirrored.
+  async #completedWaitpointRecordsResolver(
+    runId: string,
+    snapshot: { organizationId: string; metadata?: unknown },
     blockingWaitpoints: { waitpoint: { id: string } }[]
+  ): Promise<() => Promise<CompletedWaitpointRecord[]>> {
+    if (
+      blockingWaitpoints.length > 0 &&
+      snapshotRouteFromSnapshot(snapshot).residency === "redis-primary"
+    ) {
+      const records = await this.resolveResumeCompletedWaitpointRecords(
+        runId,
+        blockingWaitpoints,
+        snapshot.organizationId
+      );
+      return async () => records;
+    }
+    return () =>
+      this.resolveResumeCompletedWaitpointRecords(
+        runId,
+        blockingWaitpoints,
+        snapshot.organizationId
+      );
+  }
+
+  // Full records for a redis-primary cycle: the blocking edges carry only a 4-field pick. See
+  // #completedWaitpointRecordsResolver for when it runs. The adapter path reads only COMPLETED
+  // legacy rows, so a stray PENDING row is never described as a completion. TS-private so a test
+  // can call it.
+  private async resolveResumeCompletedWaitpointRecords(
+    runId: string,
+    blockingWaitpoints: { waitpoint: { id: string } }[],
+    organizationId?: string
   ) {
-    const rows = await this.$.runStore.findManyWaitpoints(
-      { where: { id: { in: boundedIn(blockingWaitpoints.map((b) => b.waitpoint.id)) } } },
-      this.$.prisma,
-      runId
-    );
-    return buildCompletedWaitpointRecords(rows);
+    // Without a store, or for a disabled org, read Postgres only and do not classify ids.
+    const organizationEnabled =
+      this.#waitpointStore !== undefined &&
+      organizationId !== undefined &&
+      (await this.options.waitpointStoreEnabled?.(organizationId)) === true;
+    if (!organizationEnabled) {
+      const rows = await this.$.runStore.findManyWaitpoints(
+        { where: { id: { in: boundedIn(blockingWaitpoints.map((b) => b.waitpoint.id)) } } },
+        this.$.prisma,
+        runId
+      );
+      return buildCompletedWaitpointRecords(rows);
+    }
+    return resolveCompletedWaitpointRecords({
+      requestedIds: blockingWaitpoints.map((b) => b.waitpoint.id),
+      legacyReader: async (ids) =>
+        buildCompletedWaitpointRecords(
+          await this.$.runStore.findManyWaitpoints(
+            { where: { id: { in: boundedIn(ids) }, status: "COMPLETED" } },
+            this.$.prisma,
+            runId
+          )
+        ),
+      storeReader: this.#waitpointStore
+        ? (ids) => this.#waitpointStore!.readCompletedRecords(ids)
+        : undefined,
+    });
   }
 
   public buildRunAssociatedWaitpoint({
@@ -862,9 +937,7 @@ export class WaitpointSystem {
     });
   }
 
-  /**
-   * Builds the waitpoint output payload from a completed run's stored output/error.
-   */
+  /** Undefined for a success with no output, or for a run that is not final. */
   public buildWaitpointOutputFromRun(
     run: Pick<TaskRun, "status" | "output" | "outputType" | "error">
   ): { value: string; type?: string; isError: boolean } | undefined {
@@ -888,11 +961,8 @@ export class WaitpointSystem {
   }
 
   /**
-   * Gets an existing run waitpoint or creates one lazily.
-   * Used for debounce/idempotency when a late-arriving triggerAndWait caller
-   * needs to block on an existing run that was created without a waitpoint.
-   * When the run has already completed, creates the waitpoint and immediately
-   * completes it with the run's output/error so the parent can resume.
+   * Returns the run's waitpoint, creating it for a late triggerAndWait caller on a run created
+   * without one. If the run already finished, the new waitpoint is completed with its output.
    */
   public async getOrCreateRunWaitpoint({
     runId,
@@ -903,7 +973,6 @@ export class WaitpointSystem {
     projectId: string;
     environmentId: string;
   }): Promise<Waitpoint> {
-    // Fast path: check if waitpoint already exists
     const run = await this.$.runStore.findRun(
       { id: runId },
       { include: { associatedWaitpoint: true } },
@@ -918,11 +987,10 @@ export class WaitpointSystem {
       return run.associatedWaitpoint;
     }
 
-    // Need to create - use run lock to prevent races (operational decisions use latest snapshot inside lock)
+    // Create under the run lock to prevent a race.
     return this.$.runLock.lock("getOrCreateRunWaitpoint", [runId], async () => {
       const prisma = this.$.prisma;
 
-      // Double-check after acquiring lock
       const runAfterLock = await this.$.runStore.findRun(
         { id: runId },
         { include: { associatedWaitpoint: true } },
@@ -937,16 +1005,28 @@ export class WaitpointSystem {
         return runAfterLock.associatedWaitpoint;
       }
 
-      // Operational decision: use latest execution snapshot, not TaskRun status
-      const snapshot = await getLatestExecutionSnapshot(
-        prisma,
-        runId,
-        this.$.runStore,
-        undefined,
-        runAfterLock.organizationId ?? undefined
-      );
+      // Decide from the latest snapshot, not the TaskRun status.
+      let runFinished: boolean;
+      try {
+        const snapshot = await getLatestExecutionSnapshot(
+          prisma,
+          runId,
+          this.$.runStore,
+          undefined,
+          runAfterLock.organizationId ?? undefined
+        );
+        runFinished = snapshot.executionStatus === "FINISHED";
+      } catch (error) {
+        if (!isExpiredSnapshotOfFinishedRun(error, runAfterLock.status)) {
+          throw error;
+        }
+        this.$.logger.warn("getOrCreateRunWaitpoint: snapshot state expired, using final run row", {
+          runId,
+        });
+        runFinished = true;
+      }
 
-      // Create waitpoint and link to run atomically
+      // Creates and links the waitpoint atomically.
       const waitpointData = this.buildRunAssociatedWaitpoint({
         projectId,
         environmentId,
@@ -958,8 +1038,7 @@ export class WaitpointSystem {
         data: waitpointData,
       });
 
-      // If run has already finished (per snapshot), complete the waitpoint immediately so the parent can resume
-      if (snapshot.executionStatus === "FINISHED") {
+      if (runFinished) {
         const output = this.buildWaitpointOutputFromRun(runAfterLock);
         const completed = await this.completeWaitpoint({
           id: waitpoint.id,

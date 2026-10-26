@@ -5,6 +5,8 @@ import { findOrCreateUser } from "~/models/user.server";
 import { sendMagicLinkEmail } from "~/services/email.server";
 import type { AuthUser } from "./authUser";
 import { logger } from "./logger.server";
+import { pinMagicLinkOrigin } from "./magicLinkOrigin.server";
+import { loginOriginForRequest } from "./adminOrigin.server";
 
 import { postAuthentication } from "./postAuth.server";
 import { SsoRequiredError, ssoRedirectForEmail } from "./ssoAutoDiscovery.server";
@@ -62,9 +64,19 @@ const emailStrategy = new EmailLinkStrategy(
     secret,
     callbackURL: "/magic",
     sessionMagicLinkKey: "triggerdotdev:magiclink",
+    /**
+     * A magic link only signs in from the browser session that requested it. Without this,
+     * anything that opens the link signs in, including the link scanners corporate mail filters
+     * run on incoming email, so a request typed with someone else's address created an account.
+     * Development is exempt: there `sendMagicLinkEmail` redirects straight to the link before the
+     * strategy has stored it in the session.
+     */
+    validateSessionMagicLink:
+      env.NODE_ENV !== "development" && env.MAGIC_LINK_SAME_BROWSER_REQUIRED,
   },
   verifyMagicLink
 );
+pinMagicLinkOrigin(emailStrategy, loginOriginForRequest);
 
 export function addEmailLinkStrategy(authenticator: Authenticator<AuthUser>) {
   authenticator.use(emailStrategy);

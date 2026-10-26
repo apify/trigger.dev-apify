@@ -53,7 +53,8 @@ export type WorkerApiContinueRunExecutionRequestBody = z.infer<
 >;
 
 export const WorkerApiRunRestoreOutcomeRequestBody = z.object({
-  outcome: z.enum(["requeue", "fail"]),
+  // `fallback` requeues a run that has not started onto the worker queue the platform falls back to.
+  outcome: z.enum(["requeue", "fail", "fallback"]),
   reason: z.string().max(256),
   // Matches the cap the engine applies to a run error's message.
   message: z
@@ -119,6 +120,9 @@ export type WorkerApiRunHeartbeatResponseBody = z.infer<typeof WorkerApiRunHeart
 
 export const WorkerApiRunAttemptStartRequestBody = z.object({
   isWarmStart: z.boolean().optional(),
+  // Set by the supervisor, not the runner. A value this webapp cannot accept drops the stamp, never the attempt.
+  workerCell: z.string().max(64).optional().catch(undefined),
+  workerLane: z.string().max(32).optional().catch(undefined),
 });
 export type WorkerApiRunAttemptStartRequestBody = z.infer<
   typeof WorkerApiRunAttemptStartRequestBody
@@ -135,6 +139,8 @@ export type WorkerApiRunAttemptStartResponseBody = z.infer<
 
 export const WorkerApiRunAttemptCompleteRequestBody = z.object({
   completion: TaskRunExecutionResult,
+  /** Queue any retry for a new runner instead of retrying on this one, e.g. when it was killed. */
+  forceRequeue: z.boolean().optional(),
 });
 export type WorkerApiRunAttemptCompleteRequestBody = z.infer<
   typeof WorkerApiRunAttemptCompleteRequestBody

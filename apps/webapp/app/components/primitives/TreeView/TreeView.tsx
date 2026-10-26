@@ -2,7 +2,7 @@ import type { VirtualItem, Virtualizer } from "@tanstack/react-virtual";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { motion } from "framer-motion";
 import type { MutableRefObject, RefObject } from "react";
-import { useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import { cn } from "~/utils/cn";
 import type { NodeState, NodesState } from "./reducer";
 import { reducer } from "./reducer";
@@ -160,6 +160,14 @@ type TreeStateHookProps<TData, TFilterValue> = {
   }) => number;
   parentRef: RefObject<any>;
   filter?: Filter<TData, TFilterValue>;
+  /** Nodes that start collapsed when they first appear, initially or as the tree grows. */
+  isCollapsedByDefault?: (node: FlatTreeItem<TData>) => boolean;
+  /** Whether a node can be expanded or collapsed. Defaults to having children. */
+  canExpand?: (node: FlatTreeItem<TData>) => boolean;
+  /** Called when a single node is expanded or collapsed (click, keyboard, toggle). */
+  onExpandedChange?: (id: string, expanded: boolean) => void;
+  /** Change it when the tree's structure changes without its node count changing. */
+  structureKey?: string | number;
 };
 
 //this is so Framer Motion can be used to render the components
@@ -203,6 +211,10 @@ export function useTree<TData, TFilterValue>({
   parentRef,
   estimatedRowHeight,
   filter,
+  isCollapsedByDefault,
+  canExpand = (node) => node.hasChildren,
+  onExpandedChange,
+  structureKey,
 }: TreeStateHookProps<TData, TFilterValue>): UseTreeStateOutput {
   const previousNodeCount = useRef(tree.length);
   const previousSelectedId = useRef<string | undefined>(selectedId);
@@ -213,9 +225,23 @@ export function useTree<TData, TFilterValue>({
 
   const [state, dispatch] = useReducer(
     reducer,
-    concreteStateFromInput({ tree, selectedId, collapsedIds, filter })
+    { tree, selectedId, collapsedIds, filter },
+    (input) =>
+      concreteStateFromInput({
+        ...input,
+        collapsedIds: isCollapsedByDefault
+          ? (input.collapsedIds ?? []).concat(
+              input.tree.filter(isCollapsedByDefault).map((node) => node.id)
+            )
+          : input.collapsedIds,
+      })
   );
-  const currentSelectedId = selectedIdFromState(state.nodes);
+  const latestNodesRef = useRef(state.nodes);
+  latestNodesRef.current = state.nodes;
+  const isCollapsedByDefaultRef = useRef(isCollapsedByDefault);
+  isCollapsedByDefaultRef.current = isCollapsedByDefault;
+  // Scans every node, so only redo it when node state changes, not on scroll renders.
+  const currentSelectedId = useMemo(() => selectedIdFromState(state.nodes), [state.nodes]);
 
   // id -> index lookup so getNodeProps resolves in O(1) instead of scanning
   // the whole tree per rendered row.
@@ -256,14 +282,28 @@ export function useTree<TData, TFilterValue>({
   }, [currentSelectedId]);
 
   const treeNodeCount = tree.length;
+  const previousStructureKey = useRef(structureKey);
 
   // Callers may recreate the tree array; preserve reducer state unless its shape changes.
   useEffect(() => {
-    if (treeNodeCount !== previousNodeCount.current) {
-      previousNodeCount.current = treeNodeCount;
-      dispatch({ type: "UPDATE_TREE", payload: { tree: latestTreeRef.current } });
+    if (
+      treeNodeCount === previousNodeCount.current &&
+      structureKey === previousStructureKey.current
+    ) {
+      return;
     }
-  }, [treeNodeCount]);
+    previousNodeCount.current = treeNodeCount;
+    previousStructureKey.current = structureKey;
+    const nextTree = latestTreeRef.current;
+    const collapseByDefault = isCollapsedByDefaultRef.current;
+    const knownNodes = latestNodesRef.current;
+    const newlyCollapsedIds = collapseByDefault
+      ? nextTree
+          .filter((node) => !(node.id in knownNodes) && collapseByDefault(node))
+          .map((node) => node.id)
+      : undefined;
+    dispatch({ type: "UPDATE_TREE", payload: { tree: nextTree, collapsedIds: newlyCollapsedIds } });
+  }, [treeNodeCount, structureKey]);
 
   const latestFilterRef = useRef(filter);
   latestFilterRef.current = filter;
@@ -278,13 +318,22 @@ export function useTree<TData, TFilterValue>({
     dispatch({ type: "UPDATE_FILTER", payload: { filter: latestFilterRef.current } });
   }, [serializedFilterValue]);
 
+  // A new getItemKey makes the virtualizer re-measure every row, so only
+  // change it when the visible rows change.
+  const getItemKey = useCallback(
+    (index: number) => state.visibleNodeIds[index],
+    [state.visibleNodeIds]
+  );
+
   // oxlint-disable-next-line react/incompatible-library -- TanStack Virtual is not compatible with compiler memoization.
   const virtualizer = useVirtualizer({
     count: state.visibleNodeIds.length,
-    getItemKey: (index) => state.visibleNodeIds[index],
+    getItemKey,
     getScrollElement: () => parentRef.current,
     estimateSize: (index: number) => {
-      const treeItem = tree[index];
+      const id = state.visibleNodeIds[index];
+      const treeIndex = id === undefined ? undefined : treeIndexById.get(id);
+      const treeItem = treeIndex === undefined ? undefined : tree[treeIndex];
       if (!treeItem) return 0;
       return estimatedRowHeight({
         node: treeItem,
@@ -319,15 +368,28 @@ export function useTree<TData, TFilterValue>({
     dispatch({ type: "TOGGLE_NODE_SELECTION", payload: { id, scrollToNode, scrollToNodeFn } });
   };
 
+  const notifyExpanded = (id: string, expanded: boolean) => {
+    const node = state.nodes[id];
+    if (onExpandedChange && node && node.expanded !== expanded) {
+      onExpandedChange(id, expanded);
+    }
+  };
+
   const expandNode = (id: string, scrollToNode = true) => {
+    notifyExpanded(id, true);
     dispatch({ type: "EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
   };
 
   const collapseNode = (id: string) => {
+    notifyExpanded(id, false);
     dispatch({ type: "COLLAPSE_NODE", payload: { id } });
   };
 
   const toggleExpandNode = (id: string, scrollToNode = true) => {
+    const node = state.nodes[id];
+    if (node) {
+      notifyExpanded(id, !node.expanded);
+    }
     dispatch({ type: "TOGGLE_EXPAND_NODE", payload: { id, scrollToNode, scrollToNodeFn } });
   };
 
@@ -432,14 +494,14 @@ export function useTree<TData, TFilterValue>({
               const treeNode = tree.find((node) => node.id === selected);
 
               if (e.altKey) {
-                if (treeNode && treeNode.hasChildren) {
+                if (treeNode && canExpand(treeNode)) {
                   collapseLevel(treeNode.level);
                 }
                 break;
               }
 
               const shouldCollapse =
-                treeNode && treeNode.hasChildren && state.nodes[selected].expanded;
+                treeNode && canExpand(treeNode) && state.nodes[selected].expanded;
               if (shouldCollapse) {
                 collapseNode(selected);
               } else {
@@ -459,7 +521,7 @@ export function useTree<TData, TFilterValue>({
               const treeNode = tree.find((node) => node.id === selected);
 
               if (e.altKey) {
-                if (treeNode && treeNode.hasChildren) {
+                if (treeNode && canExpand(treeNode)) {
                   expandLevel(treeNode.level);
                 }
                 break;
