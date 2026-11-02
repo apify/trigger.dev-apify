@@ -36,12 +36,14 @@ import {
   v3ErrorsPath,
   v3LogsPath,
   v3ModelsPath,
+  v3OidcPath,
   v3ProjectAlertsPath,
   v3ProjectSettingsIntegrationsPath,
   v3PromptsPath,
   concurrencyPath,
   v3WaitpointTokensPath,
 } from "~/utils/pathBuilder";
+import { computeCanUseAlertsList } from "~/v3/canUseAlertsList";
 import { AlphaBadge, NewBadge } from "../FeatureBadges";
 import { type RenderIcon } from "../primitives/Icon";
 import { type SideMenuSectionId } from "./sideMenuTypes";
@@ -57,6 +59,7 @@ type SideMenuItemConfig = {
   activeIconColor: string;
   inactiveIconColor?: string;
   to: string;
+  matchPrefix?: boolean;
   dataAction?: string;
   badge?: ReactNode;
   trailingIconClassName?: string;
@@ -79,6 +82,7 @@ export function buildSideMenuSections({
   project,
   environment,
   isAdmin,
+  alertsConfigured,
   featureFlags,
   isManagedCloud,
   dashboards,
@@ -87,7 +91,14 @@ export function buildSideMenuSections({
   project: ProjectForPath;
   environment: EnvironmentForPath;
   isAdmin: boolean;
-  featureFlags: { hasAiAccess?: boolean; hasQueryAccess?: boolean; hasLogsPageAccess?: boolean };
+  alertsConfigured: boolean;
+  featureFlags: {
+    hasAiAccess?: boolean;
+    hasQueryAccess?: boolean;
+    hasLogsPageAccess?: boolean;
+    alertsEnabled?: boolean;
+    oidcEnabled?: boolean;
+  };
   isManagedCloud: boolean;
   /** Side-menu-only extras on the Dashboards item; the customize modal has no use for them. */
   dashboards?: { action?: ReactNode; after?: ReactNode };
@@ -107,7 +118,6 @@ export function buildSideMenuSections({
           activeIconColor: "text-aiPrompts",
           to: v3PromptsPath(organization, project, environment),
           dataAction: "prompts",
-          badge: <NewBadge />,
         },
         {
           id: "models",
@@ -116,17 +126,33 @@ export function buildSideMenuSections({
           activeIconColor: "text-models",
           to: v3ModelsPath(organization, project, environment),
           dataAction: "models",
-          badge: <NewBadge />,
         },
       ],
     });
   }
 
-  if (isAdmin || featureFlags.hasQueryAccess || featureFlags.hasLogsPageAccess) {
+  const alertsItem = {
+    id: "alerts",
+    name: "Alerts",
+    icon: BellIcon,
+    activeIconColor: "text-text-bright",
+    to: v3ProjectAlertsPath(organization, project, environment),
+    dataAction: "alerts",
+  } satisfies SideMenuItemConfig;
+  const showObservability =
+    isAdmin || featureFlags.hasQueryAccess || featureFlags.hasLogsPageAccess;
+  const alertsInObservability =
+    showObservability &&
+    computeCanUseAlertsList(featureFlags.alertsEnabled === true, isAdmin, alertsConfigured);
+
+  if (showObservability) {
     staticSections.push({
       id: "metrics",
       title: "Observability",
       items: [
+        ...(alertsInObservability
+          ? [{ ...alertsItem, matchPrefix: true, badge: <NewBadge /> }]
+          : []),
         ...(isAdmin || featureFlags.hasLogsPageAccess
           ? [
               {
@@ -150,6 +176,10 @@ export function buildSideMenuSections({
                 to: v3ErrorsPath(organization, project, environment),
                 dataAction: "errors",
               } satisfies SideMenuItemConfig,
+            ]
+          : []),
+        ...(isAdmin || featureFlags.hasQueryAccess
+          ? [
               {
                 id: "query",
                 name: "Query",
@@ -257,14 +287,19 @@ export function buildSideMenuSections({
         to: v3ApiKeysPath(organization, project, environment),
         dataAction: "api keys",
       },
-      {
-        id: "alerts",
-        name: "Alerts",
-        icon: BellIcon,
-        activeIconColor: "text-text-bright",
-        to: v3ProjectAlertsPath(organization, project, environment),
-        dataAction: "alerts",
-      },
+      ...(isManagedCloud && featureFlags.oidcEnabled
+        ? [
+            {
+              id: "oidc",
+              name: "Workload identity",
+              icon: KeyIcon,
+              activeIconColor: "text-text-bright",
+              to: v3OidcPath(organization, project, environment),
+              dataAction: "oidc",
+            } satisfies SideMenuItemConfig,
+          ]
+        : []),
+      ...(alertsInObservability ? [] : [alertsItem]),
       ...(isManagedCloud
         ? [
             {

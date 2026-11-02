@@ -73,6 +73,7 @@ import { setTimeout } from "node:timers/promises";
 import sourceMapSupport from "source-map-support";
 import { env } from "std-env";
 import { normalizeImportPath } from "../utilities/normalizeImportPath.js";
+import { dropInheritedRunToken, installRunToken } from "./runTokenEnv.js";
 import { VERSION } from "../version.js";
 
 sourceMapSupport.install({
@@ -219,6 +220,7 @@ async function doBootstrap() {
       diagLogLevel: (env.TRIGGER_OTEL_LOG_LEVEL as TracingDiagnosticLogLevel) ?? "none",
       forceFlushTimeoutMillis: 30_000,
       exporters: config.telemetry?.exporters ?? [],
+      spanProcessors: config.telemetry?.spanProcessors ?? [],
       logExporters: config.telemetry?.logExporters ?? [],
       metricExporters: config.telemetry?.metricExporters ?? [],
       metricReaders: config.telemetry?.metricReaders ?? [],
@@ -375,6 +377,7 @@ const zodIpc = new ZodIpcConnection({
       sender
     ) => {
       if (env) {
+        dropInheritedRunToken(env);
         populateEnv(env, {
           override: true,
           previousEnv: _lastEnv,
@@ -669,6 +672,7 @@ const zodIpc = new ZodIpcConnection({
     RESOLVE_WAITPOINT: async ({ waitpoint }) => {
       _sharedWorkerRuntime?.resolveWaitpoints([waitpoint]);
     },
+    UPDATE_RUN_TOKEN: async (update) => ({ installed: installRunToken(_execution, update) }),
   },
 });
 

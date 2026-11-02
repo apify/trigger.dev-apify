@@ -3,6 +3,8 @@ title: "Environment Variables"
 description: "Any environment variables used in your tasks need to be added so the deployed code will run successfully."
 ---
 
+import { RollingOut } from "/snippets/feature-status.jsx";
+
 An environment variable in Node.js is accessed in your code using `process.env.MY_ENV_VAR`.
 
 We deploy your tasks and scale them up and down when they are triggered. So any environment variables you use in your tasks need to accessible to us so your code will run successfully.
@@ -14,7 +16,7 @@ We deploy your tasks and scale them up and down when they are triggered. So any 
 <Steps>
 
 <Step title="Go to the Environment Variables page">
-  In the sidebar select the "Environment Variables" page, then press the "New environment variable"
+  In the sidebar select the "Environment Variables" page, then press the "Add new"
   button. ![Environment variables page](/images/environment-variables-page.jpg)
 </Step>
 
@@ -42,6 +44,8 @@ When creating an environment variable, you can mark it as a **Secret**. Secret v
 ### Editing environment variables
 
 You can edit an environment variable's values. You cannot edit the key name, you must delete and create a new one.
+
+<RollingOut flag="allowEmptyEnvironmentVariableValues" />
 
 <Note>
   An empty string is a valid value. Saving a variable with an empty value stores it as an empty
@@ -187,6 +191,25 @@ The context object provides:
 - `ctx.project.ref` - The project reference
 
 For more information about the context object, see the [Context documentation](/context).
+
+#### Linking to a run in the dashboard
+
+Trigger.dev sets `TRIGGER_DASHBOARD_URL` on every run, in development and deployed environments. Its value is the dashboard's address without a trailing slash, so it also points at your own instance when you self-host. Append `/runs/<runId>` to link to a run:
+
+```ts
+import { task } from "@trigger.dev/sdk";
+
+export const reportTask = task({
+  id: "report-task",
+  run: async (payload, { ctx }) => {
+    const runUrl = `${process.env.TRIGGER_DASHBOARD_URL}/runs/${ctx.run.id}`;
+
+    console.log(`View this run: ${runUrl}`);
+  },
+});
+```
+
+The `/runs/<runId>` link checks that the viewer is a member of the run's organization, then redirects to the full run page. If you set your own `TRIGGER_DASHBOARD_URL` environment variable on the project, your value is used instead.
 
 ### Sync env vars from another service
 

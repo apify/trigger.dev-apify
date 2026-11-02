@@ -311,10 +311,20 @@ export type TraceChunkEvent = {
 
 export type { TraceChunkCursor };
 
+export type TraceChunkScopeOptions = {
+  includeDebugLogs?: boolean;
+  // Live tail: only rows written at or after this time (ms since epoch).
+  tailInsertedAtSinceMs?: number;
+  // Only rows written at or before this time.
+  insertedAtEnd?: Date;
+};
+
 export type TraceChunk = {
   events: Array<TraceChunkEvent>;
   nextCursor: TraceChunkCursor | null;
   hasMore: boolean;
+  // A span had more rows at one timestamp than one read allows; the extra rows were skipped.
+  droppedKeyRows?: boolean;
 };
 
 export type TraceErrorEvents = {
@@ -422,16 +432,20 @@ export interface IEventRepository {
   }): Promise<void>;
 
   // Query methods
+  /**
+   * `anchorSpanId` roots the summary at that span (the viewed run), so a window that
+   * starts after the trace root still builds. Returns undefined if it isn't in the rows.
+   */
   getTraceSummary(
     storeTable: TaskEventStoreTable,
     environmentId: string,
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; anchorSpanId?: string; insertedAtEnd?: Date }
   ): Promise<TraceSummary | undefined>;
 
-  /** Fetch the anchor span, its ancestors (for override propagation), and all descendants. */
+  /** Fetch the anchor span and all its descendants (no ancestors). */
   getTraceSubtreeSummary(
     storeTable: TaskEventStoreTable,
     environmentId: string,
@@ -439,7 +453,7 @@ export interface IEventRepository {
     anchorSpanId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<TraceSummary | undefined>;
 
   getTraceChunk(
@@ -449,17 +463,8 @@ export interface IEventRepository {
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
     cursor: TraceChunkCursor | undefined,
-    options?: { includeDebugLogs?: boolean; limit?: number; tailInsertedAtSinceMs?: number }
+    options?: TraceChunkScopeOptions & { limit?: number }
   ): Promise<TraceChunk | undefined>;
-
-  getTraceSpanCount(
-    storeTable: TaskEventStoreTable,
-    environmentId: string,
-    traceId: string,
-    startCreatedAt: Date,
-    endCreatedAt: Date | undefined,
-    options?: { includeDebugLogs?: boolean }
-  ): Promise<number | undefined>;
 
   getTraceErrorEvents(
     storeTable: TaskEventStoreTable,
@@ -467,7 +472,7 @@ export interface IEventRepository {
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<TraceErrorEvents | undefined>;
 
   getTraceSpanWithAncestors(
@@ -477,7 +482,7 @@ export interface IEventRepository {
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
     spanId: string,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<Array<TraceChunkEvent> | undefined>;
 
   getTraceDetailedSummary(
@@ -489,7 +494,10 @@ export interface IEventRepository {
     options?: { includeDebugLogs?: boolean }
   ): Promise<TraceDetailedSummary | undefined>;
 
-  /** Fetch the anchor span subtree as a detailed hierarchical trace rooted at anchorSpanId. */
+  /**
+   * Fetch the anchor span subtree as a detailed hierarchical trace rooted at anchorSpanId.
+   * `ancestorInsertedAtStart` bounds the ancestor reads (e.g. the trace root's createdAt).
+   */
   getTraceDetailedSubtreeSummary(
     storeTable: TaskEventStoreTable,
     environmentId: string,
@@ -497,7 +505,7 @@ export interface IEventRepository {
     anchorSpanId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date; ancestorInsertedAtStart?: Date }
   ): Promise<TraceDetailedSummary | undefined>;
 
   // Streams a trace's events in start_time order, one at a time, without ever
@@ -518,7 +526,8 @@ export interface IEventRepository {
     traceId: string,
     runId: string,
     startCreatedAt: Date,
-    endCreatedAt?: Date
+    endCreatedAt?: Date,
+    options?: { insertedAtEnd?: Date }
   ): Promise<RunPreparedEvent[]>;
 
   getSpan(
@@ -528,7 +537,7 @@ export interface IEventRepository {
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<SpanDetail | undefined>;
 
   // Event recording methods

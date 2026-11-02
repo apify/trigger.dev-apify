@@ -24,6 +24,7 @@ export const ROUTES_BY_GIVEN_RUN_ID: readonly string[] = [
   "recordRetryOutcome",
   "requeueRun",
   "recordBulkActionMembership",
+  "markRunWaitpointsOnStore",
   "cancelRun",
   "failRunPermanently",
   "finalizeRun",
@@ -46,6 +47,12 @@ export const GIVEN_RUN_ID_ROUTE = "#routeForWrite(runId)";
 export const PLACEMENT_SITES: readonly PlacementSite[] = [
   {
     method: "runInTransaction",
+    basis: "own-id",
+    missMode: "loud",
+    routes: ["#routeOrNew(runId)"],
+  },
+  {
+    method: "settlePendingUnit",
     basis: "own-id",
     missMode: "loud",
     routes: ["#routeOrNew(runId)"],

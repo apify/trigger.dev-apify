@@ -6,6 +6,8 @@ import { memo, useMemo, useRef } from "react";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { Callout } from "~/components/primitives/Callout";
 import { renderPart, toSafeUrl } from "~/components/runs/v3/agent/AgentMessageView";
+import type { ToolResultPayload } from "./alert-creation/draftPatch";
+import { draftResultLines } from "./alert-creation/useCreationAgentSend";
 import { sameOriginPath } from "./navigate-target";
 import { IN_FLIGHT_TOOL_STATES, liveProgress, type TurnActivity } from "./progress-line";
 import { useTranscriptAutoScroll } from "./useTranscriptAutoScroll";
@@ -163,9 +165,6 @@ export function splitActionsBlocks<T>(blocks: T[]): { content: T[]; actions: T[]
   };
 }
 
-// #region chat-layout transcript
-// `chat-layout.test.ts` fails if a spacing utility class appears in this region.
-
 function renderDashboardPart(
   part: UIMessage["parts"][number],
   i: number,
@@ -186,6 +185,14 @@ function renderDashboardPart(
     return isProsePart(p) ? (
       <ChatText key={i} text={stripModelImages(p.text ?? "")} resolveUri={resolveUri} />
     ) : null;
+  }
+
+  if (type === "tool-update_alert_draft" && p.state === "output-available") {
+    const output = (part as { output?: ToolResultPayload }).output;
+    if (!output || typeof output !== "object") return null;
+    return draftResultLines(output).map((line, index) => (
+      <ChatText key={`${i}:${index}`} text={line.text} />
+    ));
   }
 
   if (type.startsWith("tool-")) {
@@ -447,4 +454,3 @@ export function DashboardAgentMessages(props: DashboardAgentMessagesProps) {
     </ChatTranscript>
   );
 }
-// #endregion chat-layout transcript

@@ -1,11 +1,14 @@
+import { err, errAsync, ok, type Result, type ResultAsync } from "neverthrow";
 import { MachinePresetName, tryCatch } from "@trigger.dev/core/v3";
 import type { RuntimeEnvironmentType } from "@trigger.dev/database";
 import {
   BillingClient,
   defaultMachine as defaultMachineFromPlatform,
+  IpLocationResult,
   machines as machinesFromPlatform,
   type BillingAlertsResult,
   type CreatePrivateLinkConnectionBody,
+  type IpLocation,
   type Limits,
   type MachineCode,
   type PrivateLinkConnection,
@@ -43,6 +46,11 @@ import { newProjectPath, organizationBillingPath } from "~/utils/pathBuilder";
 import { singleton } from "~/utils/singleton";
 import { RedisCacheStore } from "./unkey/redisCacheStore.server";
 import { $replica } from "~/db.server";
+import {
+  enqueueGithubBuildWithClient,
+  type EnqueueGithubBuildOptions,
+  type EnqueueBuildError,
+} from "./enqueueGithubBuild.server";
 import { metrics } from "@opentelemetry/api";
 
 function initializeClient() {
@@ -202,6 +210,16 @@ function initializePlatformCache() {
       fresh: 60_000,
       stale: 120_000,
     }),
+    // Own context: getCachedPlans' loader throws on failure, and the default context would
+    // leave a failed background refresh as an unhandled rejection.
+    plans: new Namespace<PlansResult>(
+      { waitUntil: (p) => void p.catch(() => {}) },
+      {
+        stores: [memory, redisCacheStore],
+        fresh: 60_000,
+        stale: 120_000,
+      }
+    ),
   });
 
   return cache;
@@ -224,7 +242,7 @@ export function bustBillingLimitCaches(organizationId: string) {
  * plan change — a downgrade can revoke SSO, and serving the previous decision
  * for the stale TTL would keep a surface open that the new plan doesn't allow.
  */
-function invalidatePlanDerivedCaches(organizationId: string) {
+export function invalidatePlanDerivedCaches(organizationId: string) {
   platformCache.entitlement.remove(organizationId).catch(() => {});
   platformCache.ssoEntitlement.remove(organizationId).catch(() => {});
 }
@@ -348,37 +366,68 @@ export async function getCurrentPlan(orgId: string) {
   try {
     const result = await client.currentPlan(orgId);
 
-    const firstDayOfMonth = new Date();
-    firstDayOfMonth.setUTCDate(1);
-    firstDayOfMonth.setUTCHours(0, 0, 0, 0);
-
-    const firstDayOfNextMonth = new Date();
-    firstDayOfNextMonth.setUTCDate(1);
-    firstDayOfNextMonth.setUTCMonth(firstDayOfNextMonth.getUTCMonth() + 1);
-    firstDayOfNextMonth.setUTCHours(0, 0, 0, 0);
-
     if (!result.success) {
       recordPlatformFailure("getCurrentPlan", "no_success");
       return undefined;
     }
 
-    const periodStart = firstDayOfMonth;
-    const periodEnd = firstDayOfNextMonth;
-    const periodRemainingDuration = periodEnd.getTime() - new Date().getTime();
-
-    const usage = {
-      periodStart,
-      periodEnd,
-      periodRemainingDuration,
-    };
-
-    return { ...result, usage };
+    return withUsagePeriod(result);
   } catch (_e) {
     recordPlatformFailure("getCurrentPlan", "caught");
     return undefined;
   }
 }
 
+export async function getCurrentPlanOrThrow(orgId: string) {
+  if (!client) return undefined;
+
+  const result = await client.currentPlan(orgId);
+  if (!result.success) {
+    recordPlatformFailure("getCurrentPlanOrThrow", "no_success");
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
+function withUsagePeriod<T extends object>(result: T) {
+  const firstDayOfMonth = new Date();
+  firstDayOfMonth.setUTCDate(1);
+  firstDayOfMonth.setUTCHours(0, 0, 0, 0);
+
+  const firstDayOfNextMonth = new Date();
+  firstDayOfNextMonth.setUTCDate(1);
+  firstDayOfNextMonth.setUTCMonth(firstDayOfNextMonth.getUTCMonth() + 1);
+  firstDayOfNextMonth.setUTCHours(0, 0, 0, 0);
+
+  const periodStart = firstDayOfMonth;
+  const periodEnd = firstDayOfNextMonth;
+  const periodRemainingDuration = periodEnd.getTime() - new Date().getTime();
+
+  return { ...result, usage: { periodStart, periodEnd, periodRemainingDuration } };
+}
+
+export type CurrentPlanWithUsage = NonNullable<Awaited<ReturnType<typeof getCurrentPlan>>>;
+
+/**
+ * For the billing pages only: any failed plan read is "billing unavailable" rather than no plan, so
+ * they say so instead of offering plan changes. Every other caller keeps getCurrentPlan.
+ */
+export async function getBillingPagePlan(
+  orgId: string
+): Promise<Result<CurrentPlanWithUsage | undefined, "billing_unavailable">> {
+  if (!client) return ok(undefined);
+
+  const [error, result] = await tryCatch(client.currentPlan(orgId));
+  if (error) {
+    recordPlatformFailure("getCurrentPlan", "caught");
+    return err("billing_unavailable");
+  }
+  if (result.success) return ok(withUsagePeriod(result));
+
+  recordPlatformFailure("getCurrentPlan", "no_success");
+  return err("billing_unavailable");
+}
 export type SelfServePurchaseBlockReason = "plan_unavailable" | "managed_billing";
 
 /**
@@ -533,6 +582,33 @@ export async function customerPortalUrl(orgId: string, orgSlug: string) {
   }
 }
 
+const IP_LOCATION_TIMEOUT_MS = 1_000;
+
+/**
+ * Approximate country and network owner of an IP, from billing's IPinfo Lite data. Returns
+ * `undefined` when billing isn't configured, the IP isn't covered, or the lookup fails or takes
+ * longer than a second, so a slow billing service never holds up a login.
+ */
+export async function getIpLocation(ip: string | null): Promise<IpLocation | undefined> {
+  if (!client || !ip) return undefined;
+
+  const [error, result] = await tryCatch(
+    client.fetch(`/api/v1/ip-location?ip=${encodeURIComponent(ip)}`, IpLocationResult, {
+      signal: AbortSignal.timeout(IP_LOCATION_TIMEOUT_MS),
+    })
+  );
+  if (error) {
+    recordPlatformFailure("getIpLocation", "caught");
+    return undefined;
+  }
+  if (!result.success) {
+    recordPlatformFailure("getIpLocation", "no_success");
+    return undefined;
+  }
+
+  return result.location ?? undefined;
+}
+
 export async function getPlans() {
   if (!client) return undefined;
 
@@ -543,6 +619,31 @@ export async function getPlans() {
       return undefined;
     }
     return result;
+  } catch (_e) {
+    recordPlatformFailure("getPlans", "caught");
+    return undefined;
+  }
+}
+
+type PlansResult = NonNullable<Awaited<ReturnType<typeof getPlans>>>;
+
+/**
+ * {@link getPlans} behind a short SWR cache, for pages that poll. The catalog is the same for
+ * every org, so it is cached under one key. The loader throws on failure because `swr` stores
+ * whatever it returns, `undefined` included, which would overwrite a good stale catalog. A
+ * failed background refresh therefore keeps the stale value; a failed cold fetch returns
+ * `undefined`.
+ */
+export async function getCachedPlans(): Promise<PlansResult | undefined> {
+  if (!client) return undefined;
+
+  try {
+    const result = await platformCache.plans.swr("all", async () => {
+      const plans = await getPlans();
+      if (!plans) throw new Error("getPlans failed");
+      return plans;
+    });
+    return result.err ? undefined : result.val;
   } catch (_e) {
     recordPlatformFailure("getPlans", "caught");
     return undefined;
@@ -577,6 +678,24 @@ export async function activateFreePlan(
   opts?.invalidateBillingCache?.(organizationId);
   invalidatePlanDerivedCaches(organizationId);
   return { success: true };
+}
+
+export async function cancelSubscription(orgId: string) {
+  if (!client) return undefined;
+
+  const [error, result] = await tryCatch(client.cancelSubscription(orgId));
+  if (error) {
+    recordPlatformFailure("cancelSubscription", "caught");
+    throw error;
+  }
+
+  if (result.success) {
+    invalidatePlanDerivedCaches(orgId);
+  } else {
+    recordPlatformFailure("cancelSubscription", "no_success");
+  }
+
+  return result;
 }
 
 export async function setPlan(
@@ -1145,6 +1264,19 @@ export async function enqueueBuild(
   }
 
   return result;
+}
+
+export function enqueueGithubBuild(
+  projectId: string,
+  deploymentId: string,
+  github: { commitSha: string; ref: string },
+  options: EnqueueGithubBuildOptions = {}
+): ResultAsync<{ buildId: string }, EnqueueBuildError> {
+  if (!client) return errAsync({ type: "billing_not_configured" as const });
+  // The published client's enqueueBuild request type predates the github source.
+  return enqueueGithubBuildWithClient(client, projectId, deploymentId, github, options, (kind) =>
+    recordPlatformFailure("enqueueGithubBuild", kind)
+  );
 }
 
 export async function getPrivateLinks(

@@ -40,10 +40,17 @@ import {
   type IdempotencyKeyConcern,
   type ClaimedIdempotency,
 } from "../concerns/idempotencyKeys.server";
-import { resolveScheduledQueueSplitEnabled } from "../concerns/workerQueueSplit.server";
-import { workerQueueForBirth } from "../concerns/workerQueueAssignment.server";
-import { resolveComputeMigration } from "../concerns/computeMigration.server";
-import { workerRegionRegistry, backingForQueue, regionForQueue } from "~/v3/workerRegions.server";
+import {
+  environmentWorkerQueueOverride,
+  workerQueueForBirth,
+} from "../concerns/workerQueueAssignment.server";
+import { allowsAnyCompat, resolveComputeMigration } from "../concerns/computeMigration.server";
+import {
+  workerRegionRegistry,
+  backingForQueue,
+  regionForQueue,
+  selfBackingWorkerGroups,
+} from "~/v3/workerRegions.server";
 import { globalFlagsRegistry } from "~/v3/globalFlagsRegistry.server";
 import {
   publishClaim as publishMollifierClaim,
@@ -443,7 +450,7 @@ export class RunEngineTriggerTaskService {
           const parkedOnExternalDeploymentId =
             externalDeploymentResolution?.outcome === "park" ? externalDeploymentId : undefined;
 
-          const { queueName, lockedQueueId, taskTtl, taskKind, gates } =
+          const { queueName, lockedQueueId, taskTtl, taskKind, gates, templateKey } =
             await this.queueConcern.resolveQueueProperties(
               triggerRequest,
               lockedToBackgroundWorker ?? undefined
@@ -510,8 +517,24 @@ export class RunEngineTriggerTaskService {
             ? regionForQueue(baseWorkerQueue, workerGroups)
             : undefined;
           const backing = baseWorkerQueue
-            ? backingForQueue(baseWorkerQueue, workerGroups)
+            ? backingForQueue(
+                baseWorkerQueue,
+                workerGroups,
+                selfBackingWorkerGroups(
+                  env.RUN_ENGINE_MIXED_RUNTIME_WORKER_GROUPS,
+                  env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1"
+                )
+              )
             : undefined;
+          const orgFeatureFlags = environment.organization.featureFlags as Record<
+            string,
+            unknown
+          > | null;
+          const environmentOverride = environmentWorkerQueueOverride({
+            orgFeatureFlags,
+            environmentId: environment.id,
+            environmentType: environment.type,
+          });
           const migrated = resolveComputeMigration({
             baseWorkerQueue,
             baseEnableFastPath: enableFastPath,
@@ -519,12 +542,11 @@ export class RunEngineTriggerTaskService {
             backing,
             planType,
             orgId: environment.organization.id,
-            orgFeatureFlags: environment.organization.featureFlags as Record<
-              string,
-              unknown
-            > | null,
+            orgFeatureFlags,
             flags: globalFlagsRegistry.current(),
             envType: environment.type,
+            environmentCompat: environmentOverride.compat,
+            templateKey,
           });
 
           const triggerSource = options.triggerSource ?? "api";
@@ -541,31 +563,27 @@ export class RunEngineTriggerTaskService {
             webhookEndpointId: options.webhookEndpointId,
           };
 
-          // Preserve scheduled lineage independently of the queue-name version.
-          // Rollout decisions use already-loaded org flags and registry data.
-          const scheduledQueueSplitEnabled =
-            environment.type !== "DEVELOPMENT" &&
-            resolveScheduledQueueSplitEnabled({
-              orgFeatureFlags: environment.organization.featureFlags as Record<
-                string,
-                unknown
-              > | null,
-              globalDefault: env.TRIGGER_WORKER_QUEUE_SCHEDULED_SPLIT_ENABLED === "1",
-            });
           const workerQueue =
             migrated.workerQueue !== undefined
               ? workerQueueForBirth({
                   workerQueue: migrated.workerQueue,
                   region: migrated.region,
                   envType: environment.type,
-                  orgFeatureFlags: environment.organization.featureFlags as Record<
-                    string,
-                    unknown
-                  > | null,
-                  globalDefault: env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1",
+                  orgFeatureFlags,
+                  environmentOverride,
+                  v2Enabled: env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1",
+                  splitEnabled: env.TRIGGER_WORKER_QUEUE_SCHEDULED_SPLIT_ENABLED === "1",
                   workerGroups,
                   rootTriggerSource: annotations.rootTriggerSource,
-                  splitEnabled: scheduledQueueSplitEnabled,
+                  templateFallback: migrated.templateFallback,
+                  compute: migrated.compute,
+                  anyCompatAllowed: allowsAnyCompat({
+                    planType,
+                    orgId: environment.organization.id,
+                    orgFeatureFlags,
+                    flags: globalFlagsRegistry.current(),
+                    templateKey,
+                  }),
                 })
               : migrated.workerQueue;
 

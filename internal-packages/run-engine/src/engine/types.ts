@@ -24,6 +24,7 @@ import {
   type GlobalRateLimiter,
 } from "@trigger.dev/redis-worker";
 import type { ControlPlaneResolver } from "./controlPlaneResolver.js";
+import type { WaitpointSystemOptions } from "./systems/waitpointSystem.js";
 import type { FairQueueSelectionStrategyOptions } from "../run-queue/fairQueueSelectionStrategy.js";
 import type { RunQueueMetricsEmitter, RunQueueOptions } from "../run-queue/index.js";
 import type { MinimalAuthenticatedEnvironment } from "../shared/index.js";
@@ -41,6 +42,12 @@ export type WorkerQueueDequeueOptions = WorkerQueuePopOptions & {
   runnerId?: string;
   tx?: PrismaClientOrTransaction;
   skipObserving?: boolean;
+  /**
+   * Set when this consumer can only start runs whose deployment has a `templateKey`. A fresh
+   * attempt of a deployment without one moves to the worker queue this returns. Restores keep
+   * their worker queue.
+   */
+  templateFallbackWorkerQueue?: (workerQueue: string) => string | undefined;
 };
 
 /**
@@ -70,6 +77,11 @@ export type CrossSeamGuardHook = (input: {
 }) => Promise<CrossSeamGuardDecision>;
 
 export type RunEngineOptions = {
+  /** Independent of snapshot residency. Omitted means the existing Postgres waitpoint behavior. */
+  waitpointStoreEnabled?: (
+    organizationId: string,
+    organizationFlags?: unknown
+  ) => boolean | Promise<boolean>;
   prisma: PrismaClient;
   readOnlyPrisma?: PrismaReplicaClient;
   /** Optional RunStore implementation to inject. Defaults to a PostgresRunStore
@@ -114,6 +126,8 @@ export type RunEngineOptions = {
     totalConcurrencyEnabled?: boolean;
     /** Enforce the gates carried in message payloads. See RunQueueOptions.gatesEnabled. */
     gatesEnabled?: boolean;
+    /** Enforce per-key overrides set through the override API. See RunQueueOptions.concurrencyKeyLimitsEnabled. */
+    concurrencyKeyLimitsEnabled?: boolean;
     /** Bounds for the saturated-set reconcile. See RunQueueOptions.reconcile. */
     reconcile?: {
       enabled?: boolean;
@@ -133,6 +147,7 @@ export type RunEngineOptions = {
       processMarkedSchedule?: string;
       scanJitterInMs?: number;
       processMarkedJitterInMs?: number;
+      scanCount?: number;
     };
     /** TTL system options for automatic run expiration */
     ttlSystem?: {
@@ -197,6 +212,8 @@ export type RunEngineOptions = {
       factor?: number;
       /** Whether to add jitter to retry delays. Default: true */
       randomize?: boolean;
+      /** Attempt ceiling for infrastructure-class failures. Default: maxAttempts */
+      infrastructureMaxAttempts?: number;
     };
   };
   debounce?: {
@@ -262,6 +279,12 @@ export type RunEngineOptions = {
    * completion whose inline side effects never acked it. Default: 30s.
    */
   completionGuardDelayMs?: number;
+
+  /**
+   * The MemoryDB completed-record reader, for resolving store-format completed waitpoints in a
+   * Redis-primary resume cycle. Dark by default (undefined leaves the resolver Postgres-only).
+   */
+  waitpointStore?: WaitpointSystemOptions["waitpointStore"];
   heartbeatTimeoutsMs?: Partial<HeartbeatTimeouts>;
   repairSnapshotTimeoutMs?: number;
   treatProductionExecutionStallsAsOOM?: boolean;
@@ -342,16 +365,18 @@ export type EngineStartRunAttemptResult = StartRunAttemptResult & {
   run: { region: string | null; workerQueue: string };
 };
 
-export type RestoreOutcome = "requeue" | "fail";
+export type RestoreOutcome = "requeue" | "fail" | "fallback";
 
-export type RestoreOutcomeResult =
-  | { ok: true; outcome: RestoreOutcome }
-  | {
-      ok: false;
-      code: "SNAPSHOT_CONFLICT";
-      latestSnapshotId: string;
-      latestExecutionStatus: TaskRunExecutionStatus;
-    };
+type SnapshotConflict = {
+  ok: false;
+  code: "SNAPSHOT_CONFLICT";
+  latestSnapshotId: string;
+  latestExecutionStatus: TaskRunExecutionStatus;
+};
+
+export type RestoreOutcomeResult = { ok: true; outcome: RestoreOutcome } | SnapshotConflict;
+
+export type ReleaseRunResult = { ok: true; requeued: boolean } | SnapshotConflict;
 
 export type HeartbeatTimeouts = {
   PENDING_EXECUTING: number;

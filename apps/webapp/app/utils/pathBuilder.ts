@@ -5,6 +5,7 @@ import type { Organization } from "~/models/organization.server";
 import type { Project } from "~/models/project.server";
 import { RUNS_BULK_INSPECTOR_OPEN_VALUE } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs._index/shouldRevalidateRunsList";
 import type { BillingMessageKey } from "./billingMessages";
+import { encodeErrorGroupScope, type ErrorGroupScope } from "./errorGroupScope";
 import { objectToSearchParams } from "./searchParams";
 import { type WaitpointSearchParams } from "~/components/runs/v3/WaitpointTokenFilters";
 export type OrgForPath = Pick<Organization, "slug">;
@@ -266,6 +267,14 @@ export function v3ApiKeysPath(
   return `${v3EnvironmentPath(organization, project, environment)}/apikeys`;
 }
 
+export function v3OidcPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3EnvironmentPath(organization, project, environment)}/oidc`;
+}
+
 export function v3BulkActionsPath(
   organization: OrgForPath,
   project: ProjectForPath,
@@ -307,12 +316,69 @@ export function v3ProjectAlertsPath(
   return `${v3EnvironmentPath(organization, project, environment)}/alerts`;
 }
 
+export function v3ProjectAlertChannelsPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3ProjectAlertsPath(organization, project, environment)}/channels`;
+}
+
+export function v3ProjectLegacyAlertsPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath
+) {
+  return `${v3ProjectAlertsPath(organization, project, environment)}/legacy`;
+}
+
+export function v3AlertPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  alertId: string
+) {
+  return `${v3ProjectAlertsPath(organization, project, environment)}/${alertId}`;
+}
+
 export function v3NewProjectAlertPath(
   organization: OrgForPath,
   project: ProjectForPath,
   environment: EnvironmentForPath
 ) {
   return `${v3ProjectAlertsPath(organization, project, environment)}/new`;
+}
+
+export type AlertDraftPrefillParams =
+  | {
+      area?: "queues" | "runs" | "health" | "errors";
+      capability?: string;
+      scope?: "queue" | "queuePattern" | "task" | "all";
+      scopeValue?: string;
+    }
+  | { capability?: string; scope: ErrorGroupScope; scopeValue?: undefined };
+
+/** Links to the alerts list with `?create=1` and optional prefill params, opening
+ * the DashboardAgentPanel in creation mode. Params match `resolveAlertDraftPrefill`. */
+export function v3AlertCreatePath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  prefill?: AlertDraftPrefillParams
+) {
+  const base = v3ProjectAlertsPath(organization, project, environment);
+  const flat =
+    prefill && typeof prefill.scope === "object"
+      ? {
+          capability: prefill.capability,
+          scope: "errorGroup",
+          scopeValue: encodeErrorGroupScope(prefill.scope),
+        }
+      : prefill;
+  const merged = { create: "1", ...flat };
+  const searchParams = objectToSearchParams(merged);
+  const qs = searchParams?.toString();
+  return qs ? `${base}?${qs}` : base;
 }
 
 export function v3NewProjectAlertPathConnectToSlackPath(
@@ -568,11 +634,13 @@ export function v3RunTraceChunkPath(
   organization: OrgForPath,
   project: ProjectForPath,
   environment: EnvironmentForPath,
-  run: v3RunForPath
+  run: v3RunForPath,
+  options?: { context?: "session" }
 ) {
-  return `/resources/orgs/${organizationParam(organization)}/projects/${projectParam(
+  const path = `/resources/orgs/${organizationParam(organization)}/projects/${projectParam(
     project
   )}/env/${environmentParam(environment)}/runs/${run.friendlyId}/trace-chunk`;
+  return options?.context ? `${path}?context=${options.context}` : path;
 }
 
 // Run status probe for the trace viewer's live-tail backstop.
@@ -684,6 +752,32 @@ export function v3SessionPath(
   session: { friendlyId: string }
 ) {
   return `${v3SessionsPath(organization, project, environment)}/${session.friendlyId}`;
+}
+
+// A page of a session's runs for the Trace tab, newest first.
+export function v3SessionRunsPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  session: { friendlyId: string }
+) {
+  return `/resources/orgs/${organizationParam(organization)}/projects/${projectParam(
+    project
+  )}/env/${environmentParam(environment)}/sessions/${encodeURIComponent(session.friendlyId)}/runs`;
+}
+
+// A page of a session's saved transcript: the newest, or the one `before` a message id.
+export function v3SessionTranscriptPath(
+  organization: OrgForPath,
+  project: ProjectForPath,
+  environment: EnvironmentForPath,
+  sessionParam: string,
+  before?: string
+) {
+  const path = `/resources/orgs/${organizationParam(organization)}/projects/${projectParam(
+    project
+  )}/env/${environmentParam(environment)}/sessions/${encodeURIComponent(sessionParam)}/transcript`;
+  return before ? `${path}?before=${encodeURIComponent(before)}` : path;
 }
 
 export function v3BatchPath(

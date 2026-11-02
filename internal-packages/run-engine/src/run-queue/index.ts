@@ -88,6 +88,9 @@ const SemanticAttributes = {
  * active or observed gate never re-anchors; the Lua helper inlines the same value. */
 const GATE_QUEUED_COUNTER_TTL_SECONDS = 86400;
 
+/** Concurrency sets the sweeper processes at once from one SCAN page (the old COUNT 10 page width). */
+export const SWEEPER_SET_CONCURRENCY = 10;
+
 /** Counters a dequeue script tallies for its reconcile work; positional on the reply's third slot. */
 type ReconcileCounters = {
   passesGroup: number;
@@ -215,12 +218,38 @@ local function __gateReconcile(setKey, msgKeyPrefix, reconcileKeyPrefix, rc, kin
   end
 end
 
-local function __gatesHaveCapacity(gatesKeyPrefix, msg, messageId, envLimit, msgKeyPrefix, rc)
+-- Per-key override key for a concurrency-key variant: <base>:ckLimit:<key>. Queue names
+-- never contain ':', so the first ':ck:' is the variant delimiter, and the result cannot
+-- coincide with any run's queue or queue-derived key whatever the key value contains.
+local function __ckLimitKeyFromVariant(variant)
+  local p = string.find(variant, ':ck:', 1, true)
+  if not p then return nil end
+  return string.sub(variant, 1, p - 1) .. ':ckLimit:' .. string.sub(variant, p + 4)
+end
+
+-- The per-key limit in force for one pool: the pool's perKey, replaced by the key's override
+-- when overrides are enabled and the pool declares a perKey above zero. An absent perKey
+-- (removed by a deploy) takes its overrides out of force; a paused pool (perKey 0) stays paused.
+local function __perKeyLimitRaw(enabled, baseRaw, ckLimitKey)
+  if enabled and baseRaw and tonumber(baseRaw) > 0 and ckLimitKey then
+    local override = redis.call('GET', ckLimitKey)
+    if override then return override end
+  end
+  return baseRaw or '1000000'
+end
+
+local function __gatesHaveCapacity(gatesKeyPrefix, msg, messageId, envLimit, msgKeyPrefix, rc, keyLimitsEnabled)
   if not msg.gates then return true end
   for _, gate in ipairs(msg.gates) do
     local base, variant, gateKey = __gateKeys(gatesKeyPrefix, msg, gate)
     local occupancy = tonumber(redis.call('SCARD', variant .. ':currentConcurrency') or '0')
-    local perKeyLimit = math.min(tonumber(redis.call('GET', base .. ':concurrency') or '1000000'), envLimit)
+    -- A per-key override on the gate applies to the pool that follows the run's own key; a
+    -- gate pinned to a literal key is a shared pool the override API addresses by that
+    -- literal key, so it reads the same way.
+    local ckLimitKey = nil
+    if gateKey and gateKey ~= '' then ckLimitKey = base .. ':ckLimit:' .. gateKey end
+    local perKeyRaw = __perKeyLimitRaw(keyLimitsEnabled, redis.call('GET', base .. ':concurrency'), ckLimitKey)
+    local perKeyLimit = math.min(tonumber(perKeyRaw), envLimit)
     if occupancy >= perKeyLimit and redis.call('SISMEMBER', variant .. ':currentConcurrency', messageId) == 0 then
       __gateReconcile(variant .. ':currentConcurrency', msgKeyPrefix, gatesKeyPrefix, rc, 'gate', perKeyLimit)
       return false
@@ -744,7 +773,8 @@ local keyPrefix = ARGV[11]
 -- TTL (seconds) applied to counter lazy-init SETs
 local counterTtl = ARGV[12]
 local totalConcurrencyEnabled = ARGV[13] == '1'
-local gatesEnabled = ARGV[14] == '1'${v.args ?? ""}
+local gatesEnabled = ARGV[14] == '1'
+local concurrencyKeyLimitsEnabled = ARGV[15] == '1'${v.args ?? ""}
 
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
@@ -760,10 +790,10 @@ if enableFastPath == '1' then
 
     if envCurrent < envLimitWithBurst then
       local queueCurrent = tonumber(redis.call('SCARD', queueCurrentConcurrencyKey) or '0')
-      local queueLimit = math.min(
-        tonumber(redis.call('GET', queueConcurrencyLimitKey) or '1000000'),
-        envLimit
-      )
+      -- A per-key override on this key caps the fast path too, so an override lower than the
+      -- queue's perKey cannot be bypassed while the variant is empty.
+      local queueLimitRaw = __perKeyLimitRaw(concurrencyKeyLimitsEnabled, redis.call('GET', queueConcurrencyLimitKey), __ckLimitKeyFromVariant(queueKey))
+      local queueLimit = math.min(tonumber(queueLimitRaw), envLimit)
 
       if queueCurrent < queueLimit then
         -- Total-cap gate: a fast-path admit consumes a group slot, so it must
@@ -786,7 +816,7 @@ if enableFastPath == '1' then
           local okDecode, decoded = pcall(cjson.decode, messageData)
           if okDecode and type(decoded) == 'table' and decoded.gates then
             gateMsg = decoded
-            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil)
+            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil, nil, concurrencyKeyLimitsEnabled)
           end
         end
 
@@ -924,7 +954,8 @@ local keyPrefix = ARGV[13]
 -- TTL (seconds) applied to counter lazy-init SETs
 local counterTtl = ARGV[14]
 local totalConcurrencyEnabled = ARGV[15] == '1'
-local gatesEnabled = ARGV[16] == '1'${v.args ?? ""}
+local gatesEnabled = ARGV[16] == '1'
+local concurrencyKeyLimitsEnabled = ARGV[17] == '1'${v.args ?? ""}
 
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
@@ -940,10 +971,10 @@ if enableFastPath == '1' then
 
     if envCurrent < envLimitWithBurst then
       local queueCurrent = tonumber(redis.call('SCARD', queueCurrentConcurrencyKey) or '0')
-      local queueLimit = math.min(
-        tonumber(redis.call('GET', queueConcurrencyLimitKey) or '1000000'),
-        envLimit
-      )
+      -- A per-key override on this key caps the fast path too, so an override lower than the
+      -- queue's perKey cannot be bypassed while the variant is empty.
+      local queueLimitRaw = __perKeyLimitRaw(concurrencyKeyLimitsEnabled, redis.call('GET', queueConcurrencyLimitKey), __ckLimitKeyFromVariant(queueKey))
+      local queueLimit = math.min(tonumber(queueLimitRaw), envLimit)
 
       if queueCurrent < queueLimit then
         -- Total-cap gate: see enqueueMessageCkTracked.
@@ -964,7 +995,7 @@ if enableFastPath == '1' then
           local okDecode, decoded = pcall(cjson.decode, messageData)
           if okDecode and type(decoded) == 'table' and decoded.gates then
             gateMsg = decoded
-            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil)
+            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil, nil, concurrencyKeyLimitsEnabled)
           end
         end
 
@@ -1255,6 +1286,14 @@ export type RunQueueOptions = {
    */
   gatesEnabled?: boolean;
   /**
+   * When true, a per-key override set through the override API (the variant's ckLimit
+   * key) caps that key's pool instead of the limit's perKey: the concurrency-key dequeue
+   * reads it for the run's own queue and the gate helper reads it for gates that inherit
+   * the run's key. A pool paused as perKey 0 stays paused. Default false: overrides are
+   * stored but not enforced, so the feature can ship dark and be enabled per deployment.
+   */
+  concurrencyKeyLimitsEnabled?: boolean;
+  /**
    * Bounds for the admit-time reconcile that prunes leaked members from a saturated
    * groupConcurrency or gate set (see totalConcurrencyEnabled). Each dequeue script
    * runs at most `maxPassesPerDequeue` passes; a pass inspects one SSCAN page of
@@ -1288,6 +1327,8 @@ export type RunQueueOptions = {
     scanJitterInMs?: number;
     processMarkedSchedule?: string;
     processMarkedJitterInMs?: number;
+    /** SCAN COUNT hint per call while looking for currentConcurrency sets */
+    scanCount?: number;
     callback: ConcurrencySweeperCallback;
   };
   /** TTL system for automatic run expiration */
@@ -1692,6 +1733,51 @@ export class RunQueue {
     return result ? Number(result) : undefined;
   }
 
+  /**
+   * Sets a temporary per-key override of a queue's perKey for one concurrency-key value.
+   * The key expires after `ttlSeconds`; nothing else refreshes or removes it, so a
+   * forgotten override cannot outlive its TTL.
+   */
+  public async updateQueueConcurrencyKeyLimit(
+    env: MinimalAuthenticatedEnvironment,
+    queue: string,
+    concurrencyKey: string,
+    concurrency: number,
+    ttlSeconds: number
+  ) {
+    return this.redis.set(
+      this.keys.queueConcurrencyKeyLimitKey(env, queue, concurrencyKey),
+      concurrency,
+      "EX",
+      ttlSeconds
+    );
+  }
+
+  public async removeQueueConcurrencyKeyLimit(
+    env: MinimalAuthenticatedEnvironment,
+    queue: string,
+    concurrencyKey: string
+  ) {
+    return this.redis.del(this.keys.queueConcurrencyKeyLimitKey(env, queue, concurrencyKey));
+  }
+
+  public async getQueueConcurrencyKeyLimit(
+    env: MinimalAuthenticatedEnvironment,
+    queue: string,
+    concurrencyKey: string
+  ): Promise<{ concurrency: number; expiresAt: Date | null } | undefined> {
+    if (!this.options.concurrencyKeyLimitsEnabled) return undefined;
+    const key = this.keys.queueConcurrencyKeyLimitKey(env, queue, concurrencyKey);
+    const res = await this.redis.pipeline().get(key).pttl(key).exec();
+    const raw = res?.[0] && !res[0][0] ? res[0][1] : null;
+    if (raw == null) return undefined;
+    const pttl = res?.[1] && !res[1][0] ? Number(res[1][1]) : -1;
+    return {
+      concurrency: Number(raw),
+      expiresAt: pttl > 0 ? new Date(Date.now() + pttl) : null,
+    };
+  }
+
   public async updateQueueTotalConcurrencyLimits(
     env: MinimalAuthenticatedEnvironment,
     queue: string,
@@ -1962,34 +2048,75 @@ export class RunQueue {
     env: MinimalAuthenticatedEnvironment,
     queue: string,
     concurrencyKeys: string[]
-  ): Promise<Map<string, { queued: number; running: number; oldestEnqueuedAt: number | null }>> {
+  ): Promise<
+    Map<
+      string,
+      {
+        queued: number;
+        running: number;
+        oldestEnqueuedAt: number | null;
+        /** The key's per-key override, when one is in force (null when the feature is off). */
+        limit: number | null;
+        limitExpiresAt: Date | null;
+      }
+    >
+  > {
     const result = new Map<
       string,
-      { queued: number; running: number; oldestEnqueuedAt: number | null }
+      {
+        queued: number;
+        running: number;
+        oldestEnqueuedAt: number | null;
+        limit: number | null;
+        limitExpiresAt: Date | null;
+      }
     >();
     if (concurrencyKeys.length === 0) return result;
 
     const ckIndexKey = this.keys.ckIndexKeyFromQueue(this.keys.queueKey(env, queue));
 
+    // The override reads are skipped entirely while the feature is off: nothing enforces them.
+    const readOverrides = this.options.concurrencyKeyLimitsEnabled === true;
+    const stride = readOverrides ? 5 : 3;
     const pipeline = this.redis.pipeline();
+    // An override is only in force while the queue declares a perKey, so the base is read once
+    // and a missing one blanks every key's override, matching admission.
+    if (readOverrides) {
+      pipeline.get(this.keys.queueConcurrencyLimitKey(env, queue));
+    }
     for (const concurrencyKey of concurrencyKeys) {
       const member = this.keys.queueKey(env, queue, concurrencyKey);
       pipeline.zcard(member); // queued in this key's subqueue
       pipeline.scard(this.keys.queueCurrentConcurrencyKeyFromQueue(member)); // running
       pipeline.zscore(ckIndexKey, member); // oldest-enqueued score (null once the key drains)
+      if (readOverrides) {
+        const limitKey = this.keys.queueConcurrencyKeyLimitKey(env, queue, concurrencyKey);
+        pipeline.get(limitKey); // per-key override
+        pipeline.pttl(limitKey); // its remaining life
+      }
     }
     const res = await pipeline.exec();
     if (!res) return result;
 
+    const offset = readOverrides ? 1 : 0;
+    const baseResult = readOverrides ? res[0] : undefined;
+    const baseDeclared = baseResult !== undefined && !baseResult[0] && baseResult[1] != null;
+
     concurrencyKeys.forEach((concurrencyKey, i) => {
-      const queuedResult = res[i * 3];
-      const runningResult = res[i * 3 + 1];
-      const scoreResult = res[i * 3 + 2];
+      const queuedResult = res[offset + i * stride];
+      const runningResult = res[offset + i * stride + 1];
+      const scoreResult = res[offset + i * stride + 2];
+      const limitResult = readOverrides && baseDeclared ? res[offset + i * stride + 3] : undefined;
+      const pttlResult = readOverrides && baseDeclared ? res[offset + i * stride + 4] : undefined;
       const queued = queuedResult && !queuedResult[0] ? ((queuedResult[1] as number) ?? 0) : 0;
       const running = runningResult && !runningResult[0] ? ((runningResult[1] as number) ?? 0) : 0;
       const rawScore = scoreResult && !scoreResult[0] ? scoreResult[1] : null;
       const oldestEnqueuedAt = rawScore != null ? Number(rawScore) : null;
-      result.set(concurrencyKey, { queued, running, oldestEnqueuedAt });
+      const rawLimit = limitResult && !limitResult[0] ? limitResult[1] : null;
+      const limit = rawLimit != null ? Number(rawLimit) : null;
+      const pttl = pttlResult && !pttlResult[0] ? Number(pttlResult[1]) : -1;
+      const limitExpiresAt = limit !== null && pttl > 0 ? new Date(Date.now() + pttl) : null;
+      result.set(concurrencyKey, { queued, running, oldestEnqueuedAt, limit, limitExpiresAt });
     });
 
     return result;
@@ -2745,7 +2872,7 @@ export class RunQueue {
    * Create a scan stream for queue current concurrency keys
    */
   public currentConcurrencyScanStream(
-    count: number = 10,
+    count: number,
     onEnd?: () => void,
     onError?: (error: Error) => void
   ): { stream: Readable; redis: Redis } {
@@ -3755,6 +3882,7 @@ export class RunQueue {
               String(this.counterTtlSeconds),
               totalConcurrencyEnabledArg,
               this.options.gatesEnabled ? "1" : "0",
+              this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
               String(this.#ckVtimeStateTtl),
               String(this.#ckVtimeQuantum),
               String(this.#ckVtimeArrivalCap),
@@ -3798,6 +3926,7 @@ export class RunQueue {
               String(this.counterTtlSeconds),
               totalConcurrencyEnabledArg,
               this.options.gatesEnabled ? "1" : "0",
+              this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
               metricsGaugeArg
             );
       } else {
@@ -3839,6 +3968,7 @@ export class RunQueue {
               String(this.counterTtlSeconds),
               totalConcurrencyEnabledArg,
               this.options.gatesEnabled ? "1" : "0",
+              this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
               String(this.#ckVtimeStateTtl),
               String(this.#ckVtimeQuantum),
               String(this.#ckVtimeArrivalCap),
@@ -3879,6 +4009,7 @@ export class RunQueue {
               String(this.counterTtlSeconds),
               totalConcurrencyEnabledArg,
               this.options.gatesEnabled ? "1" : "0",
+              this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
               metricsGaugeArg
             );
       }
@@ -3916,6 +4047,7 @@ export class RunQueue {
         this.options.redis.keyPrefix ?? "",
         this.options.gatesEnabled ? "1" : "0",
         this.options.totalConcurrencyEnabled ? "1" : "0",
+        this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
         metricsGaugeArg
       );
     } else {
@@ -3948,6 +4080,7 @@ export class RunQueue {
         this.options.redis.keyPrefix ?? "",
         this.options.gatesEnabled ? "1" : "0",
         this.options.totalConcurrencyEnabled ? "1" : "0",
+        this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
         metricsGaugeArg
       );
     }
@@ -4033,6 +4166,7 @@ export class RunQueue {
         String(maxCount),
         this.options.gatesEnabled ? "1" : "0",
         this.options.totalConcurrencyEnabled ? "1" : "0",
+        this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
         ...this.reconcileArgs,
         metricsGaugeArg
       );
@@ -4188,6 +4322,7 @@ export class RunQueue {
             String(this.#ckVtimeWindowMultiplier),
             String(this.#ckVtimeStateTtl),
             String(this.#ckVtimeIdleMaxEntries),
+            this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
             ...this.reconcileArgs,
             // Must stay last: the gauge fragment reads ARGV[#ARGV].
             metricsGaugeArg
@@ -4216,6 +4351,7 @@ export class RunQueue {
             String(maxCount),
             this.options.totalConcurrencyEnabled ? "1" : "0",
             this.options.gatesEnabled ? "1" : "0",
+            this.options.concurrencyKeyLimitsEnabled ? "1" : "0",
             ...this.reconcileArgs,
             metricsGaugeArg
           );
@@ -4829,13 +4965,17 @@ export class RunQueue {
     };
 
     const { promise, resolve, reject } = promiseWithResolvers<typeof stats>();
+    // "end" can fire while the last page is still being processed; finish it first.
+    let processing: Promise<void> = Promise.resolve();
 
     const { stream, redis } = this.currentConcurrencyScanStream(
-      10,
+      boundedInt(this.options.concurrencySweeper?.scanCount, 1000, 1, 10_000),
       () => {
-        this.logger.debug("Concurrency scan stream closed", { stats });
+        void processing.then(() => {
+          this.logger.debug("Concurrency scan stream closed", { stats });
 
-        resolve(stats);
+          resolve(stats);
+        });
       },
       (error) => {
         this.logger.error("Concurrency scan stream error", {
@@ -4880,11 +5020,21 @@ export class RunQueue {
 
       stats.processedKeys += uniqueKeys.length;
 
-      await Promise.allSettled(uniqueKeys.map((key) => this.processConcurrencySet(key))).finally(
-        () => {
-          stream.resume();
+      // A full SCAN page can hold hundreds of matches; cap the fan-out so the per-set callback
+      // (a DB query in the engine) doesn't burst.
+      processing = (async () => {
+        for (let i = 0; i < uniqueKeys.length; i += SWEEPER_SET_CONCURRENCY) {
+          await Promise.allSettled(
+            uniqueKeys
+              .slice(i, i + SWEEPER_SET_CONCURRENCY)
+              .map((key) => this.processConcurrencySet(key))
+          );
         }
-      );
+      })().finally(() => {
+        stream.resume();
+      });
+
+      await processing;
     });
 
     return promise;
@@ -4896,9 +5046,11 @@ export class RunQueue {
     });
 
     const { promise, resolve, reject } = promiseWithResolvers<void>();
+    // Same as the SCAN page level: "end" can fire while the last SSCAN page is in flight.
+    let processing: Promise<void> = Promise.resolve();
 
     stream.on("end", () => {
-      resolve();
+      void processing.then(() => resolve());
     });
 
     stream.on("error", (error) => {
@@ -4910,7 +5062,7 @@ export class RunQueue {
       reject(error);
     });
 
-    stream.on("data", async (runIds: string[]) => {
+    const processPage = async (runIds: string[]) => {
       stream.pause();
 
       if (this.abortController.signal.aborted) {
@@ -4938,6 +5090,10 @@ export class RunQueue {
       }
 
       stream.resume();
+    };
+
+    stream.on("data", (runIds: string[]) => {
+      processing = processPage(runIds);
     });
 
     return promise;
@@ -5180,6 +5336,7 @@ local enableFastPath = ARGV[9]
 local keyPrefix = ARGV[10]
 local gatesEnabled = ARGV[11] == '1'
 local totalConcurrencyEnabled = ARGV[12] == '1'
+local concurrencyKeyLimitsEnabled = ARGV[13] == '1'
 
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
@@ -5221,7 +5378,7 @@ if enableFastPath == '1' then
           local okDecode, decoded = pcall(cjson.decode, messageData)
           if okDecode and type(decoded) == 'table' and decoded.gates then
             gateMsg = decoded
-            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil)
+            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil, nil, concurrencyKeyLimitsEnabled)
           end
         end
 
@@ -5329,6 +5486,7 @@ local enableFastPath = ARGV[11]
 local keyPrefix = ARGV[12]
 local gatesEnabled = ARGV[13] == '1'
 local totalConcurrencyEnabled = ARGV[14] == '1'
+local concurrencyKeyLimitsEnabled = ARGV[15] == '1'
 
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
@@ -5370,7 +5528,7 @@ if enableFastPath == '1' then
           local okDecode, decoded = pcall(cjson.decode, messageData)
           if okDecode and type(decoded) == 'table' and decoded.gates then
             gateMsg = decoded
-            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil)
+            gatesAllowFastPath = __gatesHaveCapacity(keyPrefix, decoded, messageId, envLimit, nil, nil, concurrencyKeyLimitsEnabled)
           end
         end
 
@@ -5683,10 +5841,10 @@ local ckVtimeFloorKey = KEYS[19]
 local ckVtimeIdleKey = KEYS[20]`,
         args: `
 -- TTL (seconds) applied to ckVtime on registration
-local stateTtl = ARGV[15]
+local stateTtl = ARGV[16]
 -- Arrival stacking (only read when this call registers a brand-new variant)
-local quantum = tonumber(ARGV[16] or '1')
-local arrivalCap = tonumber(ARGV[17] or '4294967296')`,
+local quantum = tonumber(ARGV[17] or '1')
+local arrivalCap = tonumber(ARGV[18] or '4294967296')`,
         register: `
 -- Register this variant in the virtual-time index. NX means an already-advanced tag is
 -- never rewound. A returning variant starts at max(floor, remembered idle tag), because
@@ -5745,10 +5903,10 @@ local ckVtimeFloorKey = KEYS[20]
 local ckVtimeIdleKey = KEYS[21]`,
         args: `
 -- TTL (seconds) applied to ckVtime on registration
-local stateTtl = ARGV[17]
+local stateTtl = ARGV[18]
 -- Arrival stacking (only read when this call registers a brand-new variant)
-local quantum = tonumber(ARGV[18] or '1')
-local arrivalCap = tonumber(ARGV[19] or '4294967296')`,
+local quantum = tonumber(ARGV[19] or '1')
+local arrivalCap = tonumber(ARGV[20] or '4294967296')`,
         register: `
 -- Register this variant in the virtual-time index. Identical to the block in
 -- enqueueMessageCkVtimeTracked; see there for why the tag is chosen the way it is.
@@ -6098,10 +6256,11 @@ local keyPrefix = ARGV[5]
 local maxCount = tonumber(ARGV[6] or '1')
 local gatesEnabled = ARGV[7] == '1'
 local totalConcurrencyEnabled = ARGV[8] == '1'
-local reconcileEnabled = ARGV[9] == '1'
-local reconcileScanCount = tonumber(ARGV[10]) or 100
-local reconcileLockTtl = tonumber(ARGV[11]) or 10
-local reconcileMaxPasses = tonumber(ARGV[12]) or 2
+local concurrencyKeyLimitsEnabled = ARGV[9] == '1'
+local reconcileEnabled = ARGV[10] == '1'
+local reconcileScanCount = tonumber(ARGV[11]) or 100
+local reconcileLockTtl = tonumber(ARGV[12]) or 10
+local reconcileMaxPasses = tonumber(ARGV[13]) or 2
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
 local __reconcile = __reconcileNew(reconcileEnabled, reconcileScanCount, reconcileLockTtl, reconcileMaxPasses)
@@ -6209,7 +6368,7 @@ for i = 1, #messages, 2 do
         else
             local gatesAllow = true
             if gatesEnabled then
-              gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile)
+              gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile, concurrencyKeyLimitsEnabled)
             end
 
             if gatesAllow then
@@ -6448,10 +6607,11 @@ local keyPrefix = ARGV[5]
 local maxCount = tonumber(ARGV[6] or '1')
 local totalConcurrencyEnabled = ARGV[7] == '1'
 local gatesEnabled = ARGV[8] == '1'
-local reconcileEnabled = ARGV[9] == '1'
-local reconcileScanCount = tonumber(ARGV[10]) or 100
-local reconcileLockTtl = tonumber(ARGV[11]) or 10
-local reconcileMaxPasses = tonumber(ARGV[12]) or 2
+local concurrencyKeyLimitsEnabled = ARGV[9] == '1'
+local reconcileEnabled = ARGV[10] == '1'
+local reconcileScanCount = tonumber(ARGV[11]) or 100
+local reconcileLockTtl = tonumber(ARGV[12]) or 10
+local reconcileMaxPasses = tonumber(ARGV[13]) or 2
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_GATES_LUA_HELPERS}
 local __reconcile = __reconcileNew(reconcileEnabled, reconcileScanCount, reconcileLockTtl, reconcileMaxPasses)
@@ -6488,7 +6648,8 @@ if envCurrentConcurrency >= envConcurrencyLimitWithBurstFactor then
   return __qmret(nil)
 end
 
-local queueConcurrencyLimit = math.min(tonumber(redis.call('GET', queueConcurrencyLimitKey) or '1000000'), envConcurrencyLimit)
+local queueConcurrencyLimitRaw = redis.call('GET', queueConcurrencyLimitKey)
+local queueConcurrencyLimit = math.min(tonumber(queueConcurrencyLimitRaw or '1000000'), envConcurrencyLimit)
 
 local envAvailableCapacity = envConcurrencyLimitWithBurstFactor - envCurrentConcurrency
 local actualMaxCount = math.min(maxCount, envAvailableCapacity)
@@ -6549,7 +6710,12 @@ for _, ckQueueName in ipairs(ckQueues) do
   local ckConcurrencyKey = fullQueueKey .. ':currentConcurrency'
   local ckCurrentConcurrency = tonumber(redis.call('SCARD', ckConcurrencyKey) or '0')
 
+  -- A per-key override (set through the override API) caps this key's pool instead of the
+  -- queue's perKey, env-clamped.
   local perKeyLimit = queueConcurrencyLimit
+  if concurrencyKeyLimitsEnabled then
+    perKeyLimit = math.min(tonumber(__perKeyLimitRaw(true, queueConcurrencyLimitRaw, __ckLimitKeyFromVariant(fullQueueKey))), envConcurrencyLimit)
+  end
 
   if ckCurrentConcurrency >= perKeyLimit then
     -- Back a blocked variant off so it cannot pin the bounded candidate window
@@ -6587,7 +6753,7 @@ for _, ckQueueName in ipairs(ckQueues) do
         else
           local gatesAllow = true
           if gatesEnabled then
-            gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile)
+            gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile, concurrencyKeyLimitsEnabled)
           end
           if not gatesAllow then
             blockedByGates = true
@@ -6720,10 +6886,11 @@ local quantum = tonumber(ARGV[9] or '1')
 local windowMultiplier = tonumber(ARGV[10] or '3')
 local stateTtl = tonumber(ARGV[11] or '86400')
 local idleMaxEntries = tonumber(ARGV[12] or '10000')
-local reconcileEnabled = ARGV[13] == '1'
-local reconcileScanCount = tonumber(ARGV[14]) or 100
-local reconcileLockTtl = tonumber(ARGV[15]) or 10
-local reconcileMaxPasses = tonumber(ARGV[16]) or 2
+local concurrencyKeyLimitsEnabled = ARGV[13] == '1'
+local reconcileEnabled = ARGV[14] == '1'
+local reconcileScanCount = tonumber(ARGV[15]) or 100
+local reconcileLockTtl = tonumber(ARGV[16]) or 10
+local reconcileMaxPasses = tonumber(ARGV[17]) or 2
 ${QUEUE_METRICS_GAUGE_PRELUDE}
 ${QUEUE_METRICS_CK_DEQUEUE_GAUGE_LUA}
 ${QUEUE_GATES_LUA_HELPERS}
@@ -6755,7 +6922,8 @@ if envCurrentConcurrency >= envConcurrencyLimitWithBurstFactor then
   return __qmret(nil)
 end
 
-local queueConcurrencyLimit = math.min(tonumber(redis.call('GET', queueConcurrencyLimitKey) or '1000000'), envConcurrencyLimit)
+local queueConcurrencyLimitRaw = redis.call('GET', queueConcurrencyLimitKey)
+local queueConcurrencyLimit = math.min(tonumber(queueConcurrencyLimitRaw or '1000000'), envConcurrencyLimit)
 
 local envAvailableCapacity = envConcurrencyLimitWithBurstFactor - envCurrentConcurrency
 local actualMaxCount = math.min(maxCount, envAvailableCapacity)
@@ -6822,7 +6990,14 @@ local function tryServe(ckQueueName, mayRaiseFloor, knownRegistered)
   local ckConcurrencyKey = fullQueueKey .. ':currentConcurrency'
   local ckCurrentConcurrency = tonumber(redis.call('SCARD', ckConcurrencyKey) or '0')
 
-  if ckCurrentConcurrency < queueConcurrencyLimit then
+  -- A per-key override (set through the override API) caps this key's pool instead of the
+  -- queue's perKey, env-clamped.
+  local perKeyLimit = queueConcurrencyLimit
+  if concurrencyKeyLimitsEnabled then
+    perKeyLimit = math.min(tonumber(__perKeyLimitRaw(true, queueConcurrencyLimitRaw, __ckLimitKeyFromVariant(fullQueueKey))), envConcurrencyLimit)
+  end
+
+  if ckCurrentConcurrency < perKeyLimit then
     local messages = redis.call('ZRANGEBYSCORE', fullQueueKey, '-inf', tostring(currentTime), 'WITHSCORES', 'LIMIT', 0, 1)
 
     if #messages >= 2 then
@@ -6854,7 +7029,7 @@ local function tryServe(ckQueueName, mayRaiseFloor, knownRegistered)
           -- in ckIndex and reported notReady, exactly like the per-key concurrency ceiling.
           local gatesAllow = true
           if gatesEnabled then
-            gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile)
+            gatesAllow = __gatesHaveCapacity(keyPrefix, messageData, messageId, envConcurrencyLimit, messageKeyPrefix, __reconcile, concurrencyKeyLimitsEnabled)
           end
           local alreadyInGroup = false
           local totalAllows = true
@@ -8022,6 +8197,7 @@ declare module "@internal/redis" {
       keyPrefix: string,
       gatesEnabled: string,
       totalConcurrencyEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       metricsEnabled: string,
       callback?: Callback<[number, number[] | null]>
     ): Result<[number, number[] | null], Context>;
@@ -8058,6 +8234,7 @@ declare module "@internal/redis" {
       keyPrefix: string,
       gatesEnabled: string,
       totalConcurrencyEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       metricsEnabled: string,
       callback?: Callback<[number, number[] | null]>
     ): Result<[number, number[] | null], Context>;
@@ -8099,6 +8276,7 @@ declare module "@internal/redis" {
       maxCount: string,
       gatesEnabled: string,
       totalConcurrencyEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       reconcileEnabled: string,
       reconcileScanCount: string,
       reconcileLockTtlSeconds: string,
@@ -8408,6 +8586,7 @@ declare module "@internal/redis" {
       counterTtl: string,
       totalConcurrencyEnabled: string,
       gatesEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       metricsEnabled: string,
       callback?: Callback<[number, number[] | null]>
     ): Result<[number, number[] | null], Context>;
@@ -8447,6 +8626,7 @@ declare module "@internal/redis" {
       counterTtl: string,
       totalConcurrencyEnabled: string,
       gatesEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       metricsEnabled: string,
       callback?: Callback<[number, number[] | null]>
     ): Result<[number, number[] | null], Context>;
@@ -8486,6 +8666,7 @@ declare module "@internal/redis" {
       counterTtl: string,
       totalConcurrencyEnabled: string,
       gatesEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       stateTtl: string,
       quantum: string,
       arrivalCap: string,
@@ -8531,6 +8712,7 @@ declare module "@internal/redis" {
       counterTtl: string,
       totalConcurrencyEnabled: string,
       gatesEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       stateTtl: string,
       quantum: string,
       arrivalCap: string,
@@ -8560,6 +8742,7 @@ declare module "@internal/redis" {
       maxCount: string,
       totalConcurrencyEnabled: string,
       gatesEnabled: string,
+      concurrencyKeyLimitsEnabled: string,
       reconcileEnabled: string,
       reconcileScanCount: string,
       reconcileLockTtlSeconds: string,
@@ -8597,6 +8780,7 @@ declare module "@internal/redis" {
       windowMultiplier: string,
       stateTtlSeconds: string,
       idleMaxEntries: string,
+      concurrencyKeyLimitsEnabled: string,
       reconcileEnabled: string,
       reconcileScanCount: string,
       reconcileLockTtlSeconds: string,

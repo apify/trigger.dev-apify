@@ -14,7 +14,7 @@ import {
 } from "~/services/inputStreamWaitpointCache.server";
 import { logger } from "~/services/logger.server";
 import { getRealtimeStreamInstance } from "~/services/realtime/v1StreamsGlobal.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
 import { parseDelay } from "~/utils/delays";
 import { resolveIdempotencyKeyTTL } from "~/utils/idempotencyKeys.server";
 import { engine } from "~/v3/runEngine.server";
@@ -30,8 +30,17 @@ const { action, loader } = createActionApiRoute(
     body: CreateInputStreamWaitpointRequestBody,
     maxContentLength: 1024 * 10, // 10KB
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: (params) =>
+        everyResource([{ type: "runs", id: params.runFriendlyId }, { type: "waitpoints" }]),
+    },
   },
-  async ({ authentication, body, params }) => {
+  async ({ authentication, body, params, ability }) => {
+    if (!ability.can("read", { type: "inputStreams", id: params.runFriendlyId })) {
+      return json({ error: "Unauthorized" }, { status: 403 });
+    }
+
     try {
       const where = {
         friendlyId: params.runFriendlyId,
@@ -129,14 +138,22 @@ const { action, loader } = createActionApiRoute(
                 type: "application/json",
                 isError: false,
               },
+              organizationId: authentication.environment.organization.id,
             });
 
             // Clean up the Redis cache since we completed it ourselves
             await deleteInputStreamWaitpoint(run.friendlyId, body.streamId);
           }
-        } catch {
+        } catch (error) {
           // Non-fatal: if the S2 check fails, the waitpoint is still PENDING.
           // The next .send() will complete it via the Redis cache path.
+          logger.warn("input-stream wait race-check failed", {
+            runId: run.friendlyId,
+            streamId: body.streamId,
+            waitpointId: WaitpointId.toFriendlyId(result.waitpoint.id),
+            error,
+            environmentId: authentication.environment.id,
+          });
         }
       }
 

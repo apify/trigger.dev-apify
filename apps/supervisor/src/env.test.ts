@@ -78,7 +78,11 @@ describe("worker queue selection", () => {
   it.each([
     { config: {}, subscription: { ...ondemand, compat: "compute" }, error: "compatibility" },
     {
-      config: { COMPUTE_GATEWAY_URL: "http://localhost:8080" },
+      config: {
+        KUBERNETES_FORCE_ENABLED: "true",
+        KUBERNETES_RUN_CRD_ENABLED: "true",
+        KUBERNETES_RUNNER_RUNTIME: "microvm",
+      },
       subscription: ondemand,
       error: "compatibility",
     },
@@ -86,11 +90,11 @@ describe("worker queue selection", () => {
     {
       config: {
         KUBERNETES_FORCE_ENABLED: "true",
-        KUBERNETES_RUN_CRD_ENABLED: "true",
+        KUBERNETES_RUN_CRD_ENABLED: "false",
         KUBERNETES_RUNNER_RUNTIME: "microvm",
       },
       subscription: { ...restore, compat: "compute" },
-      error: "COMPUTE_GATEWAY_URL",
+      error: "compatibility",
     },
   ])(
     "rejects incompatible or unsupported subscriptions: $error",
@@ -105,11 +109,31 @@ describe("worker queue selection", () => {
     }
   );
 
-  it("accepts shared fresh work and compute restores on the compute backend", () => {
+  it.each(["ondemand", "scheduled"])(
+    "accepts %s compute restores on the native microVM Runner backend",
+    (queueClass) => {
+      expect(() =>
+        Env.parse({
+          ...base,
+          KUBERNETES_FORCE_ENABLED: "true",
+          KUBERNETES_RUN_CRD_ENABLED: "true",
+          KUBERNETES_RUNNER_RUNTIME: "microvm",
+          TRIGGER_WORKER_QUEUE_SUBSCRIPTIONS: JSON.stringify([
+            { ...ondemand, class: queueClass, compat: "compute" },
+            { ...restore, class: queueClass, compat: "compute" },
+          ]),
+        })
+      ).not.toThrow();
+    }
+  );
+
+  it("accepts shared fresh work and compute restores on the native microVM Runner backend", () => {
     expect(() =>
       Env.parse({
         ...base,
-        COMPUTE_GATEWAY_URL: "http://localhost:8080",
+        KUBERNETES_FORCE_ENABLED: "true",
+        KUBERNETES_RUN_CRD_ENABLED: "true",
+        KUBERNETES_RUNNER_RUNTIME: "microvm",
         TRIGGER_WORKER_QUEUE_SUBSCRIPTIONS: JSON.stringify([
           { ...ondemand, compat: "any" },
           { ...restore, compat: "compute" },
@@ -161,15 +185,83 @@ describe("Env superRefine - backpressure source awareness", () => {
   });
 });
 
-describe("Env superRefine - compute snapshots", () => {
-  it("needs the metadata URL and workload API domain only for the gateway", () => {
-    expect(() => Env.parse({ ...base, COMPUTE_SNAPSHOTS_ENABLED: "true" })).not.toThrow();
-    expect(() =>
-      Env.parse({
-        ...base,
-        COMPUTE_SNAPSHOTS_ENABLED: "true",
-        COMPUTE_GATEWAY_URL: "http://gateway:8080",
-      })
-    ).toThrow(/TRIGGER_METADATA_URL[\s\S]*TRIGGER_WORKLOAD_API_DOMAIN/);
+describe("releasing runs that never started", () => {
+  it("is off by default for both failed creates and failed pods", () => {
+    const env = Env.parse(base);
+    expect(env.RELEASE_UNSTARTED_RUNS_ENABLED).toBe(false);
+    expect(env.RELEASE_FAILED_POD_RUNS_ENABLED).toBe(false);
+  });
+
+  it("limits releases to five different runs a minute unless told otherwise, never fewer than none", () => {
+    expect(Env.parse(base).RUN_RELEASES_PER_MINUTE).toBe(5);
+    expect(Env.parse({ ...base, RUN_RELEASES_PER_MINUTE: "0" }).RUN_RELEASES_PER_MINUTE).toBe(0);
+    expect(() => Env.parse({ ...base, RUN_RELEASES_PER_MINUTE: "-1" })).toThrow();
+    expect(Env.parse({ ...base, RUN_RELEASES_PER_MINUTE: " " }).RUN_RELEASES_PER_MINUTE).toBe(5);
+  });
+
+  it("turns on each path on its own", () => {
+    const creates = Env.parse({ ...base, RELEASE_UNSTARTED_RUNS_ENABLED: "true" });
+    expect(creates.RELEASE_UNSTARTED_RUNS_ENABLED).toBe(true);
+    expect(creates.RELEASE_FAILED_POD_RUNS_ENABLED).toBe(false);
+
+    const pods = Env.parse({ ...base, RELEASE_FAILED_POD_RUNS_ENABLED: "1" });
+    expect(pods.RELEASE_UNSTARTED_RUNS_ENABLED).toBe(false);
+    expect(pods.RELEASE_FAILED_POD_RUNS_ENABLED).toBe(true);
+  });
+});
+
+describe("worker cell name", () => {
+  it("treats an empty value as unset", () => {
+    expect(
+      Env.parse({ ...base, TRIGGER_WORKER_CELL_NAME: "" }).TRIGGER_WORKER_CELL_NAME
+    ).toBeUndefined();
+  });
+
+  it("keeps a well-formed name", () => {
+    expect(
+      Env.parse({ ...base, TRIGGER_WORKER_CELL_NAME: "us-west-2.cell_1" }).TRIGGER_WORKER_CELL_NAME
+    ).toBe("us-west-2.cell_1");
+  });
+
+  it("refuses a malformed name at boot", () => {
+    expect(() => Env.parse({ ...base, TRIGGER_WORKER_CELL_NAME: "bad/name" })).toThrow();
+  });
+});
+
+describe("continue retry budget", () => {
+  it("is off when unset", () => {
+    expect(Env.parse(base).TRIGGER_CONTINUE_RETRY_BUDGET_MS).toBeUndefined();
+  });
+
+  it("accepts a budget within the bounds", () => {
+    for (const value of ["120000", "270000", "290000"]) {
+      expect(
+        Env.parse({ ...base, TRIGGER_CONTINUE_RETRY_BUDGET_MS: value })
+          .TRIGGER_CONTINUE_RETRY_BUDGET_MS
+      ).toBe(Number(value));
+    }
+  });
+
+  it.each(["", "0", "-1", "60000", "119999", "290001", "not-a-number"])(
+    "refuses %j, so a bad value stops the supervisor from starting",
+    (value) => {
+      expect(() => Env.parse({ ...base, TRIGGER_CONTINUE_RETRY_BUDGET_MS: value })).toThrow();
+    }
+  );
+});
+
+describe("runner token Secret settle delay", () => {
+  it("defaults to two minutes", () => {
+    expect(Env.parse(base).KUBERNETES_RUNNER_TOKEN_SECRET_SETTLE_MS).toBe(120_000);
+  });
+
+  it("takes a number of milliseconds from a minute up and refuses less", () => {
+    expect(
+      Env.parse({ ...base, KUBERNETES_RUNNER_TOKEN_SECRET_SETTLE_MS: "60000" })
+        .KUBERNETES_RUNNER_TOKEN_SECRET_SETTLE_MS
+    ).toBe(60_000);
+    expect(
+      Env.safeParse({ ...base, KUBERNETES_RUNNER_TOKEN_SECRET_SETTLE_MS: "59999" }).success
+    ).toBe(false);
   });
 });

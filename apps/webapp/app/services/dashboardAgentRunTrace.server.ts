@@ -1,12 +1,16 @@
 import { type SpanEvents } from "@trigger.dev/core/v3";
 import { type TaskEventStyle } from "@trigger.dev/core/v3/schemas";
 import { nanosecondsToMilliseconds } from "@trigger.dev/core/v3/utils/durations";
-import { boundedIn, type PrismaReplicaClient } from "@trigger.dev/database";
+import { boundedIn, type PrismaReplicaClient, type TaskRunStatus } from "@trigger.dev/database";
 import { $replica } from "~/db.server";
 import { logger } from "~/services/logger.server";
 import { getAdminOnlyForEvent } from "~/utils/timelineSpanEvents";
 import { type SpanSummary, type TraceSummary } from "~/v3/eventRepository/eventRepository.types";
 import { getEventRepositoryForStore } from "~/v3/eventRepository/index.server";
+import {
+  getTraceInsertedAtEnd,
+  getTraceStartTimeEnd,
+} from "~/v3/eventRepository/traceInsertedAtBound";
 import { runStore } from "~/v3/runStore.server";
 import { getTaskEventStoreTableForRun } from "~/v3/taskEventStore.server";
 
@@ -44,8 +48,10 @@ type TraceRun = {
   friendlyId: string;
   traceId: string;
   spanId: string;
+  status: TaskRunStatus;
   createdAt: Date;
   completedAt: Date | null;
+  updatedAt: Date;
   taskEventStore: string;
 };
 
@@ -62,7 +68,8 @@ export async function getDashboardAgentRunTrace({
 }): Promise<{ trace: DashboardAgentTrace } | undefined> {
   const repository = await getEventRepositoryForStore(run.taskEventStore, organizationId);
   const storeTable = getTaskEventStoreTableForRun(run);
-  const endCreatedAt = run.completedAt ?? undefined;
+  const endCreatedAt = getTraceStartTimeEnd(run);
+  const insertedAtEnd = getTraceInsertedAtEnd(run);
 
   let summary: TraceSummary | undefined = await repository.getTraceSummary(
     storeTable,
@@ -70,12 +77,12 @@ export async function getDashboardAgentRunTrace({
     run.traceId,
     run.createdAt,
     endCreatedAt,
-    { includeDebugLogs: false }
+    { includeDebugLogs: false, anchorSpanId: run.spanId, insertedAtEnd }
   );
 
-  // The anchor span can fall past the row cap on large traces, so fall back to
-  // the subtree fetch like the run page does.
-  if (summary && !summary.spans.some((span) => span.id === run.spanId)) {
+  // No summary means the anchor span isn't in the summary rows, e.g. it fell past the
+  // row cap on a large trace, so fall back to the subtree fetch like the run page does.
+  if (!summary) {
     const subtree = await repository.getTraceSubtreeSummary(
       storeTable,
       environmentId,
@@ -83,7 +90,8 @@ export async function getDashboardAgentRunTrace({
       run.spanId,
       run.createdAt,
       endCreatedAt,
-      { includeDebugLogs: false }
+      // The tree is built from the anchor down, so ancestors would be read for nothing.
+      { includeDebugLogs: false, insertedAtEnd }
     );
 
     if (subtree) {

@@ -33,7 +33,11 @@ import {
   getUserProvidedIdempotencyKey,
 } from "@trigger.dev/core/v3/serverOnly";
 import { parsePacket } from "@trigger.dev/core/v3/utils/ioSerialization";
-import type { PrismaClientOrTransaction, RuntimeEnvironmentType } from "@trigger.dev/database";
+import type {
+  Prisma,
+  PrismaClientOrTransaction,
+  RuntimeEnvironmentType,
+} from "@trigger.dev/database";
 import { MAX_TASK_RUN_ATTEMPTS } from "../consts.js";
 import { runStatusFromError, ServiceValidationError } from "../errors.js";
 import { sendNotificationToWorker } from "../eventBus.js";
@@ -49,6 +53,7 @@ import {
 } from "../statuses.js";
 import type {
   EngineStartRunAttemptResult,
+  ReleaseRunResult,
   RestoreOutcome,
   RestoreOutcomeResult,
   RunEngineOptions,
@@ -58,15 +63,22 @@ import type { DelayedRunSystem } from "./delayedRunSystem.js";
 import type {
   EnhancedExecutionSnapshot,
   ExecutionSnapshotSystem,
+  PreviousSnapshot,
 } from "./executionSnapshotSystem.js";
 import {
   executionResultFromSnapshot,
   getLatestExecutionSnapshot,
+  getLatestExecutionSnapshotOrFinishedRun,
 } from "./executionSnapshotSystem.js";
 import type { SystemResources } from "./systems.js";
 import { snapshotRouteFromSnapshot, type SnapshotRouteWire } from "@internal/run-store";
 import type { WaitpointSystem } from "./waitpointSystem.js";
 import { BatchId, RunId } from "@trigger.dev/core/v3/isomorphic";
+
+/** A run whose snapshot state has expired has no snapshot to report, only its final run row. */
+export type CancelRunResult =
+  | (ExecutionResult & { alreadyFinished: boolean })
+  | { alreadyFinished: true; run: ExecutionResult["run"]; snapshot: null };
 
 export type RunAttemptSystemOptions = {
   resources: SystemResources;
@@ -128,6 +140,7 @@ export class RunAttemptSystem {
   private readonly delayedRunSystem: DelayedRunSystem;
   private readonly finalizationGuardDelayMs: number;
   private readonly rederivationsCounter: Counter;
+  private readonly releasesCounter: Counter;
   private readonly restoreOutcomesCounter: Counter;
   private readonly cache: UnkeyCache<{
     tasks: BackwardsCompatibleTaskRunExecution["task"];
@@ -153,6 +166,11 @@ export class RunAttemptSystem {
         unit: "runs",
       }
     );
+    this.releasesCounter = this.$.meter.createCounter("run_engine.run_releases", {
+      description:
+        "Dequeued runs a worker released before they started, by reason and result: requeued, dropped when the run could not be requeued (as when its dequeue budget is used up) and failed, or conflict",
+      unit: "releases",
+    });
     this.restoreOutcomesCounter = this.$.meter.createCounter("run_engine.restore_outcomes", {
       description: "Failed restores reported by a supervisor, by outcome, reason and result",
       unit: "reports",
@@ -334,6 +352,8 @@ export class RunAttemptSystem {
     workerId,
     runnerId,
     isWarmStart,
+    workerCell,
+    workerLane,
     environmentId,
     tx,
   }: {
@@ -342,6 +362,8 @@ export class RunAttemptSystem {
     workerId?: string;
     runnerId?: string;
     isWarmStart?: boolean;
+    workerCell?: string;
+    workerLane?: string;
     environmentId?: string;
     tx?: PrismaClientOrTransaction;
   }): Promise<EngineStartRunAttemptResult> {
@@ -389,6 +411,7 @@ export class RunAttemptSystem {
                 status: true,
                 lockedById: true,
                 ttl: true,
+                annotations: true,
               },
             },
             // read-your-writes on the owning primary (dequeue just wrote lockedById; a replica lags).
@@ -435,6 +458,17 @@ export class RunAttemptSystem {
             throw new ServiceValidationError("Max attempts reached", 400);
           }
 
+          // An earlier snapshot unit still pending would make the snapshot's prepare busy and fail the
+          // start after the callback has acked the TTL job, which a rollback does not undo. Settle it
+          // first; only a run with MemoryDB residency can have one.
+          const previousRoute = snapshotRouteFromSnapshot(latestSnapshot);
+          if (
+            previousRoute.residency === "mirrored" ||
+            previousRoute.residency === "redis-primary"
+          ) {
+            await this.$.runStore.settlePendingUnit(taskRun.id);
+          }
+
           // Atomic unit: the attempt bump (startAttempt) and the EXECUTING snapshot must
           // commit together or a crash between them leaves the run EXECUTING with no snapshot. Under
           // the run-ops split these route to the SAME owning DB but, as two router calls, would each
@@ -448,6 +482,10 @@ export class RunAttemptSystem {
                   attemptNumber: nextAttemptNumber,
                   executedAt: taskRun.attemptNumber === null ? new Date() : undefined,
                   isWarmStart: isWarmStart ?? false,
+                  annotations: stampWorkerAnnotations(taskRun.annotations, {
+                    workerCell,
+                    workerLane,
+                  }),
                 },
                 {
                   select: {
@@ -507,7 +545,8 @@ export class RunAttemptSystem {
                     }`,
                   },
                   previousSnapshotId: latestSnapshot.id,
-                  snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
+                  previousSnapshot: latestSnapshot,
+                  snapshotRoute: previousRoute,
                   environmentId: latestSnapshot.environmentId,
                   environmentType: latestSnapshot.environmentType,
                   projectId: latestSnapshot.projectId,
@@ -688,6 +727,7 @@ export class RunAttemptSystem {
     runId,
     snapshotId,
     completion,
+    forceRequeue,
     workerId,
     runnerId,
     environmentId,
@@ -695,12 +735,11 @@ export class RunAttemptSystem {
     runId: string;
     snapshotId: string;
     completion: TaskRunExecutionResult;
+    forceRequeue?: boolean;
     workerId?: string;
     runnerId?: string;
     environmentId?: string;
   }): Promise<CompleteRunAttemptResult> {
-    await this.#notifyMetadataUpdated(runId, completion);
-
     switch (completion.ok) {
       case true: {
         return this.attemptSucceeded({
@@ -718,6 +757,7 @@ export class RunAttemptSystem {
           runId,
           snapshotId,
           completion,
+          forceRequeue,
           tx: this.$.prisma,
           workerId,
           runnerId,
@@ -759,12 +799,17 @@ export class RunAttemptSystem {
           );
 
           if (latestSnapshot.id !== snapshotId) {
-            throw new ServiceValidationError("Snapshot ID doesn't match the latest snapshot", 400);
+            throw new ServiceValidationError("Snapshot ID doesn't match the latest snapshot", 400, {
+              code: "SNAPSHOT_CONFLICT",
+              latestSnapshotId: latestSnapshot.id,
+            });
           }
 
           if (latestSnapshot.executionStatus === "FINISHED") {
             throw new ServiceValidationError("Run is already finished", 400);
           }
+
+          await this.#notifyMetadataUpdated(runId, completion);
 
           span.setAttribute("completionStatus", completion.ok);
           span.setAttribute("runId", runId);
@@ -808,6 +853,7 @@ export class RunAttemptSystem {
               usageDurationMs: updatedUsage.usageDurationMs,
               costInCents: updatedUsage.costInCents,
               snapshot: {
+                ...this.executionSnapshotSystem.nextSnapshotIdentity(latestSnapshot, runId),
                 executionStatus: "FINISHED",
                 description: "Task completed successfully",
                 snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
@@ -883,6 +929,7 @@ export class RunAttemptSystem {
               output: completion.output
                 ? { value: completion.output, type: completion.outputType, isError: false }
                 : undefined,
+              organizationId: env.organizationId,
             });
           }
 
@@ -965,17 +1012,26 @@ export class RunAttemptSystem {
           );
 
           if (latestSnapshot.id !== snapshotId) {
-            throw new ServiceValidationError("Snapshot ID doesn't match the latest snapshot", 400);
+            throw new ServiceValidationError("Snapshot ID doesn't match the latest snapshot", 400, {
+              code: "SNAPSHOT_CONFLICT",
+              latestSnapshotId: latestSnapshot.id,
+            });
           }
 
           if (latestSnapshot.executionStatus === "FINISHED") {
             throw new ServiceValidationError("Run is already finished", 400);
           }
 
+          await this.#notifyMetadataUpdated(runId, completion);
+
           span.setAttribute("completionStatus", completion.ok);
 
           //remove waitpoints blocking the run
-          const deletedCount = await this.waitpointSystem.clearBlockingWaitpoints({ runId, tx });
+          const deletedCount = await this.waitpointSystem.clearBlockingWaitpoints({
+            runId,
+            organizationId: latestSnapshot.organizationId,
+            tx,
+          });
           if (deletedCount > 0) {
             this.$.logger.debug("Cleared blocking waitpoints", { runId, deletedCount });
           }
@@ -1047,6 +1103,12 @@ export class RunAttemptSystem {
                 attemptDurationMs: completion.usage?.durationMs,
                 tx: prisma,
               });
+              if (result.snapshot === null) {
+                // Not reachable for a run with a live attempt.
+                throw new Error(
+                  `cancelRun returned no snapshot for run ${runId} with a live attempt`
+                );
+              }
               return {
                 attemptStatus:
                   result.snapshot.executionStatus === "PENDING_CANCEL"
@@ -1177,6 +1239,7 @@ export class RunAttemptSystem {
                 const nackResult = await this.tryNackAndRequeue({
                   run,
                   snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
+                  previousSnapshot: latestSnapshot,
                   environment: env,
                   orgId: env.organizationId,
                   projectId: env.project.id,
@@ -1211,6 +1274,7 @@ export class RunAttemptSystem {
                     description: "Attempt failed with a short delay, starting a new attempt",
                   },
                   previousSnapshotId: latestSnapshot.id,
+                  previousSnapshot: latestSnapshot,
                   snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
                   environmentId: latestSnapshot.environmentId,
                   environmentType: latestSnapshot.environmentType,
@@ -1306,6 +1370,7 @@ export class RunAttemptSystem {
   public async tryNackAndRequeue({
     run,
     snapshotRoute,
+    previousSnapshot,
     environment,
     orgId,
     projectId,
@@ -1318,10 +1383,14 @@ export class RunAttemptSystem {
     batchId,
     resetQueueAttempts = false,
     workerQueue,
+    moveToWorkerQueue,
+    description,
+    previousSnapshotId,
     tx,
   }: {
     run: { id: string };
     snapshotRoute?: SnapshotRouteWire;
+    previousSnapshot?: PreviousSnapshot;
     environment: {
       id: string;
       type: RuntimeEnvironmentType;
@@ -1346,6 +1415,10 @@ export class RunAttemptSystem {
      */
     resetQueueAttempts?: boolean;
     workerQueue?: string;
+    /** Also moves the run to this worker queue, so later deliveries and retries use it. */
+    moveToWorkerQueue?: string;
+    description?: string;
+    previousSnapshotId?: string;
   }): Promise<{ wasRequeued: boolean } & ExecutionResult> {
     const prisma = tx ?? this.$.prisma;
 
@@ -1356,7 +1429,7 @@ export class RunAttemptSystem {
         messageId: run.id,
         retryAt: timestamp,
         resetAttemptCount: resetQueueAttempts,
-        workerQueue,
+        workerQueue: moveToWorkerQueue ?? workerQueue,
       });
 
       if (!gotRequeued) {
@@ -1377,6 +1450,7 @@ export class RunAttemptSystem {
             status: true,
             attemptNumber: true,
           },
+          workerQueue: moveToWorkerQueue,
         },
         prisma
       );
@@ -1384,9 +1458,10 @@ export class RunAttemptSystem {
       const newSnapshot = await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
         run: requeuedRun,
         snapshotRoute,
+        previousSnapshot,
         snapshot: {
           executionStatus: "QUEUED",
-          description: "Requeued the run after a failure",
+          description: description ?? "Requeued the run after a failure",
         },
         environmentId: environment.id,
         environmentType: environment.type,
@@ -1397,6 +1472,7 @@ export class RunAttemptSystem {
         checkpointId,
         completedWaitpoints,
         batchId,
+        previousSnapshotId,
       });
 
       return {
@@ -1427,6 +1503,8 @@ export class RunAttemptSystem {
     workerId,
     runnerId,
     environmentId,
+    fallbackWorkerQueue,
+    servesWorkerQueue,
   }: {
     runId: string;
     snapshotId: string;
@@ -1436,6 +1514,8 @@ export class RunAttemptSystem {
     workerId?: string;
     runnerId?: string;
     environmentId?: string;
+    fallbackWorkerQueue?: (workerQueue: string) => string | undefined;
+    servesWorkerQueue?: (workerQueue: string) => boolean;
   }): Promise<RestoreOutcomeResult> {
     const prisma = this.$.prisma;
 
@@ -1446,11 +1526,19 @@ export class RunAttemptSystem {
         this.$.runStore,
         environmentId
       );
+      // read-your-writes: the attempt's lock-time retry config may not be on a replica yet
+      const run = await this.$.runStore.findRunOnPrimary(
+        { id: runId },
+        { select: { workerQueue: true, lockedRetryConfig: true } }
+      );
 
+      // A cold start has no checkpoint to lose, so it cannot fail; a restore cannot change lanes.
       if (
         latestSnapshot.id !== snapshotId ||
         latestSnapshot.executionStatus !== "PENDING_EXECUTING" ||
-        !latestSnapshot.checkpointId
+        (outcome === "fail" && !latestSnapshot.checkpointId) ||
+        (outcome === "fallback" && latestSnapshot.checkpointId) ||
+        (servesWorkerQueue && !servesRun(run, latestSnapshot, servesWorkerQueue))
       ) {
         this.restoreOutcomesCounter.add(1, {
           outcome,
@@ -1467,6 +1555,8 @@ export class RunAttemptSystem {
             latestSnapshotId: latestSnapshot.id,
             latestExecutionStatus: latestSnapshot.executionStatus,
             latestCheckpointId: latestSnapshot.checkpointId,
+            workerQueue: run?.workerQueue,
+            workerId,
           }
         );
 
@@ -1482,37 +1572,42 @@ export class RunAttemptSystem {
       let willRetry: boolean;
 
       switch (outcome) {
-        case "requeue": {
+        case "requeue":
+        case "fallback": {
+          let moveToWorkerQueue: string | undefined;
+          if (outcome === "fallback") {
+            const target = run ? fallbackWorkerQueue?.(run.workerQueue) : undefined;
+            // Without a worker queue to move to, it is requeued where it is.
+            moveToWorkerQueue = target !== run?.workerQueue ? target : undefined;
+            this.$.logger.info("reportRestoreOutcome: moving a cold start", {
+              runId,
+              workerQueue: run?.workerQueue,
+              moveToWorkerQueue,
+            });
+          }
           const requeued = await this.tryNackAndRequeue({
             run: { id: runId },
+            previousSnapshot: latestSnapshot,
             environment: {
               id: latestSnapshot.environmentId,
               type: latestSnapshot.environmentType,
             },
             orgId: latestSnapshot.organizationId,
             projectId: latestSnapshot.projectId,
-            checkpointId: latestSnapshot.checkpointId,
+            checkpointId: latestSnapshot.checkpointId ?? undefined,
             completedWaitpoints: latestSnapshot.completedWaitpoints,
             batchId: latestSnapshot.batchId ?? undefined,
             workerId,
             runnerId,
-            error: {
-              type: "INTERNAL_ERROR",
-              code: "TASK_RUN_DEQUEUED_MAX_RETRIES",
-              message: "Restoring the run failed more times than we retry.",
-            },
+            error: dequeuedMaxRetriesError(latestSnapshot.checkpointId),
             snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
+            moveToWorkerQueue,
             tx: prisma,
           });
           willRetry = requeued.wasRequeued;
           break;
         }
         case "fail": {
-          // read-your-writes: the attempt's lock-time retry config may not be on a replica yet
-          const run = await this.$.runStore.findRunOnPrimary(
-            { id: runId },
-            { select: { lockedRetryConfig: true } }
-          );
           const failed = await this.attemptFailed({
             runId,
             snapshotId: latestSnapshot.id,
@@ -1562,6 +1657,101 @@ export class RunAttemptSystem {
     });
   }
 
+  public async releaseRun({
+    runId,
+    snapshotId,
+    reason,
+    workerId,
+    runnerId,
+    environmentId,
+    servesWorkerQueue,
+  }: {
+    runId: string;
+    snapshotId: string;
+    reason: string;
+    workerId?: string;
+    runnerId?: string;
+    environmentId?: string;
+    servesWorkerQueue?: (workerQueue: string) => boolean;
+  }): Promise<ReleaseRunResult> {
+    const prisma = this.$.prisma;
+
+    return await this.$.runLock.lock("releaseRun", [runId], async () => {
+      const latestSnapshot = await getLatestExecutionSnapshot(
+        prisma,
+        runId,
+        this.$.runStore,
+        environmentId
+      );
+
+      let refused =
+        latestSnapshot.id !== snapshotId || latestSnapshot.executionStatus !== "PENDING_EXECUTING";
+      if (!refused && servesWorkerQueue) {
+        const run = await this.$.runStore.findRunOnPrimary(
+          { id: runId },
+          { select: { workerQueue: true } }
+        );
+        refused = !servesRun(run, latestSnapshot, servesWorkerQueue);
+      }
+
+      if (refused) {
+        this.releasesCounter.add(1, { reason: metricReason(reason), result: "conflict" });
+        this.$.logger.debug(
+          "releaseRun: refused, the snapshot moved on or the worker does not serve the run",
+          {
+            runId,
+            snapshotId,
+            reason,
+            latestSnapshotId: latestSnapshot.id,
+            latestExecutionStatus: latestSnapshot.executionStatus,
+            workerId,
+          }
+        );
+
+        return {
+          ok: false,
+          code: "SNAPSHOT_CONFLICT",
+          latestSnapshotId: latestSnapshot.id,
+          latestExecutionStatus: latestSnapshot.executionStatus,
+        };
+      }
+
+      const { wasRequeued } = await this.tryNackAndRequeue({
+        run: { id: runId },
+        snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
+        environment: {
+          id: latestSnapshot.environmentId,
+          type: latestSnapshot.environmentType,
+        },
+        orgId: latestSnapshot.organizationId,
+        projectId: latestSnapshot.projectId,
+        checkpointId: latestSnapshot.checkpointId ?? undefined,
+        completedWaitpoints: latestSnapshot.completedWaitpoints,
+        batchId: latestSnapshot.batchId ?? undefined,
+        workerId,
+        runnerId,
+        error: dequeuedMaxRetriesError(latestSnapshot.checkpointId),
+        description: `Released before the run started: ${reason}`,
+        previousSnapshotId: latestSnapshot.id,
+        previousSnapshot: latestSnapshot,
+        tx: prisma,
+      });
+
+      this.releasesCounter.add(1, {
+        reason: metricReason(reason),
+        result: wasRequeued ? "requeued" : "dropped",
+      });
+      const fields = { runId, snapshotId, reason, workerId, runnerId };
+      if (wasRequeued) {
+        this.$.logger.info("releaseRun: requeued", fields);
+      } else {
+        this.$.logger.warn("releaseRun: the run could not be requeued and failed", fields);
+      }
+
+      return { ok: true, requeued: wasRequeued };
+    });
+  }
+
   /**
   Call this to cancel a run.
   If the run is in-progress it will change it's state to PENDING_CANCEL and notify the worker.
@@ -1591,18 +1781,29 @@ export class RunAttemptSystem {
     bulkActionId?: string;
     attemptDurationMs?: number;
     tx?: PrismaClientOrTransaction;
-  }): Promise<ExecutionResult & { alreadyFinished: boolean }> {
+  }): Promise<CancelRunResult> {
     const prisma = tx ?? this.$.prisma;
 
     return startSpan(this.$.tracer, "cancelRun", async (span) => {
-      return this.$.runLock.lock("cancelRun", [runId], async () => {
-        const latestSnapshot = await getLatestExecutionSnapshot(
-          prisma,
-          runId,
-          this.$.runStore,
-          undefined,
-          organizationId
-        );
+      return this.$.runLock.lock("cancelRun", [runId], async (): Promise<CancelRunResult> => {
+        const { snapshot: latestSnapshot, finishedRun } =
+          await getLatestExecutionSnapshotOrFinishedRun(
+            prisma,
+            runId,
+            this.$.runStore,
+            organizationId,
+            { id: true, friendlyId: true, attemptNumber: true, taskEventStore: true }
+          );
+        if (finishedRun) {
+          if (bulkActionId) {
+            await this.$.runStore.recordBulkActionMembership(runId, bulkActionId, prisma);
+          }
+          this.$.logger.warn("cancelRun: snapshot state expired or absent, run already finished", {
+            runId,
+            status: finishedRun.status,
+          });
+          return { alreadyFinished: true, run: finishedRun, snapshot: null };
+        }
 
         //already finished, do nothing
         if (latestSnapshot.executionStatus === "FINISHED") {
@@ -1745,6 +1946,7 @@ export class RunAttemptSystem {
                 description: "Run was cancelled",
               },
               previousSnapshotId: latestSnapshot.id,
+              previousSnapshot: latestSnapshot,
               snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
               environmentId: latestSnapshot.environmentId,
               environmentType: latestSnapshot.environmentType,
@@ -1776,6 +1978,7 @@ export class RunAttemptSystem {
             description: "Run was cancelled, not finished",
           },
           previousSnapshotId: latestSnapshot.id,
+          previousSnapshot: latestSnapshot,
           snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
           environmentId: latestSnapshot.environmentId,
           environmentType: latestSnapshot.environmentType,
@@ -1790,6 +1993,7 @@ export class RunAttemptSystem {
           await this.waitpointSystem.completeWaitpoint({
             id: run.associatedWaitpoint.id,
             output: { value: JSON.stringify(error), isError: true },
+            organizationId: latestSnapshot.organizationId,
           });
         }
 
@@ -1942,6 +2146,7 @@ export class RunAttemptSystem {
           description: "Run failed",
         },
         previousSnapshotId: latestSnapshot.id,
+        previousSnapshot: latestSnapshot,
         snapshotRoute: snapshotRouteFromSnapshot(latestSnapshot),
         environmentId: env.id,
         environmentType: env.type,
@@ -2086,11 +2291,22 @@ export class RunAttemptSystem {
       }
 
       if (run.status === "CANCELED") {
-        const latestSnapshot = await getLatestExecutionSnapshot(
-          this.$.prisma,
-          runId,
-          this.$.runStore
-        );
+        // No snapshot state (expired, or never written) means no worker owns the execution, so this
+        // is the same as a FINISHED snapshot: nothing to wait for, deliver below.
+        const { snapshot: latestSnapshot, finishedRun } =
+          await getLatestExecutionSnapshotOrFinishedRun(
+            this.$.prisma,
+            runId,
+            this.$.runStore,
+            undefined,
+            { id: true }
+          );
+        if (finishedRun) {
+          this.$.logger.warn(
+            "ensureRunFinalized: snapshot state expired or absent, run already finished",
+            { runId, status: finishedRun.status }
+          );
+        }
 
         /**
          * Defer only while a worker still owns the execution: those states carry
@@ -2101,11 +2317,16 @@ export class RunAttemptSystem {
          * so the guard must deliver or the parent is stranded.
          */
         const workerOwnsExecution =
-          isExecuting(latestSnapshot.executionStatus) ||
-          isPendingExecuting(latestSnapshot.executionStatus) ||
-          latestSnapshot.executionStatus === "PENDING_CANCEL";
+          latestSnapshot !== null &&
+          (isExecuting(latestSnapshot.executionStatus) ||
+            isPendingExecuting(latestSnapshot.executionStatus) ||
+            latestSnapshot.executionStatus === "PENDING_CANCEL");
 
-        if (latestSnapshot.executionStatus !== "FINISHED" && workerOwnsExecution) {
+        if (
+          latestSnapshot !== null &&
+          latestSnapshot.executionStatus !== "FINISHED" &&
+          workerOwnsExecution
+        ) {
           const currentDeferCount = deferCount ?? 0;
 
           if (currentDeferCount < MAX_FINALIZATION_GUARD_DEFERRALS) {
@@ -2163,6 +2384,8 @@ export class RunAttemptSystem {
         await this.waitpointSystem.completeWaitpoint({
           id: run.associatedWaitpoint.id,
           output: this.waitpointSystem.buildWaitpointOutputFromRun(run),
+          // This recovery re-derivation selects no organizationId; leave it conservative rather than
+          // widen the query solely to skip a MemoryDB lookup.
         });
       }
 
@@ -2573,6 +2796,7 @@ function truncateString(str: string | undefined, maxLength: number): string {
 // reasons the operator and supervisor are known to report; the rest is logged.
 const METRIC_REASONS = new Set([
   "ContainerFailed",
+  "CreateFailed",
   "CreateContainerConfigError",
   "PodCannotStart",
   "PodCreateFailed",
@@ -2588,11 +2812,78 @@ const METRIC_REASONS = new Set([
   "SnapshotNodeGone",
   "SnapshotNodeUnschedulable",
   "SnapshotNotFound",
+  "SnapshotRefused",
   "StartError",
+  "TemplateKeyMalformed",
+  "TemplateKeyMissing",
+  "TemplateNotFound",
   "Timeout",
   "Unknown",
 ]);
 
+/** Whether a worker group serves the run's worker queue or, for a restore, its restore queue. */
+function servesRun(
+  run: { workerQueue: string } | null,
+  snapshot: Pick<EnhancedExecutionSnapshot, "environmentId" | "environmentType" | "checkpoint">,
+  serves: (workerQueue: string) => boolean
+): boolean {
+  if (!run) {
+    return false;
+  }
+  return (
+    serves(run.workerQueue) ||
+    (!!snapshot.checkpoint &&
+      serves(
+        workerQueueForPublish(
+          run,
+          { id: snapshot.environmentId, type: snapshot.environmentType },
+          snapshot.checkpoint
+        )
+      ))
+  );
+}
+
+function dequeuedMaxRetriesError(checkpointId: string | null | undefined): TaskRunInternalError {
+  return {
+    type: "INTERNAL_ERROR",
+    code: "TASK_RUN_DEQUEUED_MAX_RETRIES",
+    message: checkpointId
+      ? "Restoring the run failed more times than we retry."
+      : "Starting the run failed more times than we retry.",
+  };
+}
+
 function metricReason(reason: string): string {
   return METRIC_REASONS.has(reason) ? reason : "other";
+}
+
+/**
+ * Replaces the worker stamp in a run's existing annotations. The stamp is one unit: a previous
+ * attempt's cell must not survive next to this attempt's lane, and an unstamped attempt clears
+ * the previous stamp rather than keeping it. Returns undefined when the write would change nothing.
+ */
+export function stampWorkerAnnotations(
+  existing: Prisma.JsonValue | null | undefined,
+  stamp: { workerCell?: string; workerLane?: string }
+): Prisma.InputJsonObject | undefined {
+  const current =
+    typeof existing === "object" && existing !== null && !Array.isArray(existing)
+      ? (existing as Prisma.InputJsonObject)
+      : {};
+  const { workerCell: previousCell, workerLane: previousLane, ...base } = current;
+
+  if (
+    stamp.workerCell === undefined &&
+    stamp.workerLane === undefined &&
+    previousCell === undefined &&
+    previousLane === undefined
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...base,
+    ...(stamp.workerCell !== undefined ? { workerCell: stamp.workerCell } : {}),
+    ...(stamp.workerLane !== undefined ? { workerLane: stamp.workerLane } : {}),
+  };
 }

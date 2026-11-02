@@ -1,6 +1,8 @@
 import { tryCatch } from "@trigger.dev/core/v3";
 import { env } from "~/env.server";
 import { resolvePrivateApiKeyRateLimitScope } from "~/models/runtimeEnvironment.server";
+import { resolveRunToken } from "~/services/oidc/runTokenAuth.server";
+import { isRunTokenFormat } from "~/services/oidc/runTokenVerify";
 import { batchStreamGrants } from "~/runEngine/concerns/batchStreamGrantsInstance.server";
 import { authenticateAuthorizationHeader } from "./apiAuth.server";
 import { recordApiRateLimitObservation } from "./apiRateLimitMetrics.server";
@@ -56,6 +58,28 @@ export async function resolveApiRateLimitOverride(
         projectId: scope.projectId,
         environmentId: scope.environmentId,
         metricsEnabled: readApiRateLimitMetricsFlag(scope.featureFlags),
+      },
+    };
+  }
+
+  // Run tokens share their environment's bucket, like private keys. Without this each run would
+  // get its own bucket keyed on the token hash. Trimmed the same way as route authentication, so
+  // extra whitespace can't produce a fresh bucket.
+  const runToken = rawApiKey.trim();
+  if (isRunTokenFormat(runToken)) {
+    const environment = (await resolveRunToken(runToken))?.environment;
+    if (!environment) {
+      return;
+    }
+
+    return {
+      config: environment.organization.apiRateLimiterConfig,
+      identifier: environment.id,
+      tenant: {
+        organizationId: environment.organizationId,
+        projectId: environment.projectId,
+        environmentId: environment.id,
+        metricsEnabled: readApiRateLimitMetricsFlag(environment.organization.featureFlags),
       },
     };
   }
@@ -140,6 +164,8 @@ export const apiRateLimiter = authorizationRateLimitMiddleware({
     "/api/v1/timezones",
     "/api/v1/usage/ingest",
     "/api/v1/auth/jwt/claims",
+    // Dedicated per-run/environment limits prevent a throttled run from draining the API budget.
+    "/api/v1/auth/oidc/token",
     /^\/api\/v1\/runs\/[^/]+\/attempts$/, // /api/v1/runs/$runFriendlyId/attempts
     /^\/api\/v1\/waitpoints\/tokens\/[^/]+\/callback\/[^/]+$/, // /api/v1/waitpoints/tokens/$waitpointFriendlyId/callback/$hash
     ...deploymentApiPaths, // rate limited separately by deploymentRateLimiter
@@ -165,6 +191,16 @@ export const apiRateLimiter = authorizationRateLimitMiddleware({
 
     if (!batchFriendlyId || !authorizationValue) {
       return false;
+    }
+
+    // Run tokens can upload batch items too, so they must be able to spend the phase-one grant.
+    const runToken = authorizationValue.replace(/^Bearer /, "").trim();
+    if (isRunTokenFormat(runToken)) {
+      const [runTokenError, resolved] = await tryCatch(resolveRunToken(runToken));
+      if (runTokenError || !resolved) {
+        return false;
+      }
+      return batchStreamGrants.spend(resolved.environment.id, batchFriendlyId);
     }
 
     const [authError, authenticated] = await tryCatch(

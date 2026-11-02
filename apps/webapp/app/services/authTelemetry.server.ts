@@ -1,13 +1,24 @@
 import { getMeter } from "@internal/tracing";
 import { isAdditionalApiKey } from "@trigger.dev/core/v3/apiKeys";
+import {
+  isSdkCredentialTelemetryOperation,
+  isSdkCredentialTelemetryReason,
+  SDK_CREDENTIAL_OPERATION_HEADER,
+  SDK_CREDENTIAL_REASON_HEADER,
+} from "@trigger.dev/core/v3";
 import { isPublicJWT } from "@trigger.dev/core/v3/jwt";
-import type { BearerAuthOptions } from "@trigger.dev/plugins";
+import { isDefaultDevBranch, sanitizeBranchName } from "@trigger.dev/core/v3/utils/gitBranch";
+import type { BearerAuthOptions, BearerAuthResult } from "@trigger.dev/plugins";
 import type {
   BearerCredentialKind,
   BearerLookupPath,
+  BearerResolution,
   HostBearerAuthResult,
   RbacResource,
+  RoleBaseAccessController,
 } from "@trigger.dev/rbac";
+import { authenticateRunToken } from "~/services/oidc/runTokenAuth.server";
+import { isRunTokenFormat } from "~/services/oidc/runTokenVerify";
 import { rbac } from "~/services/rbac.server";
 import { singleton } from "~/utils/singleton";
 
@@ -23,19 +34,27 @@ const telemetry = singleton("apiAuthTelemetry", () => {
     unit: "ms",
   });
 
-  return { attempts, duration };
+  const sdkCredentialSelections = meter.createCounter("api_auth.sdk_credential_selections", {
+    description: "SDK credential selections reported on API authentication attempts",
+  });
+
+  return { attempts, duration, sdkCredentialSelections };
 });
 
 export async function authenticateBearerWithTelemetry(
   request: Request,
-  options: BearerAuthOptions
+  options: BearerAuthOptions,
+  controller: Pick<RoleBaseAccessController, "authenticateBearer"> = rbac
 ): Promise<HostBearerAuthResult> {
   const startedAt = performance.now();
   const classified = classifyCredential(request, options.allowJWT ?? false);
   let final = { ...classified, result: "error" as ApiAuthResult };
 
   try {
-    const result = await rbac.authenticateBearer(request, options);
+    const result: BearerAuthResult & { resolution?: BearerResolution } =
+      classified.credentialKind === "run_token"
+        ? await authenticateRunTokenBearer(request)
+        : await controller.authenticateBearer(request, options);
     // The host LazyController always attaches `resolution`; fall back to the
     // format-based classification if a caller (e.g. a test double) omits it.
     const resolution = result.resolution ?? classified;
@@ -45,11 +64,12 @@ export async function authenticateBearerWithTelemetry(
       result: result.ok ? "success" : result.status === 403 ? "forbidden" : "invalid",
     };
     recordAuthAttempt("rbac", final.credentialKind, final.lookupPath, final.result);
-    return result;
+    return { ...result, resolution };
   } catch (error) {
     recordAuthAttempt("rbac", final.credentialKind, final.lookupPath, final.result);
     throw error;
   } finally {
+    recordSdkCredentialSelection(request, final.credentialKind);
     telemetry.duration.record(performance.now() - startedAt, {
       resolver: "rbac",
       credential_kind: final.credentialKind,
@@ -57,6 +77,55 @@ export async function authenticateBearerWithTelemetry(
       lookup_path: final.lookupPath,
     });
   }
+}
+
+const RUN_TOKEN_RESOLUTION = { credentialKind: "run_token", lookupPath: "run_token" } as const;
+
+// Run tokens are host-owned and verified locally, so they never reach the RBAC controller.
+async function authenticateRunTokenBearer(request: Request): Promise<HostBearerAuthResult> {
+  const result = await authenticateRunToken(bearerToken(request) ?? "");
+  if (!result.ok) {
+    return { ...result, resolution: RUN_TOKEN_RESOLUTION };
+  }
+
+  const rawBranch = request.headers.get("x-trigger-branch");
+  const branch = sanitizeBranchName(rawBranch);
+  const environment = result.environment;
+  const requestedBranch =
+    environment.type === "DEVELOPMENT" && isDefaultDevBranch(branch) ? null : branch;
+  if (
+    (environment.type === "PREVIEW" || environment.type === "DEVELOPMENT") &&
+    rawBranch &&
+    (branch === null || requestedBranch !== environment.branchName)
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: "x-trigger-branch does not match the run token environment",
+      resolution: RUN_TOKEN_RESOLUTION,
+    };
+  }
+
+  return {
+    ok: true,
+    environment: result.environment,
+    subject: {
+      type: "runToken",
+      runId: result.claims.run_id,
+      environmentId: result.environment.id,
+      organizationId: result.environment.organizationId,
+      projectId: result.environment.projectId,
+    },
+    ability: result.ability,
+    resolution: RUN_TOKEN_RESOLUTION,
+  };
+}
+
+function bearerToken(request: Request): string | undefined {
+  return request.headers
+    .get("Authorization")
+    ?.replace(/^Bearer /, "")
+    .trim();
 }
 
 export async function authenticateAuthorizeBearerWithTelemetry(
@@ -95,6 +164,7 @@ export async function observeLegacyBearerAuthentication<T extends { ok: boolean 
     recordAuthAttempt("legacy", classified.credentialKind, classified.lookupPath, result);
     throw error;
   } finally {
+    recordSdkCredentialSelection(request, classified.credentialKind);
     telemetry.duration.record(performance.now() - startedAt, {
       resolver: "legacy",
       credential_kind: classified.credentialKind,
@@ -102,6 +172,23 @@ export async function observeLegacyBearerAuthentication<T extends { ok: boolean 
       lookup_path: classified.lookupPath,
     });
   }
+}
+
+const sdkTelemetryRecorded = new WeakSet<Request>();
+
+function recordSdkCredentialSelection(request: Request, credentialKind: BearerCredentialKind) {
+  if (sdkTelemetryRecorded.has(request)) return;
+  const operation = request.headers.get(SDK_CREDENTIAL_OPERATION_HEADER);
+  const reason = request.headers.get(SDK_CREDENTIAL_REASON_HEADER);
+  if (!isSdkCredentialTelemetryOperation(operation) || !isSdkCredentialTelemetryReason(reason))
+    return;
+
+  sdkTelemetryRecorded.add(request);
+  telemetry.sdkCredentialSelections.add(1, {
+    operation,
+    reason,
+    credential_kind: credentialKind,
+  });
 }
 
 function recordAuthAttempt(
@@ -126,11 +213,9 @@ function classifyCredential(
   request: Request,
   allowJWT: boolean
 ): { credentialKind: BearerCredentialKind; lookupPath: BearerLookupPath } {
-  const token = request.headers
-    .get("Authorization")
-    ?.replace(/^Bearer /, "")
-    .trim();
+  const token = bearerToken(request);
   if (!token) return { credentialKind: "unknown", lookupPath: "not_found" };
+  if (isRunTokenFormat(token)) return RUN_TOKEN_RESOLUTION;
   if (token.startsWith("pk_")) {
     return { credentialKind: "legacy_public_key", lookupPath: "legacy_public" };
   }

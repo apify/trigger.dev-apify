@@ -28,15 +28,12 @@ import {
   getTraceSummaryQueryBuilderV2,
   getTraceChunkQueryBuilder,
   getTraceChunkQueryBuilderV2,
-  getTraceSpanCountQueryBuilder,
-  getTraceSpanCountQueryBuilderV2,
   insertTaskEvents,
   insertTaskEventsV2,
   getLogDetailQueryBuilderV2,
   getLogsSearchListQueryBuilder,
 } from "./taskEvents.js";
 import { insertTaskEventsSearchV2 } from "./taskEventsSearch.js";
-import { projectTaskEventsSearchV2Window } from "./taskEventsSearchProjector.js";
 import { insertMetrics } from "./metrics.js";
 import { insertLlmMetrics } from "./llmMetrics.js";
 import {
@@ -81,6 +78,11 @@ import {
   getOccurrenceCountsSinceQueryBuilder,
 } from "./errors.js";
 export { msToClickHouseInterval } from "./intervals.js";
+export {
+  setQueryObserver,
+  type QueryObservation,
+  type QueryObserver,
+} from "./client/queryObserver.js";
 import { Logger, type LogLevel } from "@trigger.dev/core/logger";
 import type { Meter } from "@internal/tracing";
 import type { Agent as HttpAgent } from "http";
@@ -91,11 +93,11 @@ export type * from "./taskEvents.js";
 export {
   buildTraceChunkCursorPredicate,
   buildTraceChunkKeyPredicate,
+  buildTraceStartTimeSortKeyPredicate,
   sliceTraceChunk,
   TRACE_CHUNK_ORDER_BY,
 } from "./taskEvents.js";
 export * from "./taskEventsSearch.js";
-export * from "./taskEventsSearchProjector.js";
 export type * from "./metrics.js";
 export type * from "./llmMetrics.js";
 export type * from "./queueMetrics.js";
@@ -139,7 +141,12 @@ export {
 export type { ColumnFormatType, OutputColumnMetadata } from "@internal/tsql";
 
 // Errors
-export { QueryError, isClickhouseResourceLimitError } from "./client/errors.js";
+export {
+  QueryError,
+  isClickhouseResourceLimitError,
+  insertErrorServerText,
+  insertErrorType,
+} from "./client/errors.js";
 
 export type ClickhouseCommonConfig = {
   keepAlive?: {
@@ -165,6 +172,8 @@ export type ClickHouseConfig =
       url?: string;
       writerUrl?: never;
       readerUrl?: never;
+      readerClickhouseSettings?: never;
+      readerRequestTimeoutMs?: never;
     } & ClickhouseCommonConfig)
   | ({
       name?: never;
@@ -173,6 +182,10 @@ export type ClickHouseConfig =
       writerUrl: string;
       readerName?: string;
       readerUrl: string;
+      /** Applied to the reader only, on top of `clickhouseSettings`. */
+      readerClickhouseSettings?: ClickHouseSettings;
+      /** Reader-only override of `requestTimeoutMs`. */
+      readerRequestTimeoutMs?: number;
     } & ClickhouseCommonConfig);
 
 export class ClickHouse {
@@ -211,14 +224,14 @@ export class ClickHouse {
       this.reader = new ClickhouseClient({
         name: config.readerName ?? "clickhouse-reader",
         url: config.readerUrl,
-        clickhouseSettings: config.clickhouseSettings,
+        clickhouseSettings: { ...config.clickhouseSettings, ...config.readerClickhouseSettings },
         logger: this.logger,
         meter: config.meter,
         logLevel: config.logLevel,
         keepAlive: config.keepAlive,
         httpAgent: config.httpAgent,
         maxOpenConnections: config.maxOpenConnections,
-        requestTimeoutMs: config.requestTimeoutMs,
+        requestTimeoutMs: config.readerRequestTimeoutMs ?? config.requestTimeoutMs,
         compression: config.compression,
       });
       this.writer = new ClickhouseClient({
@@ -263,6 +276,11 @@ export class ClickHouse {
     });
   }
 
+  /** True when reads and writes go to separate services. */
+  get hasSeparateReader(): boolean {
+    return this._splitClients;
+  }
+
   async close() {
     if (this._splitClients) {
       await Promise.all([this.reader.close(), this.writer.close()]);
@@ -293,7 +311,6 @@ export class ClickHouse {
       insert: insertTaskEvents(this.writer),
       traceSummaryQueryBuilder: getTraceSummaryQueryBuilder(this.reader),
       traceChunkQueryBuilder: getTraceChunkQueryBuilder(this.reader),
-      traceSpanCountQueryBuilder: getTraceSpanCountQueryBuilder(this.reader),
       traceDetailedSummaryQueryBuilder: getTraceDetailedSummaryQueryBuilder(this.reader),
       traceEventsForExportQueryBuilder: getTraceEventsForExportQueryBuilder(this.reader),
       spanDetailsQueryBuilder: getSpanDetailsQueryBuilder(this.reader),
@@ -361,7 +378,6 @@ export class ClickHouse {
       insert: insertTaskEventsV2(this.writer),
       traceSummaryQueryBuilder: getTraceSummaryQueryBuilderV2(this.reader),
       traceChunkQueryBuilder: getTraceChunkQueryBuilderV2(this.reader),
-      traceSpanCountQueryBuilder: getTraceSpanCountQueryBuilderV2(this.reader),
       traceDetailedSummaryQueryBuilder: getTraceDetailedSummaryQueryBuilderV2(this.reader),
       traceEventsForExportQueryBuilder: getTraceEventsForExportQueryBuilderV2(this.reader),
       spanDetailsQueryBuilder: getSpanDetailsQueryBuilderV2(this.reader),
@@ -373,7 +389,6 @@ export class ClickHouse {
     return {
       insert: insertTaskEventsSearchV2(this.writer),
       logsListQueryBuilder: getLogsSearchListQueryBuilder(this.reader),
-      projectV2Window: projectTaskEventsSearchV2Window(this.writer),
     };
   }
 

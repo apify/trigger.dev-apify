@@ -28,6 +28,7 @@ import { ServiceValidationError } from "~/v3/services/common.server";
 import { EngineServiceValidationError } from "@internal/run-engine";
 import { unroutableIdResponse } from "./unroutableId.server";
 import { tenantContext, tenantContextFromAuthEnvironment } from "~/services/tenantContext.server";
+import { withRequestFeature, type RequestFeatureName } from "~/services/requestFeature.server";
 
 // Client aborts and service-level validation errors aren't bugs — they're
 // expected at API boundaries. Log them at `warn` so they stay in stdout
@@ -126,10 +127,17 @@ async function authenticateRequestForApiBuilder(
   // Plugins return the full AuthenticatedEnvironment shape directly — no
   // follow-up DB lookup. The fallback fetches via Prisma, the cloud plugin
   // via Drizzle; both produce the same slim contract type.
+  // Scoped credentials must fail closed on routes without an authorization check.
+  const restrictedApiKey =
+    (result.subject.type === "apiKey" && result.subject.restricted) ||
+    result.subject.type === "publicJWT" ||
+    result.subject.type === "runToken";
   const authentication: ApiAuthenticationResultSuccess = {
     ok: true,
     apiKey: result.environment.apiKey,
     type: result.subject.type === "publicJWT" ? "PUBLIC_JWT" : "PRIVATE",
+    environmentScoped: restrictedApiKey,
+    credentialKind: result.resolution.credentialKind,
     environment: result.environment,
     realtime: result.jwt?.realtime,
     oneTimeUse: result.jwt?.oneTimeUse,
@@ -142,7 +150,7 @@ async function authenticateRequestForApiBuilder(
     ok: true,
     authentication,
     ability: result.ability,
-    restrictedApiKey: result.subject.type === "apiKey" && result.subject.restricted,
+    restrictedApiKey,
   };
 }
 
@@ -297,6 +305,8 @@ type ApiKeyRouteBuilderOptions<
       : undefined
   ) => Promise<TResource | undefined>;
   shouldRetryNotFound?: boolean;
+  // Opt-in metrics label for the request and its ClickHouse queries.
+  feature?: RequestFeatureName;
   authorization?: {
     action: string;
     resource: (
@@ -349,7 +359,7 @@ export function createLoaderApiRoute<
   options: ApiKeyRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>,
   handler: ApiKeyHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>
 ) {
-  return async function loader({ request, params }: LoaderFunctionArgs) {
+  const loader = async function ({ request, params }: LoaderFunctionArgs) {
     const {
       params: paramsSchema,
       searchParams: searchParamsSchema,
@@ -522,6 +532,8 @@ export function createLoaderApiRoute<
       }
     }
   };
+
+  return (args: LoaderFunctionArgs) => withRequestFeature(options.feature, () => loader(args));
 }
 
 // `environmentId` is checked against a user-actor token's environment claim, so an env-scoped
@@ -1200,6 +1212,7 @@ type ApiKeyActionHandlerFunction<
     ? z.infer<TBodySchema>
     : undefined;
   authentication: ApiAuthenticationResultSuccess;
+  restrictedApiKey: boolean;
   ability: RbacAbility;
   request: Request;
   resource?: TResource;
@@ -1437,6 +1450,7 @@ export function createActionApiRoute<
             headers: parsedHeaders,
             body: parsedBody,
             authentication: authenticationResult,
+            restrictedApiKey: authResult.restrictedApiKey,
             ability,
             request,
             resource,

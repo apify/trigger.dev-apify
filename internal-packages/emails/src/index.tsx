@@ -6,6 +6,7 @@ import AlertDashboardAgentWatchEmail, {
   AlertDashboardAgentWatchEmailSchema,
 } from "../emails/alert-dashboard-agent-watch";
 import AlertErrorGroupEmail, { AlertErrorGroupEmailSchema } from "../emails/alert-error-group";
+import AlertRaisedEmail, { AlertRaisedEmailSchema } from "../emails/alert-raised";
 import AlertRunFailureEmail, { AlertRunEmailSchema } from "../emails/alert-run-failure";
 import { setGlobalBasePath } from "../emails/components/BasePath";
 import ConfirmEmailChangeEmail, {
@@ -25,6 +26,9 @@ import type { MailTransport, MailTransportOptions } from "./transports";
 import { constructMailTransport } from "./transports";
 import MfaEnabledEmail, { MfaEnabledEmailSchema } from "../emails/mfa-enabled";
 import MfaDisabledEmail, { MfaDisabledEmailSchema } from "../emails/mfa-disabled";
+import CliLoginAuthorizedEmail, {
+  CliLoginAuthorizedEmailSchema,
+} from "../emails/cli-login-authorized";
 import BulkActionCompletedEmail, {
   BulkActionCompletedEmailSchema,
 } from "../emails/bulk-action-complete";
@@ -43,11 +47,13 @@ export const DeliverEmailSchema = z
     AlertRunEmailSchema,
     AlertAttemptEmailSchema,
     AlertErrorGroupEmailSchema,
+    AlertRaisedEmailSchema,
     AlertDashboardAgentWatchEmailSchema,
     AlertDeploymentFailureEmailSchema,
     AlertDeploymentSuccessEmailSchema,
     MfaEnabledEmailSchema,
     MfaDisabledEmailSchema,
+    CliLoginAuthorizedEmailSchema,
     BulkActionCompletedEmailSchema,
   ])
   .and(z.object({ to: z.string() }));
@@ -149,6 +155,12 @@ export class EmailClient {
           component: <AlertErrorGroupEmail {...data} />,
         };
       }
+      case "alert-raised": {
+        return {
+          subject: `[${data.organization}] ${data.headline}`,
+          component: <AlertRaisedEmail {...data} />,
+        };
+      }
       case "alert-dashboard-agent-watch": {
         return {
           // The headline is the same sentence the chat and Slack use; `identity` is a key.
@@ -178,6 +190,12 @@ export class EmailClient {
         return {
           subject: `Multi-factor authentication disabled on your Trigger.dev account`,
           component: <MfaDisabledEmail {...data} />,
+        };
+      }
+      case "cli-login-authorized": {
+        return {
+          subject: `New login authorized on your Trigger.dev account`,
+          component: <CliLoginAuthorizedEmail {...data} />,
         };
       }
       case "bulk-action-completed": {

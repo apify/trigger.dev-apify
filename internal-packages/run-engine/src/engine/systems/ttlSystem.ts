@@ -2,7 +2,10 @@ import { parseNaturalLanguageDuration } from "@trigger.dev/core/v3/isomorphic";
 import type { TaskRunError } from "@trigger.dev/core/v3/schemas";
 import type { PrismaClientOrTransaction, TaskRunStatus } from "@trigger.dev/database";
 import { isExecuting } from "../statuses.js";
-import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
+import {
+  getLatestExecutionSnapshotOrFinishedRun,
+  type ExecutionSnapshotSystem,
+} from "./executionSnapshotSystem.js";
 import type { SystemResources } from "./systems.js";
 import {
   parseSnapshotRoute,
@@ -18,17 +21,20 @@ import { boundedIn } from "@trigger.dev/database";
 export type TtlSystemOptions = {
   resources: SystemResources;
   waitpointSystem: WaitpointSystem;
+  executionSnapshotSystem: ExecutionSnapshotSystem;
   finalizationGuardDelayMs?: number;
 };
 
 export class TtlSystem {
   private readonly $: SystemResources;
   private readonly waitpointSystem: WaitpointSystem;
+  private readonly executionSnapshotSystem: ExecutionSnapshotSystem;
   private readonly finalizationGuardDelayMs: number;
 
   constructor(private readonly options: TtlSystemOptions) {
     this.$ = options.resources;
     this.waitpointSystem = options.waitpointSystem;
+    this.executionSnapshotSystem = options.executionSnapshotSystem;
     this.finalizationGuardDelayMs = options.finalizationGuardDelayMs ?? 60_000;
   }
 
@@ -60,13 +66,20 @@ export class TtlSystem {
   }) {
     const prisma = tx ?? this.$.prisma;
     await this.$.runLock.lock("expireRun", [runId], async () => {
-      const snapshot = await getLatestExecutionSnapshot(
+      const { snapshot, finishedRun } = await getLatestExecutionSnapshotOrFinishedRun(
         prisma,
         runId,
         this.$.runStore,
-        undefined,
-        route ?? organizationId
+        route ?? organizationId,
+        { id: true }
       );
+      if (finishedRun) {
+        this.$.logger.debug("expireRun: snapshot state expired, run already finished", {
+          runId,
+          status: finishedRun.status,
+        });
+        return;
+      }
 
       //if we're executing then we won't expire the run
       if (isExecuting(snapshot.executionStatus)) {
@@ -114,6 +127,7 @@ export class TtlSystem {
           completedAt: new Date(),
           expiredAt: new Date(),
           snapshot: {
+            ...this.executionSnapshotSystem.nextSnapshotIdentity(snapshot, runId),
             engine: "V2",
             executionStatus: "FINISHED",
             description: "Run was expired because the TTL was reached",
@@ -157,6 +171,7 @@ export class TtlSystem {
         await this.waitpointSystem.completeWaitpoint({
           id: updatedRun.associatedWaitpoint.id,
           output: { value: JSON.stringify(error), isError: true },
+          organizationId: snapshot.organizationId,
         });
       }
 

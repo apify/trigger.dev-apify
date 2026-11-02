@@ -12,9 +12,10 @@ import { $replica, prisma, type PrismaClient } from "~/db.server";
 import { clickhouseFactory } from "~/services/clickhouse/clickhouseFactoryInstance.server";
 import { logger } from "~/services/logger.server";
 import { mintSessionToken } from "~/services/realtime/mintSessionToken.server";
+import { stripClientIngressFieldsFromBasePayload } from "~/services/realtime/sanitizeSessionInput.server";
 import {
   isSafeSessionExternalId,
-  SESSION_CHANNEL_SCOPE_INFIX,
+  SESSION_EXTERNAL_ID_FOLD_ERROR,
 } from "~/services/realtime/sessionChannels.server";
 import {
   ensureRunForSession,
@@ -32,10 +33,7 @@ import {
   createLoaderApiRoute,
   everyResource,
 } from "~/services/routeBuilders/apiBuilder.server";
-import {
-  recordSessionCreateAuthorization,
-  sessionCreateAuthorizationOutcome,
-} from "~/services/sessionAuthorizationTelemetry.server";
+import { sessionCreateAuthorizationOutcome } from "~/services/sessionAuthorizationTelemetry.server";
 import { ServiceValidationError } from "~/v3/services/common.server";
 import { runStore } from "~/v3/runStore.server";
 
@@ -163,15 +161,10 @@ const { action } = createActionApiRoute(
     },
     corsStrategy: "all",
   },
-  async ({ authentication, body, ability, request }) => {
+  async ({ authentication, body, ability }) => {
     try {
       if (body.externalId && !isSafeSessionExternalId(body.externalId)) {
-        return json(
-          {
-            error: `externalId cannot contain "${SESSION_CHANNEL_SCOPE_INFIX}" or end in ":out" or ":in"`,
-          },
-          { status: 422 }
-        );
+        return json({ error: SESSION_EXTERNAL_ID_FOLD_ERROR }, { status: 422 });
       }
 
       const sessionIds = body.externalId ? [body.externalId] : [];
@@ -192,13 +185,18 @@ const { action } = createActionApiRoute(
         return json({ error: "Unauthorized" }, { status: 403 });
       }
 
+      const triggerConfig = {
+        ...body.triggerConfig,
+        basePayload: stripClientIngressFieldsFromBasePayload(body.triggerConfig.basePayload),
+      };
+
       // Defer cached config changes until the stored task has been authorized.
       const { session, isCached } = await findOrCreateSession({
         environment: authentication.environment,
         externalId: body.externalId,
         type: body.type,
         taskIdentifier: body.taskIdentifier,
-        triggerConfig: body.triggerConfig,
+        triggerConfig,
         tags: body.tags,
         metadata: body.metadata as Record<string, unknown> | undefined,
         expiresAt: body.expiresAt,
@@ -229,7 +227,6 @@ const { action } = createActionApiRoute(
         );
       }
 
-      recordSessionCreateAuthorization(ability, session, request, authentication.environment);
       if (
         sessionCreateAuthorizationOutcome(
           ability,
@@ -245,7 +242,7 @@ const { action } = createActionApiRoute(
           session,
           await prisma.session.update({
             where: { id: session.id },
-            data: { triggerConfig: body.triggerConfig as unknown as Prisma.InputJsonValue },
+            data: { triggerConfig: triggerConfig as unknown as Prisma.InputJsonValue },
             select: { triggerConfig: true, updatedAt: true },
           })
         );
