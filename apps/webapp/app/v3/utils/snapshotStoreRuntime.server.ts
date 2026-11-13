@@ -1,10 +1,9 @@
-import { createCompletedWaitpointResolver } from "@internal/run-engine";
+import { createStoreRunCompletedWaitpointResolver } from "@internal/run-engine";
 import {
   PendingIndex,
   PendingRecoveryWorker,
   RouteUnavailableError,
   TaskRunExecutionSnapshotStore,
-  type CompletedWaitpointResolver,
   type PostgresCommitStatus,
   type RunStore,
   type SnapshotDecoratorMetrics,
@@ -18,10 +17,12 @@ export function createSnapshotStoreRuntime(options: {
   rollout: ReturnType<typeof createSnapshotRolloutResolver>;
   getRunStore: () => RunStore;
   metrics?: SnapshotDecoratorMetrics;
+  waitpointStoreEnabled?: (organizationId: string) => boolean | Promise<boolean>;
 }) {
   const leaves = new Map<string, RunStore>();
   let recovery: PendingRecoveryWorker | undefined;
-  let completedWaitpoints: CompletedWaitpointResolver | undefined;
+  let pendingIndex: PendingIndex | undefined;
+  let completedWaitpoints: ReturnType<typeof createStoreRunCompletedWaitpointResolver> | undefined;
 
   function primary(route: string) {
     const leaf = leaves.get(route);
@@ -29,10 +30,14 @@ export function createSnapshotStoreRuntime(options: {
     return leaf.primaryReadClient;
   }
 
+  function getPendingIndex() {
+    return (pendingIndex ??= new PendingIndex(options.connection.getClient()));
+  }
+
   function recoveryWorker() {
     return (recovery ??= new PendingRecoveryWorker({
       store: options.connection.getStore(),
-      pendingIndex: new PendingIndex(options.connection.getClient()),
+      pendingIndex: getPendingIndex(),
       checkPostgresCommit: async (xid, route) => {
         const rows = await primary(route).$queryRawUnsafe<Array<{ status: PostgresCommitStatus }>>(
           "SELECT pg_xact_status($1::xid8) AS status",
@@ -54,6 +59,15 @@ export function createSnapshotStoreRuntime(options: {
   }
 
   return {
+    /** The background sweep's handles: the same worker, index and client as `resolvePending`. */
+    recovery() {
+      return {
+        worker: recoveryWorker(),
+        pendingIndex: getPendingIndex(),
+        store: options.connection.getStore(),
+        ready: options.connection.ready,
+      };
+    },
     decorate(leaf: RunStore, route: string): RunStore {
       if (leaves.has(route)) throw new Error(`Duplicate snapshot primary route: ${route}`);
       leaves.set(route, leaf);
@@ -67,9 +81,13 @@ export function createSnapshotStoreRuntime(options: {
           await options.connection.ready();
           await recoveryWorker().resolveEntry({ id: "", fields: { runId } }, recoveryOptions);
         },
-        resolveCompletedWaitpoints: (args) => {
-          completedWaitpoints ??= createCompletedWaitpointResolver(options.getRunStore());
-          return completedWaitpoints(args);
+        resolveCompletedWaitpointsWithContext: (args, context) => {
+          completedWaitpoints ??= createStoreRunCompletedWaitpointResolver(
+            options.getRunStore(),
+            leaf.primaryReadClient,
+            options.waitpointStoreEnabled
+          );
+          return completedWaitpoints(args, context);
         },
         metrics: options.metrics,
       });

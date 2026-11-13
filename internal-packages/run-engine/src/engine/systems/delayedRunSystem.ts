@@ -2,7 +2,11 @@ import { startSpan } from "@internal/tracing";
 import type { SystemResources } from "./systems.js";
 import { snapshotRouteFromSnapshot } from "@internal/run-store";
 import type { PrismaClientOrTransaction, TaskRun } from "@trigger.dev/database";
-import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
+import {
+  getLatestExecutionSnapshot,
+  getLatestExecutionSnapshotOrFinishedRun,
+  type ExecutionSnapshotSystem,
+} from "./executionSnapshotSystem.js";
 import { parseNaturalLanguageDuration } from "@trigger.dev/core/v3/isomorphic";
 import type { EnqueueSystem } from "./enqueueSystem.js";
 import { deletedEnvironmentReason, MISSING_ENVIRONMENT_REASON } from "../controlPlaneResolver.js";
@@ -11,15 +15,18 @@ import { ServiceValidationError } from "../errors.js";
 export type DelayedRunSystemOptions = {
   resources: SystemResources;
   enqueueSystem: EnqueueSystem;
+  executionSnapshotSystem: ExecutionSnapshotSystem;
 };
 
 export class DelayedRunSystem {
   private readonly $: SystemResources;
   private readonly enqueueSystem: EnqueueSystem;
+  private readonly executionSnapshotSystem: ExecutionSnapshotSystem;
 
   constructor(private readonly options: DelayedRunSystemOptions) {
     this.$ = options.resources;
     this.enqueueSystem = options.enqueueSystem;
+    this.executionSnapshotSystem = options.executionSnapshotSystem;
   }
 
   /**
@@ -65,6 +72,7 @@ export class DelayedRunSystem {
             {
               delayUntil: delayUntil,
               snapshot: {
+                ...this.executionSnapshotSystem.nextSnapshotIdentity(snapshot, runId),
                 snapshotRoute: snapshotRouteFromSnapshot(snapshot),
                 environmentId: snapshot.environmentId,
                 environmentType: snapshot.environmentType,
@@ -131,7 +139,20 @@ export class DelayedRunSystem {
     return await this.$.runLock.lock("enqueueDelayedRun", [runId], async () => {
       // Check if run is still in DELAYED status before enqueuing
       // This prevents a race where debounce reschedules the run while we're about to enqueue it
-      const snapshot = await getLatestExecutionSnapshot(this.$.prisma, runId, this.$.runStore);
+      const { snapshot, finishedRun } = await getLatestExecutionSnapshotOrFinishedRun(
+        this.$.prisma,
+        runId,
+        this.$.runStore,
+        undefined,
+        { id: true }
+      );
+      if (finishedRun) {
+        this.$.logger.warn(
+          "enqueueDelayedRun: snapshot state expired or absent, run already finished",
+          { runId, status: finishedRun.status }
+        );
+        return;
+      }
 
       if (snapshot.executionStatus !== "DELAYED" && snapshot.executionStatus !== "RUN_CREATED") {
         this.$.logger.debug("enqueueDelayedRun: run is no longer delayed, skipping enqueue", {
@@ -222,6 +243,7 @@ export class DelayedRunSystem {
         run,
         env,
         previousSnapshotId: snapshot.id,
+        previousSnapshot: snapshot,
         snapshotRoute: snapshotRouteFromSnapshot(snapshot),
         batchId: run.batchId ?? undefined,
         skipRunLock: true,

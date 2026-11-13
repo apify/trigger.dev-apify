@@ -1,6 +1,12 @@
 // Keep this file free of imports and JSX so plain node can read it.
 
-export type GalleryPageId = "chat" | "view-blocks" | "report" | "investigation" | "watch";
+export type GalleryPageId =
+  | "chat"
+  | "composer"
+  | "view-blocks"
+  | "report"
+  | "investigation"
+  | "wizard";
 
 export type GalleryPage = {
   id: GalleryPageId;
@@ -15,7 +21,14 @@ export const GALLERY_PAGES: GalleryPage[] = [
     slug: "agent-ui",
     title: "Chat UI",
     blurb:
-      "The chat chrome: the blank-state hero, suggested prompts, the transcript and its one progress line, wake banners, watch chips and the context banner.",
+      "The chat chrome: the blank-state hero, suggested prompts, the transcript and its one progress line, and the context banner.",
+  },
+  {
+    id: "composer",
+    slug: "agent-composer",
+    title: "Composer",
+    blurb:
+      "The message box in every state it reaches: docked under a chat, in the blank-state hero, at the character and message limits, in each window mode and in each theme. Every composer here is live: type into one to see Send and the counter react.",
   },
   {
     id: "view-blocks",
@@ -37,29 +50,32 @@ export const GALLERY_PAGES: GalleryPage[] = [
     blurb: "One card per ending an investigation can have, plus the state while it is still going.",
   },
   {
-    id: "watch",
-    slug: "agent-watch",
-    title: "Watch card",
+    id: "wizard",
+    slug: "agent-wizard",
+    title: "Wizard card",
     blurb:
-      "The configuration card, what a submitted card leaves in the transcript, and the wake headline.",
+      "The question card above the composer: option rows, the entity picker, custom inputs with units, multi-param thresholds, the Until date and errors.",
   },
 ];
 
 export type GalleryGroup =
+  | "composer-docked"
+  | "composer-hero"
+  | "composer-limits"
+  | "composer-modes"
+  | "composer-themes"
   | "card"
   | "diagnosis"
   | "view-blocks"
   | "investigation"
   | "report"
   | "chart"
-  | "watches"
-  | "watch-card"
-  | "wakes"
   | "hero"
   | "prompts"
   | "intents"
   | "messages"
-  | "banner";
+  | "banner"
+  | "wizard";
 
 export type GallerySection = {
   /** DOM id and deep-link anchor. Renaming breaks the link. */
@@ -73,30 +89,33 @@ export const GALLERY_GROUPS: { group: GalleryGroup; page: GalleryPageId; label: 
   { group: "prompts", page: "chat", label: "Suggested prompts" },
   { group: "messages", page: "chat", label: "Message-level states" },
   { group: "intents", page: "chat", label: "Intent bubbles" },
-  { group: "wakes", page: "chat", label: "Wake banners" },
-  { group: "watches", page: "chat", label: "Watch chips" },
   { group: "banner", page: "chat", label: "Context banner" },
+  { group: "wizard", page: "wizard", label: "Wizard card" },
+  { group: "composer-docked", page: "composer", label: "Docked under a chat" },
+  { group: "composer-hero", page: "composer", label: "Blank-state hero" },
+  { group: "composer-limits", page: "composer", label: "Limits" },
+  { group: "composer-modes", page: "composer", label: "Window modes" },
+  { group: "composer-themes", page: "composer", label: "Themes" },
   { group: "view-blocks", page: "view-blocks", label: "Envelope & actions" },
   { group: "card", page: "view-blocks", label: "Card chrome" },
   { group: "diagnosis", page: "view-blocks", label: "Diagnosis card" },
   { group: "chart", page: "view-blocks", label: "Chart card" },
   { group: "report", page: "report", label: "Report view" },
   { group: "investigation", page: "investigation", label: "Investigation card" },
-  { group: "watch-card", page: "watch", label: "Watch card" },
 ];
 
 export const MANIFEST: GallerySection[] = [
   {
     sectionId: "hero-panel",
-    title: "Floating window content (380px) — no page context",
+    title: "Floating panel content (380px) — no page context",
     group: "hero",
   },
   {
     sectionId: "hero-panel-contextual",
-    title: "Floating window — failed run on the page",
+    title: "Floating panel — failed run on the page",
     group: "hero",
   },
-  { sectionId: "hero-fullscreen", title: "Fullscreen takeover — centred column", group: "hero" },
+  { sectionId: "hero-fullscreen", title: "Full page takeover — centred column", group: "hero" },
   { sectionId: "hero-in-chat", title: "Empty chat — hero without its own composer", group: "hero" },
 
   { sectionId: "prompts-default", title: "Default set, no page context", group: "prompts" },
@@ -146,22 +165,113 @@ export const MANIFEST: GallerySection[] = [
     title: "Navigate — runs with filters",
     group: "intents",
   },
-  { sectionId: "intent-watch", title: "Watch started", group: "intents" },
   {
     sectionId: "intent-rejected-propose-fix",
     title: "Rejected — propose_fix is reserved",
     group: "intents",
   },
 
-  { sectionId: "wake-positive", title: "Positive", group: "wakes" },
-  { sectionId: "wake-attention", title: "Attention", group: "wakes" },
-  { sectionId: "wake-neutral-impossible", title: "Neutral — no longer possible", group: "wakes" },
-  { sectionId: "wake-unverified", title: "Unverified at the window's end", group: "wakes" },
-
-  { sectionId: "watches-live", title: "All four states, cancellable", group: "watches" },
-
   { sectionId: "banner-prod", title: "Production environment", group: "banner" },
   { sectionId: "banner-preview-long", title: "Preview branch with a long name", group: "banner" },
+
+  { sectionId: "wizard-card", title: "Question steps above the composer", group: "wizard" },
+  { sectionId: "wizard-option-info", title: "Option rows with info", group: "wizard" },
+  { sectionId: "wizard-entity", title: "Entity picker row", group: "wizard" },
+  { sectionId: "wizard-custom-unit", title: "Custom input with unit", group: "wizard" },
+  {
+    sectionId: "wizard-multi-param",
+    title: "Multi-param thresholds with Continue",
+    group: "wizard",
+  },
+  { sectionId: "wizard-until", title: "Until date row", group: "wizard" },
+  { sectionId: "wizard-error", title: "Error state", group: "wizard" },
+
+  {
+    sectionId: "composer-docked-empty",
+    title: "Empty — placeholder, Send disabled",
+    group: "composer-docked",
+  },
+  { sectionId: "composer-docked-draft", title: "Draft — Send enabled", group: "composer-docked" },
+  {
+    sectionId: "composer-docked-long-draft",
+    title: "Long draft — grows, then scrolls at 40% of the viewport",
+    group: "composer-docked",
+  },
+  {
+    sectionId: "composer-docked-streaming",
+    title: "Turn in flight — Stop replaces Send",
+    group: "composer-docked",
+  },
+  {
+    sectionId: "composer-docked-list-context",
+    title: "List page — no entity in the context",
+    group: "composer-docked",
+  },
+  {
+    sectionId: "composer-docked-long-context",
+    title: "Long branch name — the context truncates first",
+    group: "composer-docked",
+  },
+
+  {
+    sectionId: "composer-hero-new-chat",
+    title: "New chat — placeholder, Send disabled",
+    group: "composer-hero",
+  },
+  { sectionId: "composer-hero-draft", title: "Draft — Send enabled", group: "composer-hero" },
+  {
+    sectionId: "composer-hero-fullscreen",
+    title: "Full page — centred column",
+    group: "composer-hero",
+  },
+
+  {
+    sectionId: "composer-limit-near",
+    title: "Near the character limit — the counter appears",
+    group: "composer-limits",
+  },
+  {
+    sectionId: "composer-limit-reached",
+    title: "At the character limit — the counter turns red",
+    group: "composer-limits",
+  },
+  {
+    sectionId: "composer-quota-left",
+    title: "Free plan — messages left, under the composer",
+    group: "composer-limits",
+  },
+  {
+    sectionId: "composer-cap-docked",
+    title: "Message cap — the upgrade block takes the slot",
+    group: "composer-limits",
+  },
+  {
+    sectionId: "composer-cap-hero",
+    title: "Message cap in a new chat",
+    group: "composer-limits",
+  },
+
+  {
+    sectionId: "composer-mode-right-panel-narrow",
+    title: "Right panel at its narrowest (320px)",
+    group: "composer-modes",
+  },
+  {
+    sectionId: "composer-mode-right-panel-wide",
+    title: "Right panel at its widest (720px)",
+    group: "composer-modes",
+  },
+  {
+    sectionId: "composer-mode-fullscreen",
+    title: "Full page chat — centred column",
+    group: "composer-modes",
+  },
+
+  {
+    sectionId: "composer-themes",
+    title: "Light, White, Dark and Black, side by side",
+    group: "composer-themes",
+  },
 
   {
     sectionId: "view-blocks-revisions",
@@ -175,7 +285,7 @@ export const MANIFEST: GallerySection[] = [
   },
   {
     sectionId: "view-blocks-actions-offer",
-    title: "Actions block — the watch offer as buttons",
+    title: "Actions block — next steps as buttons",
     group: "view-blocks",
   },
 
@@ -243,41 +353,6 @@ export const MANIFEST: GallerySection[] = [
     sectionId: "investigation-card-degraded",
     title: "Inconclusive, degraded after a tool failure — names what it couldn't read",
     group: "investigation",
-  },
-
-  { sectionId: "watch-card-compact", title: "Compact — the recommendation", group: "watch-card" },
-  { sectionId: "watch-card-expanded", title: "Expanded (Customize)", group: "watch-card" },
-  { sectionId: "watch-card-validation-error", title: "Validation error", group: "watch-card" },
-  { sectionId: "watch-card-pending", title: "Pending create", group: "watch-card" },
-  {
-    sectionId: "watch-card-queue-below",
-    title: "Customize — back below a threshold",
-    group: "watch-card",
-  },
-  {
-    sectionId: "watch-card-queue-stalled",
-    title: "Customize — stopped moving (no parameter)",
-    group: "watch-card",
-  },
-  {
-    sectionId: "watch-card-confirmation",
-    title: "Confirmation block — both opt-ins took effect",
-    group: "watch-card",
-  },
-  {
-    sectionId: "watch-card-confirmation-degraded",
-    title: "Confirmation block — first check and email both unavailable",
-    group: "watch-card",
-  },
-  {
-    sectionId: "watch-card-one-shot-satisfied",
-    title: "One-shot result — already true",
-    group: "watch-card",
-  },
-  {
-    sectionId: "watch-card-toast-headline",
-    title: "Wake toast headline (fact first)",
-    group: "watch-card",
   },
 ];
 

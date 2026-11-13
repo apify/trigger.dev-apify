@@ -856,6 +856,7 @@ describe("RunEngine ttl", () => {
         // The run should have been removed from the queue by the TTL Lua script
         // So dequeue should return nothing
         const dequeued = await engine.dequeueFromWorkerQueue({
+          blockingPopTimeoutSeconds: 1,
           consumerId: "test-consumer",
           workerQueue: "main",
           backgroundWorkerId: (await prisma.backgroundWorker.findFirst({
@@ -1636,6 +1637,7 @@ describe("RunEngine ttl", () => {
         async resolveEnvDeletionState() {
           return null;
         },
+        resolveDeploymentStatus: passthrough.resolveDeploymentStatus.bind(passthrough),
         resolveWorkerVersion: passthrough.resolveWorkerVersion.bind(passthrough),
         assertEnvExists: passthrough.assertEnvExists.bind(passthrough),
         async resolveEnv() {

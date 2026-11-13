@@ -3,9 +3,10 @@ import {
   CreateSessionStreamWaitpointRequestBody,
   type CreateSessionStreamWaitpointResponseBody,
 } from "@trigger.dev/core/v3";
-import { WaitpointId } from "@trigger.dev/core/v3/isomorphic";
+import { parseWaitpointId, WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import { z } from "zod";
 import { $replica } from "~/db.server";
+import { processStreamWaitpointCompletionPacket } from "~/runEngine/concerns/waitpointCompletionPacket.server";
 import { runStore } from "~/v3/runStore.server";
 import { createWaitpointTag, MAX_TAGS_PER_WAITPOINT } from "~/models/waitpointTag.server";
 import {
@@ -14,12 +15,14 @@ import {
   resolveSessionByIdOrExternalId,
 } from "~/services/realtime/sessions.server";
 import { S2RealtimeStreams } from "~/services/realtime/s2realtimeStreams.server";
+import { sessionStreamResources } from "~/services/realtime/sessionChannels.server";
 import { getRealtimeStreamInstance } from "~/services/realtime/v1StreamsGlobal.server";
 import {
   addSessionStreamWaitpoint,
   removeSessionStreamWaitpoint,
 } from "~/services/sessionStreamWaitpointCache.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
+import { keyedWaitpointBudgetResponse } from "~/services/routeBuilders/keyedWaitpointBudget.server";
 import { logger } from "~/services/logger.server";
 import { parseDelay } from "~/utils/delays";
 import { resolveIdempotencyKeyTTL } from "~/utils/idempotencyKeys.server";
@@ -36,8 +39,20 @@ const { action, loader } = createActionApiRoute(
     body: CreateSessionStreamWaitpointRequestBody,
     maxContentLength: 1024 * 10, // 10KB
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: (params) =>
+        everyResource([{ type: "runs", id: params.runFriendlyId }, { type: "waitpoints" }]),
+    },
   },
-  async ({ authentication, body, params }) => {
+  async ({ authentication, body, params, ability }) => {
+    if (body.io === "in" && authentication.type !== "PRIVATE") {
+      return json(
+        { error: "Reading the in channel requires secret key authentication" },
+        { status: 403 }
+      );
+    }
+
     try {
       const where = {
         friendlyId: params.runFriendlyId,
@@ -76,6 +91,14 @@ const { action, loader } = createActionApiRoute(
       }
 
       const addressingKey = canonicalSessionAddressingKey(maybeSession, body.session);
+      const sessionKeys = new Set([addressingKey]);
+      if (maybeSession) {
+        sessionKeys.add(maybeSession.friendlyId);
+        if (maybeSession.externalId) sessionKeys.add(maybeSession.externalId);
+      }
+      if (!ability.can("read", sessionStreamResources(body.io, sessionKeys))) {
+        return json({ error: "Unauthorized" }, { status: 403 });
+      }
 
       const idempotencyKeyExpiresAt = body.idempotencyKeyTTL
         ? resolveIdempotencyKeyTTL(body.idempotencyKeyTTL)
@@ -107,6 +130,7 @@ const { action, loader } = createActionApiRoute(
         runId: run.id,
         environmentId: authentication.environment.id,
         projectId: authentication.environment.projectId,
+        organizationId: authentication.environment.organization.id,
         idempotencyKey: body.idempotencyKey,
         idempotencyKeyExpiresAt,
         timeout,
@@ -151,15 +175,31 @@ const { action, loader } = createActionApiRoute(
 
             if (records.length > 0) {
               const record = records[0]!;
+              const storeDateTime =
+                (await engine.waitpointSystem.isWaitpointStoreEnabled(
+                  authentication.environment.organization.id
+                )) &&
+                (result.waitpoint.type === "DATETIME" || result.waitpoint.type === "MANUAL") &&
+                parseWaitpointId(result.waitpoint.id).format !== "legacy";
+              const packet = storeDateTime
+                ? await processStreamWaitpointCompletionPacket(
+                    result.waitpoint.id,
+                    record.data,
+                    authentication.environment
+                  )
+                : undefined;
 
-              await engine.completeWaitpoint({
+              const completionInput: Parameters<typeof engine.completeWaitpoint>[0] = {
                 id: result.waitpoint.id,
                 output: {
-                  value: record.data,
-                  type: "application/json",
+                  value: packet ? packet.data! : record.data,
+                  type: packet ? packet.dataType : "application/json",
                   isError: false,
                 },
-              });
+                organizationId: authentication.environment.organization.id,
+              };
+              if (storeDateTime) completionInput.onlyIfPending = true;
+              await engine.completeWaitpoint(completionInput);
 
               await removeSessionStreamWaitpoint(
                 authentication.environment.id,
@@ -191,6 +231,11 @@ const { action, loader } = createActionApiRoute(
       if (error instanceof ServiceValidationError) {
         return json({ error: error.message }, { status: 422 });
       }
+      // Expected under load and retryable, so it is not reported as an error.
+      const busy = keyedWaitpointBudgetResponse(error, {
+        environmentId: authentication.environment.id,
+      });
+      if (busy) return busy;
       // Don't forward raw internal error messages (could leak Prisma/engine
       // details). Log server-side and return a generic 500.
       logger.error("Failed to create session-stream waitpoint", {

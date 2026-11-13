@@ -1,5 +1,5 @@
 import type { ClickHouse, SessionInsertArray } from "@internal/clickhouse";
-import { getSessionField } from "@internal/clickhouse";
+import { insertErrorServerText, getSessionField } from "@internal/clickhouse";
 import { type RedisOptions } from "@internal/redis";
 import {
   LogicalReplicationClient,
@@ -512,7 +512,11 @@ export class SessionsReplicationService {
       return;
     }
 
-    if (this._lastAcknowledgedLsn === this._latestCommitEndLsn) {
+    // Keepalive acks can be ahead of the last commit; re-acking the commit would move flush back.
+    if (
+      this._lastAcknowledgedLsn &&
+      lsnToUInt64(this._lastAcknowledgedLsn) >= lsnToUInt64(this._latestCommitEndLsn)
+    ) {
       return;
     }
 
@@ -716,7 +720,7 @@ export class SessionsReplicationService {
 
   // Retry all errors except known permanent ones
   #isRetryableError(error: Error): boolean {
-    const errorMessage = error.message.toLowerCase();
+    const errorMessage = insertErrorServerText(error).toLowerCase();
 
     // Permanent errors that should NOT be retried
     const permanentErrorPatterns = [

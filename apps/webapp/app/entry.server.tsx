@@ -8,22 +8,30 @@ import isbot from "isbot";
 import { renderToPipeableStream } from "react-dom/server";
 import { PassThrough } from "stream";
 import { initMollifierDrainerWorker } from "~/v3/mollifierDrainerWorker.server";
+import { initSnapshotRecoveryWorker } from "~/v3/snapshotRecoveryWorker.server";
 import { initMollifierStaleSweepWorker } from "~/v3/mollifierStaleSweepWorker.server";
 import { initBillingLimitWorker } from "~/v3/billingLimitWorker.server";
-import { initLogsSearchProjectorWorker } from "~/v3/logsSearchProjectorWorker.server";
+import { initAlertEngineWorker } from "~/v3/alertEngineWorker.server";
 import { initQueueMetricsConsumer, initQueueMetricsEmitter } from "~/v3/queueMetrics.server";
 import { initApiRateLimitMetrics } from "~/services/apiRateLimitMetrics.server";
+import { initWebhookMetrics } from "~/services/webhookMetrics.server";
 import { bootstrap } from "./bootstrap";
 import { LocaleContextProvider } from "./components/primitives/LocaleProvider";
 import type { OperatingSystemPlatform } from "./components/primitives/OperatingSystemProvider";
 import { OperatingSystemContextProvider } from "./components/primitives/OperatingSystemProvider";
 import { assertRunOpsSplitSentinel, Prisma } from "./db.server";
 import { env } from "./env.server";
+import {
+  createIngressBodyCap,
+  DASHBOARD_AGENT_INGRESS_CAP,
+  otlpIngressCap,
+} from "./services/ingressBodyCap.server";
 import { eventLoopMonitor, eventLoopUtilizationMonitor } from "./eventLoopMonitor.server";
 import { logger } from "./services/logger.server";
 import { buildImgSrcDirective, parseCspImageOrigins, withImgSrc } from "./utils/cspImageOrigins";
 import { singleton } from "./utils/singleton";
 import { remoteBuildsEnabled } from "./v3/remoteImageBuilder.server";
+import { legacyEventStoreWarning } from "./v3/eventRepository/effectiveEventStore";
 import {
   registerRunEngineEventBusHandlers,
   setupBatchQueueCallbacks,
@@ -85,6 +93,19 @@ const IMG_SRC_DIRECTIVE = buildImgSrcDirective(
     return origins;
   })
 );
+
+singleton("LegacyEventStoreWarning", () => {
+  const warning = legacyEventStoreWarning(
+    env.EVENT_REPOSITORY_DEFAULT_STORE,
+    env.EVENT_REPOSITORY_V1_REROUTE_ENABLED
+  );
+
+  if (warning) {
+    logger.warn(warning);
+  }
+
+  return warning;
+});
 
 export default function handleRequest(
   request: Request,
@@ -161,7 +182,7 @@ function handleBotRequest(
     const { pipe, abort } = renderToPipeableStream(
       <OperatingSystemContextProvider platform={platform}>
         <LocaleContextProvider locales={locales}>
-          <RemixServer context={remixContext} url={request.url} abortDelay={ABORT_DELAY} />,
+          <RemixServer context={remixContext} url={request.url} abortDelay={ABORT_DELAY} />
         </LocaleContextProvider>
       </OperatingSystemContextProvider>,
       {
@@ -277,12 +298,14 @@ export const handleError = wrapHandleErrorWithSentry((error, { request }) => {
 });
 
 initMollifierDrainerWorker();
+initSnapshotRecoveryWorker();
 initMollifierStaleSweepWorker();
 initBillingLimitWorker();
-initLogsSearchProjectorWorker();
+initAlertEngineWorker();
 initQueueMetricsEmitter();
 initQueueMetricsConsumer();
 initApiRateLimitMetrics();
+initWebhookMetrics();
 
 bootstrap().catch((error) => {
   logError(error);
@@ -359,13 +382,16 @@ singleton("SentryTenantContextProcessor", () => {
 });
 
 export { apiRateLimiter } from "./services/apiRateLimit.server";
-export { dashboardAgentBodyCap } from "./services/dashboardAgentBodyCap.server";
+export { flushAuditLogs } from "./services/auditLogs/auditLogs.server";
+export const ingressBodyCap = createIngressBodyCap([
+  DASHBOARD_AGENT_INGRESS_CAP,
+  otlpIngressCap(env.OTLP_INGRESS_BODY_SIZE_LIMIT_MB * 1024 * 1024),
+]);
 export { deploymentRateLimiter } from "./services/deploymentRateLimit.server";
 export { engineRateLimiter } from "./services/engineRateLimit.server";
 export { otlpRateLimiter } from "./services/otlpRateLimit.server";
 export { runWithHttpContext } from "./services/httpAsyncStorage.server";
 export { tenantContextMiddleware } from "./services/tenantContextResolver.server";
-export { webhookIngressIpRateLimiter } from "./services/webhookIngressIpRateLimit.server";
 export { socketIo } from "./v3/handleSocketIo.server";
 export { wss } from "./v3/handleWebsockets.server";
 

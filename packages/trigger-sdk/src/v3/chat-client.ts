@@ -24,6 +24,8 @@ import { readUIMessageStream } from "../imports/ai-runtime.js";
 import {
   apiClientManager,
   controlSubtype,
+  SDK_CREDENTIAL_OPERATION_HEADER,
+  SDK_CREDENTIAL_REASON_HEADER,
   SSEStreamSubscription,
   TRIGGER_CONTROL_SUBTYPE,
 } from "@trigger.dev/core/v3";
@@ -163,7 +165,10 @@ export type ChatStreamResult = {
  * - `for await (const chunk of stream)` — typed UIMessageChunk iteration
  * - `await stream.result()` — accumulated `{ text, toolCalls, toolResults }`
  * - `await stream.text()` — just the text
- * - `yield* stream.messages()` — sub-agent pattern (yields UIMessage snapshots)
+ * - `yield* stream.messages()` — UIMessage snapshots (short replies only)
+ *
+ * To stream a sub-agent through a parent tool call, pass the stream to
+ * `chat.forwardSubAgent` from `@trigger.dev/sdk/ai`.
  */
 export class ChatStream {
   private readonly _consumerStream: ReadableStream<UIMessageChunk>;
@@ -216,7 +221,13 @@ export class ChatStream {
   }
 
   /**
-   * Yields accumulated UIMessage snapshots for the sub-agent tool pattern.
+   * Yields the accumulated UIMessage after almost every chunk.
+   *
+   * Every snapshot repeats the whole message so far, so yielding them as
+   * preliminary tool results writes bytes in proportion to the square of the
+   * reply length: a sub-agent reply with a few large tool results can write
+   * hundreds of MB. Use `chat.forwardSubAgent(stream, { toolCallId })` from
+   * `@trigger.dev/sdk/ai` to stream a sub-agent through a parent tool call.
    *
    * @example
    * ```ts
@@ -641,12 +652,14 @@ export class AgentChat<TAgent = unknown> {
   }
 
   private async appendInputChunk(body: string): Promise<void> {
-    const accessToken = apiClientManager.accessToken ?? "";
+    const authHeaders = apiClientManager
+      .clientOrThrow()
+      .getAuthenticationHeaders("appendToSessionStream");
     const ctx: AgentChatEndpointContext = { endpoint: "in", chatId: this.chatId };
     const url = `${this.resolveBaseURL("in")}/realtime/v1/sessions/${encodeURIComponent(this.chatId)}/in/append`;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${accessToken}`,
+      ...authHeaders,
       "x-trigger-source": "sdk",
       // Idempotency key: the server skips appends whose part id it has
       // already committed, so a retried POST can't duplicate the record.
@@ -760,33 +773,45 @@ export class AgentChat<TAgent = unknown> {
     // its boundary. Captured per subscription — the stopped stream is still
     // live and may consume the shared seed before I reach that record.
     let skipStaleBoundary = state.skipToTurnComplete === true && this.stoppedStreamId !== streamId;
-    const accessToken = apiClientManager.accessToken ?? "";
+    const apiClient = apiClientManager.clientOrThrow();
     const onTurnComplete = this.onTurnComplete;
     const chatId = this.chatId;
     const sseCtx: AgentChatEndpointContext = { endpoint: "out", chatId };
     const fetchOverride = this.fetchOverride;
-    const sseFetchClient: typeof fetch | undefined = fetchOverride
-      ? (((input, init) => {
-          if (typeof input === "string") {
-            return fetchOverride(input, init ?? {}, sseCtx);
-          }
-          if (input instanceof URL) {
-            return fetchOverride(input.toString(), init ?? {}, sseCtx);
-          }
-          // Request — preserve its url + intrinsic init, let any provided
-          // init override on top (matches fetch(Request, init) semantics).
-          return fetchOverride(
-            input.url,
-            {
-              method: input.method,
-              headers: input.headers,
-              signal: input.signal,
-              ...(init ?? {}),
-            },
-            sseCtx
-          );
-        }) as typeof fetch)
-      : undefined;
+    const sseFetchClient: typeof fetch = (input, init) => {
+      const headers = new Headers(
+        init?.headers ?? (input instanceof Request ? input.headers : undefined)
+      );
+      headers.delete(SDK_CREDENTIAL_OPERATION_HEADER);
+      headers.delete(SDK_CREDENTIAL_REASON_HEADER);
+      for (const [key, value] of Object.entries(
+        apiClient.getAuthenticationHeaders("subscribeToSessionStream")
+      )) {
+        headers.set(key, value);
+      }
+      init = { ...init, headers };
+      if (fetchOverride) {
+        if (typeof input === "string") {
+          return fetchOverride(input, init ?? {}, sseCtx);
+        }
+        if (input instanceof URL) {
+          return fetchOverride(input.toString(), init ?? {}, sseCtx);
+        }
+        // Request — preserve its url + intrinsic init, let any provided
+        // init override on top (matches fetch(Request, init) semantics).
+        return fetchOverride(
+          input.url,
+          {
+            method: input.method,
+            headers: input.headers,
+            signal: input.signal,
+            ...(init ?? {}),
+          },
+          sseCtx
+        );
+      }
+      return fetch(input, init);
+    };
 
     const internalAbort = new AbortController();
     const combinedSignal = abortSignal
@@ -822,7 +847,6 @@ export class AgentChat<TAgent = unknown> {
         const openSubscription = () =>
           new SSEStreamSubscription(streamUrl, {
             headers: {
-              Authorization: `Bearer ${accessToken}`,
               // Preview-env sessions are branch-scoped (see appendInputChunk).
               ...(apiClientManager.branchName
                 ? { "x-trigger-branch": apiClientManager.branchName }

@@ -45,6 +45,9 @@ const Env = z.object({
   // Timeline metrics
   TRIGGER_POD_SCHEDULED_AT_MS: DateEnv,
   TRIGGER_DEQUEUED_AT_MS: DateEnv,
+  // Set when the runner was held until its supervisor was reachable
+  TRIGGER_SUPERVISOR_WAIT_STARTED_AT_MS: DateEnv.optional(),
+  TRIGGER_SUPERVISOR_WAIT_MS: z.coerce.number().optional(),
 
   // May be overridden
   TRIGGER_RUN_ID: z.string().optional(), // This is set for cold starts and restores
@@ -85,9 +88,6 @@ export class RunnerEnv {
   // Base environment variables
   get NODE_ENV() {
     return this.env.NODE_ENV;
-  }
-  get NODE_EXTRA_CA_CERTS() {
-    return this.env.NODE_EXTRA_CA_CERTS;
   }
   get UV_USE_IO_URING() {
     return this.env.UV_USE_IO_URING;
@@ -142,6 +142,12 @@ export class RunnerEnv {
   }
   get TRIGGER_DEQUEUED_AT_MS() {
     return this.env.TRIGGER_DEQUEUED_AT_MS;
+  }
+  get TRIGGER_SUPERVISOR_WAIT_STARTED_AT_MS() {
+    return this.env.TRIGGER_SUPERVISOR_WAIT_STARTED_AT_MS;
+  }
+  get TRIGGER_SUPERVISOR_WAIT_MS() {
+    return this.env.TRIGGER_SUPERVISOR_WAIT_MS;
   }
 
   // Overridable values
@@ -243,7 +249,6 @@ export class RunnerEnv {
   gatherProcessEnv(): Record<string, string> {
     const $env = {
       NODE_ENV: this.NODE_ENV,
-      NODE_EXTRA_CA_CERTS: this.NODE_EXTRA_CA_CERTS,
       OTEL_EXPORTER_OTLP_ENDPOINT: this.OTEL_EXPORTER_OTLP_ENDPOINT,
       TRIGGER_OTEL_EXPORTER_OTLP_ENDPOINT: this.OTEL_EXPORTER_OTLP_ENDPOINT,
       UV_USE_IO_URING: this.UV_USE_IO_URING,

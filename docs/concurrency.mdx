@@ -201,6 +201,46 @@ export const processWebhook = task({
 await processWebhook.trigger(payload, { concurrencyKey: tenantId });
 ```
 
+## A different key for each limit
+
+A string `concurrencyKey` keys every `perKey` bound the run holds. When two limits need different keys, for example a cap per session and a cap per organization on the same run, pass an object. `default` is the run's own key, and every other entry is a named limit and the key to use for it:
+
+```ts /trigger/subagent.ts
+import { concurrencyLimit, task } from "@trigger.dev/sdk";
+
+// each organization runs at most 20 sub-agents at once
+export const orgLimit = concurrencyLimit({ name: "org-subagents", perKey: 20 });
+
+export const subagent = task({
+  id: "subagent",
+  // 3 per session, 200 in total, plus the organization limit
+  concurrency: [{ perKey: 3, total: 200 }, orgLimit],
+  run: async (payload) => {
+    //...
+  },
+});
+```
+
+```ts app/api/subagent/route.ts
+import { orgLimit, subagent } from "~/trigger/subagent";
+
+await subagent.trigger(payload, {
+  concurrencyKey: {
+    default: sessionId,
+    [orgLimit.name]: orgId,
+  },
+});
+```
+
+The run starts only when the session has fewer than 3 running, the organization has fewer than 20, and fewer than 200 are running in total.
+
+- **A limit uses its own entry if it has one, otherwise `default`.** A string is shorthand for `{ default: "..." }`.
+- **`default` is required.** Runs are queued and scheduled fairly per default key, so pick the key you want fairness across.
+- **A limit's own key is 1-128 characters.**
+- **An entry for a limit the task doesn't declare adds that limit to the run.** If the limit is declared in the same environment, by another task or by a deploy that is still rolling out, the run counts towards it, so triggers keep working during the deploy.
+- **A name that matches no declared limit caps nothing**, and the limit you meant falls back to `default`. Use `[limit.name]` rather than a string literal.
+- **`default` always means the default key**, so a limit that is itself named `default` can't be given its own key.
+
 ## A global cap for a shared resource
 
 To cap something global, like total traffic to an external API, across many tasks and all tenants: declare a limit with only a `total` and share it. It counts every run holding it, whether or not the run has a `concurrencyKey`:
@@ -366,6 +406,38 @@ await concurrencyLimits.reset("openai");
 ```
 
 Overrides survive deploys: redeploying your code keeps an active override until you reset it.
+
+### Overriding a limit for one key
+
+Pass `concurrencyKey` to override a limit's `perKey` for a single key, for example to let one session run more (or fewer) runs at once than the limit allows every other key:
+
+```ts
+import { concurrencyLimits } from "@trigger.dev/sdk";
+
+// this session may run 3 at once under "subagents", for the next 7 days
+await concurrencyLimits.override("subagents", {
+  concurrencyKey: sessionId,
+  perKey: 3,
+  ttl: "7d",
+});
+
+// read it back: the key's bound, the override, and when it expires
+const view = await concurrencyLimits.retrieve("subagents", { concurrencyKey: sessionId });
+console.log(view.perKey.override, view.perKey.expiresAt, view.running);
+
+// clear it early
+await concurrencyLimits.reset("subagents", { concurrencyKey: sessionId });
+```
+
+A per-key override behaves differently from a limit override:
+
+- **It is temporary.** It expires after `ttl` (a duration such as `"7d"` or a number of seconds). The default is 7 days and the maximum is 30 days. Call `override` again to extend it. Nothing warns you when it lapses, so check `expiresAt` if a key must keep its cap for longer than a week.
+- **It changes one limit only.** The limit's own bounds and every other limit the run holds are untouched. A tenant-wide limit keeps applying on top of a per-session override.
+- **It applies to every task holding the limit**, because the key's pool under a shared named limit is one pool.
+- **It needs a `perKey` to override.** A limit declared with only a `total` has no per-key bound, so the call is rejected, and if a later deploy removes a limit's `perKey` its per-key overrides stop applying. A task's inline limit is addressed as `task/<task-id>`. `total` is not per key, so `concurrencyKey` goes with `perKey` (and optionally `ttl`) and never with `total`; the SDK's types enforce this.
+- **`perKey: 0` blocks the key.** A paused limit stays paused whatever the override says.
+- **It does not stop runs.** Lowering a key's cap takes effect at the next run to start; runs already executing continue.
+- **`reset(name)` without a key leaves per-key overrides alone**; clear them with `reset(name, { concurrencyKey })` or let them expire.
 
 ### Pausing a limit
 

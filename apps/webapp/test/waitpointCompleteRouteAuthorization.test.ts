@@ -4,6 +4,7 @@ const auth = vi.hoisted(() => ({
   userId: "user_attacker",
   projectId: "proj_shared",
   environmentId: "env_attacker",
+  organizationId: "org_shared",
 }));
 
 const waitpointHolder = vi.hoisted(() => ({
@@ -46,11 +47,17 @@ vi.mock("~/db.server", () => ({
 }));
 
 vi.mock("~/models/runtimeEnvironment.server", () => ({
-  findEnvironmentBySlug: async () => ({ id: auth.environmentId }),
+  // The route reads environment.organization.id to route the continuation by org.
+  findEnvironmentBySlug: async () => ({
+    id: auth.environmentId,
+    organization: { id: auth.organizationId },
+  }),
 }));
 
 vi.mock("~/v3/runEngine.server", () => ({
   engine: {
+    // Existing legacy-route fixture remains on its disabled waitpoint path.
+    waitpointSystem: { isWaitpointStoreEnabled: async () => false },
     completeWaitpoint: async (args: Record<string, unknown>) => {
       engineHolder.calls.push(args);
       return { id: args.id };

@@ -3,8 +3,9 @@ import type { UnkeyCache } from "@internal/cache";
 import type { StreamIngestor, StreamRecord, StreamResponder, StreamResponseOptions } from "./types";
 import type { LogLevel } from "@trigger.dev/core/logger";
 import { Logger } from "@trigger.dev/core/logger";
-import { headerValue } from "@trigger.dev/core/v3";
+import { headerValue, SESSION_IN_CONSUMED_ID_HEADER } from "@trigger.dev/core/v3";
 import { randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 import { ServiceValidationError } from "~/v3/services/common.server";
 
 // S2's per-record metered-size limit. Verified empirically against
@@ -21,6 +22,17 @@ import { ServiceValidationError } from "~/v3/services/common.server";
 //   8 + body ≤ 1048576  →  body ≤ 1048568
 const S2_MAX_METERED_BYTES = 1024 * 1024; // 1 MiB
 const S2_RECORD_BASE_OVERHEAD_BYTES = 8;
+const S2_PEEK_TIMEOUT_MS = 2000;
+
+export type SessionOutTail =
+  | { kind: "empty" }
+  | { kind: "unknown" }
+  | {
+      kind: "record";
+      control: string | undefined;
+      timestamp: number;
+      inConsumedSeq: number | undefined;
+    };
 
 /**
  * Thrown when a record's metered size would exceed S2's hard per-record
@@ -173,6 +185,17 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     return this.#initializeStreamByName(prefixedName, `/runs/${runId}/${streamId}`, {
       operations: S2_APPEND_TOKEN_OPS,
       stream: { kind: "prefix", value: this.streamPrefix, autoPrefixStreams: true },
+    });
+  }
+
+  async initializeScopedStream(
+    runId: string,
+    streamId: string
+  ): Promise<{ responseHeaders?: Record<string, string> }> {
+    const streamName = this.toStreamName(runId, streamId);
+    return this.#initializeStreamByName(streamName, streamName, {
+      operations: S2_APPEND_TOKEN_OPS,
+      stream: { kind: "exact", value: streamName, autoPrefixStreams: false },
     });
   }
 
@@ -330,7 +353,53 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     return names;
   }
 
+  /**
+   * Non-blocking read of the records after `afterSeqNum`. Retries transient
+   * failures (network errors, stream creation races, 5xx, and reads S2 ends with an `error` event)
+   * because the `.wait()` race check depends on this read to find a record
+   * sent before the waitpoint registered.
+   */
   async #readRecordsByName(s2Stream: string, afterSeqNum?: number): Promise<StreamRecord[]> {
+    const backoffsMs = [100, 300];
+    const maxAttempts = backoffsMs.length + 1;
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.#readRecordsOnce(s2Stream, afterSeqNum);
+      } catch (error) {
+        const { status, streamNotFound } = error as {
+          status?: number;
+          streamNotFound?: boolean;
+        };
+        // A stream that is still absent after retries has no records yet.
+        if (streamNotFound && attempt + 1 >= maxAttempts) return [];
+        const isClientError =
+          status !== undefined &&
+          status >= 400 &&
+          status < 500 &&
+          status !== 409 &&
+          !streamNotFound;
+        if (isClientError || attempt + 1 >= maxAttempts) {
+          this.logger.error("S2 readRecords failed", {
+            stream: s2Stream,
+            attempts: attempt + 1,
+            error,
+          });
+          throw error;
+        }
+
+        this.logger.warn("S2 readRecords transient failure, retrying", {
+          stream: s2Stream,
+          attempt: attempt + 1,
+          nextDelayMs: backoffsMs[attempt],
+          error,
+        });
+        await new Promise((resolve) => setTimeout(resolve, backoffsMs[attempt]));
+      }
+    }
+  }
+
+  async #readRecordsOnce(s2Stream: string, afterSeqNum?: number): Promise<StreamRecord[]> {
     const startSeq = afterSeqNum != null ? afterSeqNum + 1 : 0;
 
     const qs = new URLSearchParams();
@@ -352,12 +421,12 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     );
 
     if (!res.ok) {
-      // Stream may not exist yet (no data sent)
-      if (res.status === 404) {
-        return [];
-      }
+      const streamNotFound = await isS2StreamNotFound(res);
       await cancelResponseBody(res);
-      throw new Error(`S2 readRecords failed: ${res.status} ${res.statusText}`);
+      throw Object.assign(new Error(`S2 readRecords failed: ${res.status} ${res.statusText}`), {
+        status: res.status,
+        streamNotFound,
+      });
     }
 
     // Parse the SSE response body to extract records
@@ -382,6 +451,10 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
         } else if (line.startsWith("data:")) {
           data = line.slice(5).trim();
         }
+      }
+
+      if (eventType === "error") {
+        throw new Error(`S2 readRecords failed: ${data ?? "error event"}`);
       }
 
       if (eventType === "batch" && data) {
@@ -504,15 +577,46 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     });
   }
 
+  async peekSessionOutTail(addressingKey: string): Promise<SessionOutTail> {
+    return this.#peekTail(this.toSessionStreamName(addressingKey, "out"));
+  }
+
+  async readSessionInTailSeq(addressingKey: string): Promise<number | undefined> {
+    const s2Stream = this.toSessionStreamName(addressingKey, "in");
+
+    const res = await this.#getTail(s2Stream, "records/tail", "S2 read tail", [404]);
+    if (res === "missing") return 0;
+    if (!res) return undefined;
+
+    try {
+      const json = (await res.json()) as { tail?: { seq_num?: unknown } };
+      const seqNum = json.tail?.seq_num;
+      return typeof seqNum === "number" ? seqNum : undefined;
+    } catch (error) {
+      this.logger.warn(
+        isTimeoutError(error) ? "S2 read tail: timed out" : "S2 read tail: parse failed"
+      );
+      return undefined;
+    }
+  }
+
   /**
    * Peek the tail of `.out` and return whether the stream is "settled" —
    * i.e. the most recent non-command record is a `turn-complete` control
-   * record. The agent appends an S2 `trim` command record immediately
-   * after every turn-complete to keep the stream bounded, so we read two
-   * tail records and walk past any trim command to find the
-   * turn-complete underneath.
+   * record.
    */
   async #peekIsSettled(s2Stream: string): Promise<boolean> {
+    const tail = await this.#peekTail(s2Stream);
+    return tail.kind === "record" && tail.control === "turn-complete";
+  }
+
+  /**
+   * Read the most recent non-command record of a stream. The agent appends
+   * an S2 `trim` command record immediately after every turn-complete to
+   * keep `.out` bounded, so we read two tail records and walk past any trim
+   * command to find the turn-complete underneath.
+   */
+  async #peekTail(s2Stream: string): Promise<SessionOutTail> {
     const qs = new URLSearchParams();
     // `tail_offset=2` rewinds two seq positions; `count=2` caps it to
     // those two records. At steady state these are `[turn-complete, trim]`.
@@ -521,33 +625,13 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     qs.set("count", "2");
     qs.set("wait", "0");
 
-    let res: Response;
-    try {
-      res = await fetch(`${this.baseUrl}/streams/${encodeURIComponent(s2Stream)}/records?${qs}`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.token}`,
-          Accept: "application/json",
-          "S2-Format": "raw",
-          "S2-Basin": this.basin,
-        },
-      });
-    } catch {
-      this.logger.warn("S2 peek last record: fetch failed");
-      return false;
-    }
-
-    if (!res.ok) {
-      // 404: stream has never been written to. 416: range not
-      // satisfiable (empty stream). Both mean "nothing to peek."
-      if (res.status === 404 || res.status === 416) return false;
-      await cancelResponseBody(res);
-      this.logger.warn("S2 peek last record failed", {
-        status: res.status,
-        statusText: res.statusText,
-      });
-      return false;
-    }
+    // 404: stream has never been written to. 416: range not
+    // satisfiable (empty stream). Both mean "nothing to peek."
+    const res = await this.#getTail(s2Stream, `records?${qs}`, "S2 peek last record", [404, 416], {
+      "S2-Format": "raw",
+    });
+    if (res === "missing") return { kind: "empty" };
+    if (!res) return { kind: "unknown" };
 
     let records: Array<{
       body: string;
@@ -565,24 +649,73 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
         }>;
       };
       records = json.records ?? [];
-    } catch {
-      this.logger.warn("S2 peek last record: parse failed");
-      return false;
+    } catch (error) {
+      this.logger.warn(
+        isTimeoutError(error)
+          ? "S2 peek last record: timed out"
+          : "S2 peek last record: parse failed"
+      );
+      return { kind: "unknown" };
+    }
+
+    if (records.length === 0) {
+      return { kind: "empty" };
     }
 
     // Walk from most-recent backward, skipping S2 command records
     // (`headers[0][0] === ""`). The first non-command record is the
-    // real tail — settled iff its `trigger-control` header is
-    // `turn-complete`.
+    // real tail.
     for (let i = records.length - 1; i >= 0; i--) {
       const record = records[i]!;
       if (record.headers?.[0]?.[0] === "") {
         continue;
       }
-      const controlValue = headerValue(record.headers, "trigger-control");
-      return controlValue === "turn-complete";
+      const headers = record.headers ?? undefined;
+      const consumed = headerValue(headers, SESSION_IN_CONSUMED_ID_HEADER);
+      const inConsumedSeq = consumed !== undefined && consumed !== "" ? Number(consumed) : NaN;
+      return {
+        kind: "record",
+        control: headerValue(headers, "trigger-control"),
+        timestamp: record.timestamp,
+        inConsumedSeq: Number.isInteger(inConsumedSeq) ? inConsumedSeq : undefined,
+      };
     }
-    return false;
+    return { kind: "unknown" };
+  }
+
+  async #getTail(
+    s2Stream: string,
+    path: string,
+    label: string,
+    missingStatuses: number[],
+    extraHeaders?: Record<string, string>
+  ): Promise<Response | "missing" | undefined> {
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/streams/${encodeURIComponent(s2Stream)}/${path}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          Accept: "application/json",
+          ...extraHeaders,
+          "S2-Basin": this.basin,
+        },
+        signal: AbortSignal.timeout(S2_PEEK_TIMEOUT_MS),
+      });
+    } catch {
+      this.logger.warn(`${label}: fetch failed`);
+      return undefined;
+    }
+
+    if (res.ok) return res;
+
+    await cancelResponseBody(res);
+    if (missingStatuses.includes(res.status)) return "missing";
+    this.logger.warn(`${label} failed`, {
+      status: res.status,
+      statusText: res.statusText,
+    });
+    return undefined;
   }
 
   async #streamResponseByName(
@@ -644,7 +777,10 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
           lastError = new Error(`S2 append failed: 409 ${res.statusText} ${text}`.trim());
         } else {
           await cancelResponseBody(res);
-          const httpError = new Error(`S2 append failed: ${res.status} ${res.statusText}`);
+          const httpError = Object.assign(
+            new Error(`S2 append failed: ${res.status} ${res.statusText}`),
+            { status: res.status }
+          );
           if (res.status >= 400 && res.status < 500) {
             throw httpError;
           }
@@ -749,31 +885,47 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     if (opts.clamp != null) qs.set("clamp", String(opts.clamp));
     if (opts.wait != null) qs.set("wait", String(opts.wait));
 
-    const res = await fetch(`${this.baseUrl}/streams/${encodeURIComponent(stream)}/records?${qs}`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        Accept: "text/event-stream",
-        "S2-Format": "raw",
-        "S2-Basin": this.basin,
-      },
-      signal: opts.signal,
-    });
+    // Concurrent first readers/writers can race S2's automatic stream creation.
+    // S2-lite can also return stream_not_found during this race. Other 404s
+    // (missing basin, token or route) are terminal. Retry before exposing SSE bytes.
+    const backoffsMs = [100, 200, 400];
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(
+        `${this.baseUrl}/streams/${encodeURIComponent(stream)}/records?${qs}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            Accept: "text/event-stream",
+            "S2-Format": "raw",
+            "S2-Basin": this.basin,
+          },
+          signal: opts.signal,
+        }
+      );
 
-    if (!res.ok) {
-      await cancelResponseBody(res);
-      throw new Error(`S2 stream failed: ${res.status} ${res.statusText}`);
+      if (!res.ok) {
+        const streamNotFound = await isS2StreamNotFound(res);
+        await cancelResponseBody(res);
+        opts.signal?.throwIfAborted();
+        const delay = backoffsMs[attempt];
+        if ((res.status === 409 || streamNotFound) && delay !== undefined) {
+          await sleep(delay, undefined, { signal: opts.signal });
+          continue;
+        }
+        throw new Error(`S2 stream failed: ${res.status} ${res.statusText}`);
+      }
+
+      const headers = new Headers(res.headers);
+      headers.set("X-Stream-Version", "v2");
+      headers.set("Access-Control-Expose-Headers", "*");
+
+      return new Response(res.body, {
+        headers,
+        status: res.status,
+        statusText: res.statusText,
+      });
     }
-
-    const headers = new Headers(res.headers);
-    headers.set("X-Stream-Version", "v2");
-    headers.set("Access-Control-Expose-Headers", "*");
-
-    return new Response(res.body, {
-      headers,
-      status: res.status,
-      statusText: res.statusText,
-    });
   }
 
   private parseLastEventId(lastEventId?: string): number | undefined {
@@ -782,6 +934,21 @@ export class S2RealtimeStreams implements StreamResponder, StreamIngestor {
     const digits = lastEventId.split("-")[0];
     const n = Number(digits);
     return Number.isFinite(n) && n >= 0 ? n + 1 : undefined;
+  }
+}
+
+async function isS2StreamNotFound(response: Response): Promise<boolean> {
+  if (response.status !== 404) return false;
+  try {
+    const error: unknown = await response.json();
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "stream_not_found"
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -826,4 +993,8 @@ function describeFetchError(err: unknown): Record<string, unknown> {
     }
   }
   return out;
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && error.name === "TimeoutError";
 }

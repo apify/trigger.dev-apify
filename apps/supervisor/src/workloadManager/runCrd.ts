@@ -8,8 +8,17 @@ import {
   type ObjectCache,
 } from "@kubernetes/client-node";
 import { SimpleStructuredLogger } from "@trigger.dev/core/v3/utils/structuredLogger";
-import type { CheckpointType, EnvironmentType, MachinePreset } from "@trigger.dev/core/v3";
-import { type K8sApi, createK8sApi } from "../clients/kubernetes.js";
+import type {
+  CheckpointType,
+  ComputeCheckpointLocation,
+  EnvironmentType,
+  MachinePreset,
+} from "@trigger.dev/core/v3";
+import {
+  formatComputeCheckpointLocation,
+  parseComputeCheckpointLocation,
+} from "@trigger.dev/core/v3";
+import { type K8sApi, createK8sApi, withTimeout } from "../clients/kubernetes.js";
 import { ReconnectingInformer } from "../clients/reconnectingInformer.js";
 import { getRestoreRunnerId, getRunnerId } from "../util.js";
 import type {
@@ -24,6 +33,8 @@ import type {
   WorkloadManagerCreateOptions,
   WorkloadManagerOptions,
 } from "./types.js";
+import { killCode, type RunnerKill } from "../services/runnerKills.js";
+import { k8sCreateRefused, k8sErrorMessage, WorkloadNotCreatedError } from "./createErrors.js";
 
 const GROUP = "compute.trigger.dev";
 const VERSION = "v1alpha1";
@@ -65,6 +76,8 @@ export type RunCrdWorkloadManagerOptions = WorkloadManagerOptions & {
    * Runner on a cell with no RuntimeClass rather than serve it with weaker isolation.
    */
   runtime: RunnerRuntime;
+  /** The node this process runs on. Suspend recovery only touches Runners placed on it. */
+  nodeName: string;
   /** Suspends go to the operator only under microvm, where there is a guest to snapshot. */
   snapshots?: { enabled: boolean; delayMs: number; dispatchLimit: number };
   /** How often a suspend's or a polled resume's outcome is read back off the Runner. */
@@ -79,6 +92,11 @@ export type RunCrdWorkloadManagerOptions = WorkloadManagerOptions & {
    * deadline, so its failure arrives first and carries the reason.
    */
   restoreTimeoutMs?: number;
+  /**
+   * How long after a failed create with no Runner yet its token Secret is looked at again.
+   * Longer than the API server's request timeout, within which a lost create can still commit.
+   */
+  tokenSecretSettleMs?: number;
   /** Follows resumes from one shared watch; without it each resume is polled. */
   restoreInformer?: RunnerRestoreInformer;
 };
@@ -109,20 +127,26 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
   private readonly k8s: K8sApi;
   private readonly namespace: string;
   private readonly runtime: RunnerRuntime;
+  private readonly nodeName: string;
   private readonly snapshots?: RunCrdWorkloadManagerOptions["snapshots"];
   private readonly suspendPollMs: number;
   private readonly suspendTimeoutMs: number;
   private readonly restoreTimeoutMs: number;
+  private readonly tokenSecretSettleMs: number;
   private readonly restoreInformer?: RunnerRestoreInformer;
+  private readonly releaseUnstartedRuns: boolean;
 
   constructor(opts: RunCrdWorkloadManagerOptions) {
     this.k8s = createK8sApi();
     this.namespace = opts.namespace;
     this.runtime = opts.runtime;
+    this.nodeName = opts.nodeName;
+    this.releaseUnstartedRuns = opts.releaseUnstartedRuns ?? false;
     this.snapshots = opts.snapshots;
     this.suspendPollMs = opts.suspendPollMs ?? 5_000;
     this.suspendTimeoutMs = opts.suspendTimeoutMs ?? 6 * 60_000;
     this.restoreTimeoutMs = opts.restoreTimeoutMs ?? 21 * 60_000;
+    this.tokenSecretSettleMs = opts.tokenSecretSettleMs ?? 2 * 60_000;
     this.restoreInformer = opts.restoreInformer;
   }
 
@@ -138,23 +162,33 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     return this.snapshots?.dispatchLimit ?? 1;
   }
 
-  /**
-   * Asks the operator to snapshot the runner's guest by annotating its Runner.
-   * The runner id is the Runner's name. It comes from a workload header and the
-   * snapshot is submitted as the caller's checkpoint, so with an owner a Runner
-   * from another environment or deployment is refused.
-   */
+  async validateSuspend(opts: RunnerSuspendRequest): Promise<RunnerSuspendRequested> {
+    try {
+      const runner = (await this.getRunner(opts.runnerId)) as RunnerOwnerSpec | null;
+      if (!runner) return { ok: false, error: "the Runner was not found" };
+      const spec = runner.spec;
+      if (
+        !opts.owner ||
+        spec?.owner?.envID !== opts.owner.envId ||
+        (opts.owner.deploymentFriendlyId &&
+          spec?.deployment?.friendlyID !== opts.owner.deploymentFriendlyId)
+      )
+        return { ok: false, error: "the Runner belongs to another deployment" };
+      return { ok: true };
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        error:
+          statusCodeOf(err) === 404
+            ? "the Runner was not found"
+            : `suspend owner check failed: ${messageOf(err)}`,
+      };
+    }
+  }
+
+  // The caller validates ownership before delivering earlier outcomes or making this patch.
   async requestSuspend(opts: RunnerSuspendRequest): Promise<RunnerSuspendRequested> {
     try {
-      if (opts.owner) {
-        const spec = ((await this.getRunner(opts.runnerId)) as RunnerOwnerSpec | null)?.spec;
-        if (
-          spec?.owner?.envID !== opts.owner.envId ||
-          spec?.deployment?.friendlyID !== opts.owner.deploymentFriendlyId
-        ) {
-          return { ok: false, error: "the Runner belongs to another deployment" };
-        }
-      }
       await this.k8s.objects.patch(
         {
           apiVersion: `${GROUP}/${VERSION}`,
@@ -184,7 +218,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     return publishedSuspend(await this.getRunner(runnerId));
   }
 
-  /** Every Runner whose latest suspend has an outcome not yet marked submitted. */
+  /** Every Runner on this node whose latest suspend has an outcome not yet marked submitted. */
   async publishedSuspends(): Promise<PublishedSuspend[]> {
     const list = (await this.k8s.custom.listNamespacedCustomObject({
       group: GROUP,
@@ -193,6 +227,9 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
       plural: PLURAL,
     })) as { items?: unknown[] } | null;
     return (list?.items ?? []).flatMap((runner) => {
+      if ((runner as RunnerPlacementStatus | null)?.status?.placement?.node !== this.nodeName) {
+        return [];
+      }
       const published = publishedSuspend(runner);
       return published ? [published] : [];
     });
@@ -334,8 +371,45 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     return outcome ? { ...outcome, createdAt: createdAtOf(runner), uid: uidOf(runner) } : timedOut;
   }
 
+  /** Reads a cold start's Runner for the heartbeat that covers it. A missing one is gone. */
+  async coldStartState(runnerId: string, snapshotFriendlyId: string): Promise<ColdStartState> {
+    try {
+      return coldStartState(await this.getRunner(runnerId), snapshotFriendlyId);
+    } catch (err: unknown) {
+      if (statusCodeOf(err) === 404) {
+        return "gone";
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The cold starts still waiting to start, for a new process to take over their
+   * heartbeats. One list, bounded at both ends, as nothing retries it.
+   */
+  async startingColdStarts(timeoutMs: number): Promise<StartingColdStart[]> {
+    const list = (await withTimeout(
+      this.k8s.custom.listNamespacedCustomObject({
+        group: GROUP,
+        version: VERSION,
+        namespace: this.namespace,
+        plural: PLURAL,
+        labelSelector: `${RESTORE_LABEL}!=true`,
+        timeoutSeconds: Math.ceil(timeoutMs / 1000),
+      }),
+      timeoutMs,
+      "Cold start Runner list"
+    )) as KubernetesListObject<KubernetesObject>;
+    return (list.items ?? []).flatMap((runner) => startingColdStart(runner) ?? []);
+  }
+
   /** Deletes a failed resume so its redelivery can create it again. */
   async deleteRestoreRunner(runnerId: string, uid: string): Promise<void> {
+    await this.deleteRunner(runnerId, uid);
+  }
+
+  /** Takes a failed cold start out of the way of its redelivery. */
+  async deleteFailedRunner(runnerId: string, uid: string): Promise<void> {
     await this.deleteRunner(runnerId, uid);
   }
 
@@ -375,7 +449,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
    * took. Any other checkpoint's location means nothing to it.
    */
   restores(checkpoint: { type: CheckpointType }): boolean {
-    return this.runtime === "microvm" && checkpoint.type === "COMPUTE";
+    return restoresOnRunner(this.runtime, checkpoint);
   }
 
   /**
@@ -430,7 +504,8 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
 
   /**
    * Creates a resume: a Runner the operator restores from the checkpoint's
-   * snapshot, on the node holding it, instead of cold-starting. Named from the
+   * snapshot instead of cold-starting, on the node that took it unless the
+   * snapshot is in the regional store. Named from the
    * checkpoint, so a redelivered restore finds the first Runner and leaves it
    * rather than restoring twice. Returns the Runner, also for a resume found in
    * the way, which a restarted supervisor has no other watch on.
@@ -470,7 +545,8 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
 
   /**
    * A resume already in the way counts as this restore only while it restores
-   * the same snapshot. `ended` is the phase of one held terminal for the
+   * the same snapshot. The node is only where the operator starts looking, so
+   * a resume naming or placed on another node still counts. `ended` is the phase of one held terminal for the
    * operator's TTL, which will never resume the guest.
    */
   private async readExistingRestore(
@@ -480,7 +556,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     const existing = (await this.getRunner(runnerId)) as ExistingRestore | null;
     const phase = existing?.status?.phase;
     const spec = existing?.spec?.restore;
-    if (spec?.snapshotID !== restore.snapshotID || spec?.node !== restore.node) {
+    if (spec?.snapshotID !== restore.snapshotID) {
       throw new Error(
         `restore Runner ${runnerId} restores ${JSON.stringify(spec ?? null)}, not ${checkpointLocation(restore)}`
       );
@@ -515,6 +591,11 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     restore?: RunnerRestore,
     replacing = false
   ): Promise<{ uid?: string } | false> {
+    const refused = templateKeyRefusal(this.runtime, opts.templateKey, !!restore);
+    if (refused) {
+      throw new Error(`Runner ${runnerId} not created: ${refused.reason}`);
+    }
+
     const token = await this.ensureRunnerToken(opts, runnerId, !!restore || replacing);
 
     const body = runnerBodyFor(opts, {
@@ -539,12 +620,16 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
         fieldValidation: "Strict",
       });
     } catch (err: unknown) {
-      await this.releaseRunnerToken(token, err);
+      await this.settleRunnerToken(token, runnerId);
       // A resume's name carries the checkpoint, so the Runner in the way is this
       // resume, still restoring or held terminal for the operator's TTL. A cold
       // start's carries the attempt: create sorts out which delivery made it.
       if (statusCodeOf(err) === 409) {
         return false;
+      }
+      if (this.releaseUnstartedRuns && k8sCreateRefused(err)) {
+        this.logger.error("[RunCrdWorkloadManager] Create refused", { runnerId, rawError: err });
+        throw new WorkloadNotCreatedError(k8sErrorMessage(err), { cause: err });
       }
       this.logger.error("[RunCrdWorkloadManager] Create failed", { runnerId, rawError: err });
       throw err;
@@ -552,7 +637,11 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
 
     const runnerUid = uidOf(created);
     if (token && runnerUid) {
-      await this.adoptRunnerToken(token.name, { name: runnerId, uid: runnerUid });
+      await this.adoptRunnerToken(
+        token.name,
+        { name: runnerId, uid: runnerUid },
+        opts.deploymentToken
+      );
     }
     return { uid: runnerUid };
   }
@@ -560,29 +649,40 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
   /**
    * Makes the Runner own the Secret, so the garbage collector takes it with the
    * Runner. An object that never had an owner is not a dependent, so nothing can
-   * collect the Secret before this lands.
+   * collect the Secret before this lands. A Secret gone by then (a redelivery's reuse
+   * raced an earlier delivery's settle) is written again, owned from the start.
    *
    * Never throws: an ownerless Secret holding one expiring token costs less than
    * failing a run that is about to start.
    */
-  private async adoptRunnerToken(name: string, runner: { name: string; uid: string }) {
+  private async adoptRunnerToken(
+    name: string,
+    runner: { name: string; uid: string },
+    token?: string
+  ) {
     const ownerReferences: OwnerReference[] = [
       { apiVersion: `${GROUP}/${VERSION}`, kind: "Runner", name: runner.name, uid: runner.uid },
     ];
-
     try {
-      await this.k8s.objects.patch(
-        {
-          apiVersion: "v1",
-          kind: "Secret",
-          metadata: { name, namespace: this.namespace, ownerReferences },
-        },
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        PatchStrategy.StrategicMergePatch
-      );
+      try {
+        await this.k8s.objects.patch(
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: { name, namespace: this.namespace, ownerReferences },
+          },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          PatchStrategy.StrategicMergePatch
+        );
+      } catch (err: unknown) {
+        if (statusCodeOf(err) !== 404 || token === undefined) {
+          throw err;
+        }
+        await this.writeTokenSecret(name, token, ownerReferences);
+      }
     } catch (err: unknown) {
       this.logger.warn("[RunCrdWorkloadManager] Token secret adoption failed", {
         name,
@@ -593,45 +693,72 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
   }
 
   /**
-   * Deletes the Secret a failed create left behind; with no owner coming, the
-   * collector would never take it.
-   *
-   * Only on a 4xx. No status or a 5xx may be a create that committed before its
-   * response was lost, and deleting then would fail a Runner that is about to
-   * start, so the Secret is kept and logged: an ownerless expiring token is the
-   * cheaper mistake. Reading the Runner back would tell the cases apart; not worth it
-   * for a path this rare. Only when this call wrote it: a create returns a uid, a 409 does not.
+   * A Runner holding the name and referencing the Secret adopts it: the create went
+   * through after all, or another delivery of this attempt reused the digest-named
+   * Secret. One referencing another Secret means nothing will use it, and it is deleted
+   * under its uid. With no Runner yet, or none readable, the same look is taken again
+   * later: the create may still commit, or a delivery reusing the name may be about to,
+   * and a delete now would strand that Runner.
    */
-  private async releaseRunnerToken(
-    token: { name: string; uid?: string } | undefined,
-    err: unknown
-  ) {
+  private async settleRunnerToken(token: RunnerToken | undefined, runnerId: string) {
     if (!token?.uid) {
       return;
     }
-
-    const status = statusCodeOf(err);
-    if (status !== undefined && status >= 400 && status < 500) {
-      await this.deleteRunnerToken(token.name, token.uid);
+    const kept: WrittenTokenSecret = {
+      name: token.name,
+      uid: token.uid,
+      resourceVersion: token.resourceVersion,
+    };
+    if ((await this.settleHeld(kept, runnerId)) === "settled") {
       return;
     }
+    setTimeout(async () => {
+      if ((await this.settleHeld(kept, runnerId)) === "none") {
+        await this.deleteRunnerToken(kept);
+      }
+    }, this.tokenSecretSettleMs).unref();
+  }
 
-    this.logger.warn("[RunCrdWorkloadManager] Token secret kept after an indeterminate create", {
-      name: token.name,
-      status,
-    });
+  /** Settles the Secret by the Runner under the name, if there is one and it can be read. */
+  private async settleHeld(
+    token: WrittenTokenSecret,
+    runnerId: string
+  ): Promise<"settled" | "none" | "unreadable"> {
+    let holder: unknown;
+    try {
+      holder = await this.getRunner(runnerId);
+    } catch (err: unknown) {
+      if (statusCodeOf(err) === 404) {
+        return "none";
+      }
+      this.logger.warn("[RunCrdWorkloadManager] Token secret kept, Runner unreadable", {
+        name: token.name,
+        runnerId,
+        rawError: err,
+      });
+      return "unreadable";
+    }
+    const holderUid = uidOf(holder);
+    const held = (holder as RunnerOwnerSpec | null)?.spec?.deployment?.token?.name;
+    if (holderUid && held === token.name) {
+      await this.adoptRunnerToken(token.name, { name: runnerId, uid: holderUid });
+    } else {
+      await this.deleteRunnerToken(token);
+    }
+    return "settled";
   }
 
   /**
-   * Preconditioned on uid, so a Secret that is no longer the one this call wrote
-   * is left alone. A 409 is that precondition refusing, which is the answer.
+   * Deleted under its uid and the version it was created with, so a Secret that is no
+   * longer the one this call wrote, or that a Runner adopted meanwhile, is left alone.
+   * No read: the supervisor has no get on Secrets.
    */
-  private async deleteRunnerToken(name: string, uid: string) {
+  private async deleteRunnerToken(token: WrittenTokenSecret) {
     try {
       await this.k8s.core.deleteNamespacedSecret({
         namespace: this.namespace,
-        name,
-        body: { preconditions: { uid } },
+        name: token.name,
+        body: { preconditions: { uid: token.uid, resourceVersion: token.resourceVersion } },
       });
     } catch (err: unknown) {
       const status = statusCodeOf(err);
@@ -639,7 +766,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
         return;
       }
       this.logger.warn("[RunCrdWorkloadManager] Token secret cleanup failed", {
-        name,
+        name: token.name,
         rawError: err,
       });
     }
@@ -661,7 +788,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
     opts: WorkloadManagerCreateOptions,
     runnerId: string,
     perCreate: boolean
-  ): Promise<{ name: string; key: string; uid?: string } | undefined> {
+  ): Promise<RunnerToken | undefined> {
     if (!opts.deploymentToken) {
       return undefined;
     }
@@ -674,7 +801,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
 
     try {
       const created = await this.writeTokenSecret(name, opts.deploymentToken);
-      return { name, key: TOKEN_KEY, uid: uidOf(created) };
+      return { name, key: TOKEN_KEY, ...metadataOf(created) };
     } catch (err: unknown) {
       // A redrive: the name carries the token's digest, so the existing Secret holds
       // the same token. No uid, so the failure path cannot delete what it did not create.
@@ -687,11 +814,14 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
         name,
         rawError: err,
       });
+      if (this.releaseUnstartedRuns && k8sCreateRefused(err)) {
+        throw new WorkloadNotCreatedError(k8sErrorMessage(err), { cause: err });
+      }
       throw err;
     }
   }
 
-  private async writeTokenSecret(name: string, token: string) {
+  private async writeTokenSecret(name: string, token: string, ownerReferences?: OwnerReference[]) {
     return await this.k8s.core.createNamespacedSecret({
       namespace: this.namespace,
       body: {
@@ -702,6 +832,7 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
             "app.kubernetes.io/part-of": "trigger-worker",
             "app.kubernetes.io/component": "runner-token",
           },
+          ...(ownerReferences ? { ownerReferences } : {}),
         },
         type: "Opaque",
         // Spares the kubelet a watch, and says the token does not change.
@@ -712,8 +843,17 @@ export class RunCrdWorkloadManager implements WorkloadManager, RunnerSnapshotter
   }
 }
 
+/** The Secret a create wrote, by the uid and version that guard its delete. */
+type WrittenTokenSecret = { name: string; uid: string; resourceVersion?: string };
+
+/** The Secret a Runner references; a reused one carries no uid, so it is never deleted. */
+type RunnerToken = { name: string; key: string; uid?: string; resourceVersion?: string };
+
 type RunnerOwnerSpec = {
-  spec?: { owner?: { envID?: string }; deployment?: { friendlyID?: string } };
+  spec?: {
+    owner?: { envID?: string };
+    deployment?: { friendlyID?: string; token?: { name?: string } };
+  };
 };
 
 type ExistingRestore = {
@@ -721,11 +861,19 @@ type ExistingRestore = {
   status?: { phase?: string };
 };
 
+type RunnerPlacementStatus = { status?: { placement?: { node?: string } } };
+
 type RunnerSuspendStatus = {
   status?: {
     phase?: string;
     suspend?: { request?: string; snapshotID?: string; node?: string };
-    conditions?: Array<{ type?: string; status?: string; reason?: string; message?: string }>;
+    conditions?: Array<{
+      type?: string;
+      status?: string;
+      reason?: string;
+      message?: string;
+      lastTransitionTime?: string;
+    }>;
   };
 };
 
@@ -973,7 +1121,9 @@ export class RunnerRestoreInformer {
     if (verb !== "add") {
       return;
     }
-    const bootstrap = (runner as RunnerBootstrapSpec).spec?.bootstrap;
+    const spec = (runner as RunnerBootstrapSpec).spec;
+    const bootstrap = spec?.bootstrap;
+    const environmentId = spec?.owner?.envID;
     const outcome = restoreOutcome(runner);
     // A Runner first seen already failed comes from a list, not from a create
     // here, so nothing has handled its outcome.
@@ -982,6 +1132,7 @@ export class RunnerRestoreInformer {
         runnerId: name,
         runFriendlyId: bootstrap?.runFriendlyID,
         snapshotFriendlyId: bootstrap?.snapshotFriendlyID,
+        ...(environmentId ? { environmentId } : {}),
         outcome: { ...outcome, createdAt: createdAtOf(runner), uid },
       });
       return;
@@ -993,6 +1144,7 @@ export class RunnerRestoreInformer {
         uid,
         runFriendlyId: bootstrap?.runFriendlyID,
         snapshotFriendlyId: bootstrap?.snapshotFriendlyID,
+        ...(environmentId ? { environmentId } : {}),
       });
     }
   }
@@ -1009,20 +1161,96 @@ export type UnwatchedRestore = {
   uid?: string;
   runFriendlyId?: string;
   snapshotFriendlyId?: string;
+  environmentId?: string;
 };
 
 export type UnwatchedRestoreFailure = {
   runnerId: string;
   runFriendlyId?: string;
   snapshotFriendlyId?: string;
+  environmentId?: string;
   outcome: RestoreWatchResult & { ok: false };
 };
 
 type RunnerBootstrapSpec = {
   spec?: {
     bootstrap?: { runFriendlyID?: string; snapshotFriendlyID?: string; dequeuedAt?: string };
+    owner?: { envID?: string };
   };
 };
+
+/**
+ * Follows every Runner through one list and watch, to hear of the ones the runtime killed. Each
+ * killed Runner is passed on once, however many updates or relists show it failed, as long as
+ * it is among the most recent `maxRemembered` passed on.
+ */
+export class RunnerKillInformer {
+  private readonly logger = new SimpleStructuredLogger("runner-kill-informer");
+  private readonly watch: ReconnectingInformer<KubernetesObject>;
+  private readonly reported = new Set<string>();
+
+  constructor(opts: {
+    namespace: string;
+    onRunnerKilled: (runnerId: string, kill: RunnerKill) => void;
+    /** A cold start the operator failed before it began, which a requeue may place elsewhere. */
+    onRunnerStartFailed?: (failure: RunnerStartFailure) => void;
+    reconnectIntervalMs?: number;
+    /** How long the server keeps each watch open before closing it. */
+    watchTimeoutSeconds?: number;
+    maxRemembered?: number;
+    k8s?: K8sApi;
+  }) {
+    const maxRemembered = opts.maxRemembered ?? 10_000;
+    const k8s = opts.k8s ?? createK8sApi();
+    const path = `/apis/${GROUP}/${VERSION}/namespaces/${opts.namespace}/${PLURAL}`;
+    this.watch = new ReconnectingInformer({
+      name: "runner-kill",
+      logger: this.logger,
+      reconnectIntervalMs: opts.reconnectIntervalMs ?? 1_000,
+      path,
+      watchTimeoutSeconds: opts.watchTimeoutSeconds ?? 300,
+      list: async () =>
+        (await k8s.custom.listNamespacedCustomObject({
+          group: GROUP,
+          version: VERSION,
+          namespace: opts.namespace,
+          plural: PLURAL,
+        })) as KubernetesListObject<KubernetesObject>,
+      makeInformer: (informerPath, list) => k8s.makeInformer(informerPath, list),
+      onStall: (quietMs) =>
+        this.logger.warn("Runner kill informer watch stalled, reconnecting", { quietMs }),
+    });
+    const onEvent = (runner: KubernetesObject) => {
+      const name = runner.metadata?.name;
+      const uid = runner.metadata?.uid;
+      const kill = runnerKill(runner);
+      const startFailure = opts.onRunnerStartFailed && runnerStartFailure(runner);
+      if (!name || !uid || (!kill && !startFailure) || this.reported.has(uid)) {
+        return;
+      }
+      this.reported.add(uid);
+      if (this.reported.size > maxRemembered) {
+        // A Set iterates in insertion order, so this forgets the oldest.
+        this.reported.delete(this.reported.values().next().value!);
+      }
+      if (kill) {
+        opts.onRunnerKilled(name, kill);
+      } else if (startFailure) {
+        opts.onRunnerStartFailed!(startFailure);
+      }
+    };
+    this.watch.informer.on("add", onEvent);
+    this.watch.informer.on("update", onEvent);
+  }
+
+  async start() {
+    await this.watch.start();
+  }
+
+  async stop() {
+    await this.watch.stop();
+  }
+}
 
 /**
  * Heartbeats the dequeued run while the operator brings its resume up, so a
@@ -1054,11 +1282,12 @@ const PERMANENT_RESTORE_REASONS = new Set([
   "SnapshotNodeUnschedulable",
   "RestoreNotSupported",
   "SnapshotNotFound",
+  "SnapshotRefused",
 ]);
 
 export type RestoreFailureAction =
   | { outcome: "fail" }
-  | { outcome: "requeue"; deleteRunner: boolean };
+  | { outcome: "requeue" | "fallback"; deleteRunner: boolean };
 
 /**
  * What to tell the platform about a failed resume, from the operator's reason
@@ -1085,7 +1314,7 @@ export function classifyRestoreFailure(reason: string): RestoreFailureAction | u
 }
 
 export type RestoreOutcomeReport = (body: {
-  outcome: "requeue" | "fail";
+  outcome: "requeue" | "fail" | "fallback";
   reason: string;
   message?: string;
 }) => Promise<{ success: true } | { success: false; error: string; statusCode?: number }>;
@@ -1095,14 +1324,14 @@ export type RestoreFailureSettlement =
   | { action: "kept"; error: string; forbidden?: boolean }
   | {
       action: "reported";
-      outcome: "requeue" | "fail";
+      outcome: "requeue" | "fail" | "fallback";
       result: "ok" | "conflict" | "error";
       error?: string;
       cleanupError?: string;
     };
 
 /**
- * Reports a failed resume to the platform. A requeue first deletes the Runner,
+ * Reports a failed resume to the platform. A requeue or fallback first deletes the Runner,
  * since its redelivery would otherwise find it held for the operator's TTL and
  * fail again; when that delete fails nothing is reported. A fail deletes it
  * once the platform has the report (or has moved on, a conflict), so a
@@ -1112,6 +1341,8 @@ export async function settleRestoreFailure(
   failure: {
     runnerId: string;
     outcome: RestoreWatchResult & { ok: false };
+    /** Overrides what the reason alone would report. */
+    action?: RestoreFailureAction;
   },
   deps: {
     deleteRunner: (runnerId: string, uid: string) => Promise<void>;
@@ -1119,11 +1350,11 @@ export async function settleRestoreFailure(
   }
 ): Promise<RestoreFailureSettlement> {
   const { reason, error, message, uid } = failure.outcome;
-  const action = classifyRestoreFailure(reason);
+  const action = failure.action ?? classifyRestoreFailure(reason);
   if (!action) {
     return { action: "none" };
   }
-  if (action.outcome === "requeue" && action.deleteRunner) {
+  if (action.outcome !== "fail" && action.deleteRunner) {
     if (!uid) {
       return { action: "kept", error: "no uid to guard the Runner's delete" };
     }
@@ -1219,6 +1450,128 @@ export function restoreOutcome(runner: unknown): RunnerRestoreResult | undefined
   }
 }
 
+/** Where a cold start's Runner stands. `superseded` is a Runner a later delivery created. */
+export type ColdStartState = "starting" | "started" | "failed" | "gone" | "superseded";
+
+/** A Runner that started, failed or belongs to another delivery has no more use for the heartbeat. */
+export function coldStartState(runner: unknown, snapshotFriendlyId: string): ColdStartState {
+  const bootstrap = (runner as RunnerBootstrapSpec | null)?.spec?.bootstrap;
+  if (bootstrap?.snapshotFriendlyID && bootstrap.snapshotFriendlyID !== snapshotFriendlyId) {
+    return "superseded";
+  }
+  const outcome = restoreOutcome(runner);
+  if (!outcome) {
+    return "starting";
+  }
+  return outcome.ok ? "started" : "failed";
+}
+
+export type StartingColdStart = {
+  runFriendlyId: string;
+  snapshotFriendlyId: string;
+  runnerId: string;
+  createdAt: Date;
+};
+
+/** A cold-start Runner not yet running or failed, with what its heartbeat needs. */
+export function startingColdStart(runner: unknown): StartingColdStart | undefined {
+  const meta = (runner as { metadata?: { name?: string; labels?: Record<string, string> } } | null)
+    ?.metadata;
+  const bootstrap = (runner as RunnerBootstrapSpec | null)?.spec?.bootstrap;
+  const createdAt = createdAtOf(runner);
+  if (!meta?.name || meta.labels?.[RESTORE_LABEL] === "true" || restoreOutcome(runner)) {
+    return undefined;
+  }
+  if (!bootstrap?.runFriendlyID || !bootstrap.snapshotFriendlyID || !createdAt) {
+    return undefined;
+  }
+  return {
+    runFriendlyId: bootstrap.runFriendlyID,
+    snapshotFriendlyId: bootstrap.snapshotFriendlyID,
+    runnerId: meta.name,
+    createdAt,
+  };
+}
+
+/** Reasons a cold start fails for that another lane may not, so it is moved there. */
+const FALLBACK_START_REASONS = new Set(["TemplateNotFound"]);
+
+/** A cold start that failed before its attempt began, with the dequeue it was created for. */
+export type RunnerStartFailure = {
+  runnerId: string;
+  runFriendlyId: string;
+  snapshotFriendlyId: string;
+  environmentId?: string;
+  outcome: RunnerRestoreResult & { ok: false; uid: string };
+};
+
+/**
+ * A cold-start Runner the operator failed for a reason another lane can get past. A resume is
+ * left out: the restore watch settles it.
+ */
+export function runnerStartFailure(runner: unknown): RunnerStartFailure | undefined {
+  const meta = (
+    runner as {
+      metadata?: { name?: string; uid?: string; labels?: Record<string, string> };
+    } | null
+  )?.metadata;
+  const spec = (runner as RunnerBootstrapSpec | null)?.spec;
+  const bootstrap = spec?.bootstrap;
+  if (!meta?.name || !meta.uid || meta.labels?.[RESTORE_LABEL] === "true") {
+    return undefined;
+  }
+  const outcome = restoreOutcome(runner);
+  if (!outcome || outcome.ok || !FALLBACK_START_REASONS.has(outcome.reason)) {
+    return undefined;
+  }
+  if (!bootstrap?.runFriendlyID || !bootstrap.snapshotFriendlyID) {
+    return undefined;
+  }
+  return {
+    runnerId: meta.name,
+    runFriendlyId: bootstrap.runFriendlyID,
+    snapshotFriendlyId: bootstrap.snapshotFriendlyID,
+    ...(spec?.owner?.envID ? { environmentId: spec.owner.envID } : {}),
+    outcome: { ...outcome, uid: meta.uid },
+  };
+}
+
+/**
+ * The kill a failed Runner records, from the Failed condition the operator copies off its
+ * pod. The kubelet reports OOMKilled for a microvm guest too, so the reason means the same on
+ * both lanes. The exit code is only in the message, as "exited with code N".
+ */
+export function runnerKill(runner: unknown): RunnerKill | undefined {
+  const status = (runner as RunnerSuspendStatus | null)?.status;
+  const spec = (runner as RunnerBootstrapSpec | null)?.spec;
+  const annotations = (runner as { metadata?: { annotations?: Record<string, string> } } | null)
+    ?.metadata?.annotations;
+  if (status?.phase !== "Failed") {
+    return undefined;
+  }
+  // The kill time here is only when the failure was observed, and a Runner asked to suspend may
+  // have left a checkpoint that a restore continues elsewhere in the same attempt, so neither the
+  // time nor the attempt can tell that run apart from this one. The stall path handles it.
+  if (annotations?.[SUSPEND_ANNOTATION] || status.suspend) {
+    return undefined;
+  }
+  const condition = status.conditions?.find((c) => c.type === "Failed");
+  const match = condition?.message?.match(/exited with code (-?\d+)/);
+  const code = condition && killCode(condition.reason, match ? Number(match[1]) : undefined);
+  const runFriendlyId = spec?.bootstrap?.runFriendlyID;
+  const environmentId = spec?.owner?.envID;
+  if (!code || !runFriendlyId || !environmentId || !condition.lastTransitionTime) {
+    return undefined;
+  }
+  return {
+    code,
+    runFriendlyId,
+    environmentId,
+    killedAt: new Date(condition.lastTransitionTime),
+    killedAtObserved: true,
+  };
+}
+
 /**
  * The Runner's latest suspend, when it has an outcome the platform has not
  * been marked as accepting. A request made without the run annotation, by an
@@ -1238,26 +1591,36 @@ export function publishedSuspend(runner: unknown): PublishedSuspend | undefined 
     return undefined;
   }
   const outcome = suspendOutcome(runner, request);
-  return outcome && { runnerId: meta.name, runFriendlyId, snapshotFriendlyId: request, outcome };
+  return (
+    outcome && {
+      runnerId: meta.name,
+      runFriendlyId,
+      snapshotFriendlyId: request,
+      outcome,
+      // Recovery has no HTTP caller; the persisted Runner owner supplies its environment.
+      environmentId: (runner as RunnerOwnerSpec | null)?.spec?.owner?.envID,
+    }
+  );
 }
 
-type RunnerRestore = { snapshotID: string; node: string };
+type RunnerRestore = ComputeCheckpointLocation;
 
 /**
- * A checkpoint's location names the node as well as the snapshot, because the
- * node runtime's snapshots are node-local and a resume has to land there.
- * Neither a node name nor a snapshot id can contain a slash.
+ * A checkpoint's location names the node that took the snapshot as well as the
+ * snapshot: a resume has to land there while the snapshot is only on that node,
+ * and prefers it after. The platform validates the same format when it stores
+ * the checkpoint.
  */
 export function checkpointLocation(restore: RunnerRestore): string {
-  return `${restore.node}/${restore.snapshotID}`;
+  return formatComputeCheckpointLocation(restore);
 }
 
 export function parseCheckpointLocation(location: string): RunnerRestore {
-  const [node, snapshotID, ...rest] = location.split("/");
-  if (!node || !snapshotID || rest.length > 0) {
-    throw new Error(`checkpoint location ${JSON.stringify(location)} is not <node>/<snapshot>`);
+  const parsed = parseComputeCheckpointLocation(location);
+  if (!parsed.ok) {
+    throw new Error(`checkpoint location ${JSON.stringify(location)}: ${parsed.error}`);
   }
-  return { node, snapshotID };
+  return parsed.value;
 }
 
 function messageOf(err: unknown): string {
@@ -1269,13 +1632,79 @@ function isRunner(runner: unknown, uid: string | undefined): boolean {
   return uid === undefined || uidOf(runner) === uid;
 }
 
-/** The create response is untyped, and an absent uid just skips adoption. */
-function uidOf(created: unknown): string | undefined {
-  if (typeof created !== "object" || created === null) {
+/** API objects come back untyped: an absent uid skips adoption and guards no delete. */
+function metadataOf(object: unknown): { uid?: string; resourceVersion?: string } {
+  const meta = (object as { metadata?: { uid?: unknown; resourceVersion?: unknown } } | null)
+    ?.metadata;
+  return {
+    uid: typeof meta?.uid === "string" ? meta.uid : undefined,
+    resourceVersion: typeof meta?.resourceVersion === "string" ? meta.resourceVersion : undefined,
+  };
+}
+
+function uidOf(object: unknown): string | undefined {
+  return metadataOf(object).uid;
+}
+
+const TEMPLATE_KEY = /^[a-f0-9]{64}$/;
+
+/** The pattern the CRD enforces on `spec.templateKey`. */
+function isTemplateKey(key: string | undefined): boolean {
+  return key !== undefined && TEMPLATE_KEY.test(key);
+}
+
+/** Only a COMPUTE checkpoint on the microvm lane resumes as a Runner. */
+function restoresOnRunner(runtime: RunnerRuntime, checkpoint: { type: CheckpointType }): boolean {
+  return runtime === "microvm" && checkpoint.type === "COMPUTE";
+}
+
+export type TemplateKeyRefusal = { outcome: "fallback" | "fail"; reason: string };
+
+/**
+ * A microvm Runner starts only from a template, so a run without a valid key is reported
+ * instead: a cold start falls back to another lane, and a resume, which cannot change lanes,
+ * fails. Undefined when the Runner can be created.
+ */
+function templateKeyRefusal(
+  runtime: RunnerRuntime,
+  templateKey: string | undefined,
+  restore: boolean
+): TemplateKeyRefusal | undefined {
+  if (runtime !== "microvm" || isTemplateKey(templateKey)) {
     return undefined;
   }
-  const meta = (created as { metadata?: { uid?: unknown } }).metadata;
-  return typeof meta?.uid === "string" ? meta.uid : undefined;
+  return {
+    outcome: restore ? "fail" : "fallback",
+    reason: templateKey === undefined ? "TemplateKeyMissing" : "TemplateKeyMalformed",
+  };
+}
+
+/**
+ * Reports a run its lane will not create a Runner for, in place of creating one. Undefined when
+ * the Runner can be created, or when the checkpoint client restores the run instead.
+ */
+export async function reportTemplateKeyRefusal(
+  run: { runtime: RunnerRuntime; templateKey?: string; checkpoint?: { type: CheckpointType } },
+  report: RestoreOutcomeReport
+): Promise<
+  (TemplateKeyRefusal & { result: "ok" | "conflict" | "error"; error?: string }) | undefined
+> {
+  if (run.checkpoint && !restoresOnRunner(run.runtime, run.checkpoint)) {
+    return undefined;
+  }
+  const refused = templateKeyRefusal(run.runtime, run.templateKey, !!run.checkpoint);
+  if (!refused) {
+    return undefined;
+  }
+  const result = await report(refused);
+  if (result.success) {
+    return { ...refused, result: "ok" };
+  }
+  return {
+    ...refused,
+    result: result.statusCode === 409 ? "conflict" : "error",
+    error: result.error,
+  };
 }
 
 /**
@@ -1307,6 +1736,10 @@ export function runnerBodyFor(
       // As built, digest and all: the operator owns stripping and rewriting, so
       // they cannot both apply.
       image: opts.image,
+      // Only the microvm lane starts from a template; create refuses one without a valid key.
+      ...(meta.runtime === "microvm" && isTemplateKey(opts.templateKey)
+        ? { templateKey: opts.templateKey }
+        : {}),
       machine: machineOf(opts.machine),
       ...(opts.runtime ? { taskRuntime: opts.runtime } : {}),
       deployment: {

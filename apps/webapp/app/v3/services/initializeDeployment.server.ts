@@ -8,17 +8,27 @@ import { resolveBuildRuntime } from "@trigger.dev/core/v3/build";
 import { customAlphabet } from "nanoid";
 import { env } from "~/env.server";
 import { type AuthenticatedEnvironment } from "~/services/apiAuth.server";
-import { encryptSecret } from "~/services/secrets/secretStore.server";
+import cuid from "cuid";
+import { type StoredEnvironmentValue } from "~/services/environmentEncryption/crypto.server";
+import { environmentEncryption } from "~/services/environmentEncryption/instance.server";
 import { logger } from "~/services/logger.server";
 import { generateFriendlyId } from "../friendlyIdentifiers";
 import { createRemoteImageBuild, remoteBuildsEnabled } from "../remoteImageBuilder.server";
 import { BaseService, ServiceValidationError } from "./baseService.server";
+import {
+  checkDeployAccess,
+  DeploymentAccessError,
+  deniedMessage,
+} from "../deploymentAccess.server";
+import { cardVerificationDeployRefusal } from "../cardVerificationDeployGate.server";
 import { TimeoutDeploymentService } from "./timeoutDeployment.server";
+import { resolveDeployBaseImages } from "../deployBaseImages.server";
 import { getDeploymentImageRef } from "../getDeploymentImageRef.server";
 import { tryCatch } from "@trigger.dev/core";
 import { getRegistryConfig } from "../registryConfig.server";
 import { DeploymentService } from "./deployment.server";
 import { recordDeploymentInitialized } from "./recordDeploymentFinished.server";
+import { buildEnvVarsEnvelope } from "./initializeDeployment/buildEnvVarsEnvelope.server";
 import { createDeploymentWithNextVersion } from "./initializeDeployment/createDeploymentWithNextVersion.server";
 import {
   cancelSupersededDeployments,
@@ -29,6 +39,8 @@ import {
   type ExternalIdReuseDeployment,
 } from "./initializeDeployment/resolveExternalIdReuse.server";
 import { type WorkerDeployment } from "@trigger.dev/database";
+import type { DeploymentAccessController } from "@trigger.dev/plugins";
+import { type PrismaClientOrTransaction } from "~/db.server";
 import { errAsync } from "neverthrow";
 
 const nanoid = customAlphabet("1234567890abcdefghijklmnopqrstuvwxyz", 8);
@@ -57,12 +69,56 @@ export type InitializeDeploymentResult =
     };
 
 export class InitializeDeploymentService extends BaseService {
+  private readonly _deploymentAccess: DeploymentAccessController | null | undefined;
+  private readonly _cardRefusal: typeof cardVerificationDeployRefusal;
+
+  constructor(
+    prisma?: PrismaClientOrTransaction,
+    replica?: PrismaClientOrTransaction,
+    // Tests inject these; production loads the access plugin and asks billing about the card.
+    deploymentAccess?: DeploymentAccessController | null,
+    cardRefusal: typeof cardVerificationDeployRefusal = cardVerificationDeployRefusal
+  ) {
+    super(prisma, replica);
+    this._deploymentAccess = deploymentAccess;
+    this._cardRefusal = cardRefusal;
+  }
+
   public async call(
     environment: AuthenticatedEnvironment,
     payload: InitializeDeploymentRequestBody,
-    options?: { cliVersion?: string }
+    options?: {
+      cliVersion?: string;
+      redeployOf?: string;
+      buildEnvVars?: StoredEnvironmentValue;
+      buildEnvVarsSourceId?: string;
+      trustedDeploy?: BuildServerMetadata["trustedDeploy"];
+    }
   ): Promise<InitializeDeploymentResult> {
     return this.traceWithEnv("call", environment, async (span) => {
+      // An older CLI attaching to a deployment the build server already created (the commitSha
+      // workaround below) isn't a new deploy, so it only gets the read-only check.
+      const attachingToExistingDeployment =
+        payload.gitMeta?.commitSha?.startsWith("deployment_") === true;
+      const access = await checkDeployAccess(
+        {
+          stage: attachingToExistingDeployment ? "preflight" : "initialize",
+          organizationId: environment.organization.id,
+          projectId: environment.project.id,
+          environmentId: environment.id,
+          contentHash: payload.contentHash,
+          hasGitMetadata: Boolean(payload.gitMeta?.commitSha || payload.gitMeta?.remoteUrl),
+          triggeredVia: payload.triggeredVia,
+          cliVersion: options?.cliVersion,
+        },
+        { controller: this._deploymentAccess }
+      );
+      if (!access.allowed && access.kind === "denied") {
+        throw new DeploymentAccessError(deniedMessage(access));
+      }
+      // A limit is applied further down, after the idempotent external-id short-circuit, so a
+      // re-run that creates nothing is never refused.
+
       let runtime: BuildRuntime;
       try {
         runtime = resolveBuildRuntime(payload.runtime);
@@ -147,6 +203,25 @@ export class InitializeDeploymentService extends BaseService {
         throw new ServiceValidationError("UNMANAGED deployments are not supported");
       }
 
+      const requiredBaseImages = resolveDeployBaseImages(runtime, {
+        base: env.DEPLOY_BASE_IMAGES,
+        buildBase: env.DEPLOY_BUILD_BASE_IMAGES,
+      });
+
+      if (requiredBaseImages && payload.isNativeBuild) {
+        throw new ServiceValidationError(
+          "This instance requires custom deploy base images, which native builds cannot apply. Deploy without --native-build or --local-bundle.",
+          400
+        );
+      }
+
+      if (requiredBaseImages && payload.supportsInstanceBaseImages !== true) {
+        throw new ServiceValidationError(
+          "This instance requires custom deploy base images, which this version of the CLI cannot apply. Upgrade the trigger.dev CLI and deploy again.",
+          400
+        );
+      }
+
       // Upgrade the project to engine "V2" if it's not already. This should cover cases where people deploy to V2 without running dev first.
       if (payload.type === "MANAGED" && environment.project.engine === "V1") {
         await this._prisma.project.update({
@@ -201,7 +276,49 @@ export class InitializeDeploymentService extends BaseService {
         };
       }
 
+      if (!access.allowed) throw new DeploymentAccessError(deniedMessage(access));
+
+      const cardRefusal = await this._cardRefusal(environment.organization);
+      if (cardRefusal) throw new DeploymentAccessError(cardRefusal);
+
       span.setAttribute("outcome", "created");
+
+      const deploymentId = cuid();
+      const encryption = environmentEncryption(this._prisma);
+      const prepared =
+        payload.isNativeBuild && payload.fromBundle
+          ? await encryption.prepareWrite({
+              projectId: environment.projectId,
+              environmentId: environment.id,
+            })
+          : undefined;
+      const context = {
+        environmentId: environment.id,
+        purpose: "build-env-vars" as const,
+        objectId: deploymentId,
+      };
+      // Before cancelling superseded deployments, so an invalid payload leaves them running
+      const encryptedBuildEnvVars = await buildEnvVarsEnvelope(payload, {
+        copyFrom: options?.buildEnvVars,
+        encrypt: (plaintext) => {
+          if (!prepared) throw new Error("Missing prepared build encryption key");
+          return encryption.encrypt(prepared, context, plaintext);
+        },
+        decryptSource: async (value) => {
+          if (!options?.buildEnvVarsSourceId) throw new Error("Missing source deployment identity");
+          return (
+            await encryption.decryptMany([
+              {
+                projectId: environment.projectId,
+                value,
+                context: { ...context, objectId: options.buildEnvVarsSourceId },
+              },
+            ])
+          )[0]!;
+        },
+        maxKeys: env.DEPLOYMENT_BUILD_ENV_VARS_MAX_KEYS,
+        maxBytes: env.DEPLOYMENT_BUILD_ENV_VARS_SIZE_LIMIT_BYTES,
+      });
 
       const canceledDeployments =
         reuse.action === "cancel-then-build"
@@ -255,11 +372,16 @@ export class InitializeDeploymentService extends BaseService {
       const s2StreamOrFail = await deploymentService
         .createEventStream(environment.project, { shortCode: deploymentShortCode })
         .andThen(({ basin, stream }) =>
-          deploymentService.getEventStreamAccessToken(environment.project).map((accessToken) => ({
-            basin,
-            stream,
-            accessToken,
-          }))
+          deploymentService
+            .getEventStreamAccessToken(
+              environment.project,
+              options?.trustedDeploy ? { shortCode: deploymentShortCode } : undefined
+            )
+            .map((accessToken) => ({
+              basin,
+              stream,
+              accessToken,
+            }))
         );
 
       if (s2StreamOrFail.isErr()) {
@@ -283,42 +405,12 @@ export class InitializeDeploymentService extends BaseService {
           }
         : undefined;
 
-      let encryptedBuildEnvVars: Awaited<ReturnType<typeof encryptSecret>> | undefined;
-
-      if (
-        payload.isNativeBuild &&
-        payload.fromBundle &&
-        payload.buildEnvVars &&
-        Object.keys(payload.buildEnvVars).length > 0
-      ) {
-        const buildEnvVars = payload.buildEnvVars;
-
-        const keyCount = Object.keys(buildEnvVars).length;
-        if (keyCount > env.DEPLOYMENT_BUILD_ENV_VARS_MAX_KEYS) {
-          throw new ServiceValidationError(
-            `Build environment variable count (${keyCount}) exceeds the allowed limit of ${env.DEPLOYMENT_BUILD_ENV_VARS_MAX_KEYS}. Reach out to us if you are seeing this error consistently.`
-          );
-        }
-
-        const serialized = JSON.stringify(buildEnvVars);
-        const serializedBytes = Buffer.byteLength(serialized, "utf8");
-        if (serializedBytes > env.DEPLOYMENT_BUILD_ENV_VARS_SIZE_LIMIT_BYTES) {
-          const sizeKB = parseFloat((serializedBytes / 1024).toFixed(1));
-          const limitKB = parseFloat(
-            (env.DEPLOYMENT_BUILD_ENV_VARS_SIZE_LIMIT_BYTES / 1024).toFixed(1)
-          );
-          throw new ServiceValidationError(
-            `Build environment variables size (${sizeKB} KB) exceeds the allowed limit of ${limitKB} KB. Reach out to us if you are seeing this error consistently.`
-          );
-        }
-
-        encryptedBuildEnvVars = await encryptSecret(env.ENCRYPTION_KEY, serialized);
-      }
-
       const buildServerMetadata: BuildServerMetadata | undefined =
-        payload.isNativeBuild || payload.buildId
+        payload.isNativeBuild || payload.buildId || options?.redeployOf
           ? {
               buildId: payload.buildId,
+              trustedDeploy: options?.trustedDeploy,
+              ...(options?.redeployOf ? { redeployOf: options.redeployOf } : {}),
               ...(payload.isNativeBuild
                 ? {
                     isNativeBuild: payload.isNativeBuild,
@@ -380,6 +472,7 @@ export class InitializeDeploymentService extends BaseService {
           });
 
           return {
+            id: deploymentId,
             // Regenerated per attempt: each attempt is a fresh `create` that
             // must satisfy `WorkerDeployment.friendlyId @unique`, so reusing a
             // friendlyId across retries would risk a spurious P2002 on
@@ -409,6 +502,9 @@ export class InitializeDeploymentService extends BaseService {
           archiveGuard: {
             type: environment.type,
           },
+          beforeCreate: prepared?.keyId
+            ? (tx) => encryption.assertWrite(tx, [prepared])
+            : undefined,
         }
       );
 

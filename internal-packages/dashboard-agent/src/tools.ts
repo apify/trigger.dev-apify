@@ -1,6 +1,5 @@
 import type { ToolSet } from "ai";
 import { buildRepoTools } from "./repo-tools";
-import { buildAlertTools } from "./tool-alerts";
 import { buildApiTools } from "./tool-api";
 import { createApiClient } from "./tool-api-client";
 import { buildFeedbackTool } from "./tool-feedback";
@@ -8,7 +7,11 @@ import { createInvestigationRenderer } from "./tool-investigations";
 import { buildLocateTool } from "./tool-locate";
 import { buildNavigationTools } from "./tool-navigation";
 import { createSourceReadLedger } from "./tool-source-ledger";
-import { buildWatchTools } from "./watch-tools";
+import {
+  buildAnalyzeQueryAlertTool,
+  buildMonitoringAlertTools,
+  buildPlanMonitoringTool,
+} from "./tool-monitoring-alerts";
 import type { DashboardAgentToolContext } from "./tool-context";
 
 export type { DashboardAgentToolContext } from "./tool-context";
@@ -38,19 +41,19 @@ export function buildDashboardAgentTools(ctx: DashboardAgentToolContext): ToolSe
     projectRef: ctx.projectRef,
     environmentId: ctx.environmentId,
     investigations: ctx.investigations,
-    watchEnabled: ctx.watchEnabled,
     reads: ledger,
   });
+
+  const alertTools = ctx.alertsEnabled || ctx.toolScope === "alert_creation";
 
   const apiTools: ToolSet = {
     ...buildApiTools({ ctx, client, renderInvestigations, reads: ledger }),
     ...buildNavigationTools({ ctx, environmentIdFor: client.environmentIdFor }),
-    // Alerts exist only to report a watch firing, so they come and go with the watch tool.
-    ...(ctx.watchEnabled
-      ? { ...buildWatchTools({ ctx, reads: ledger }), ...buildAlertTools({ ctx, client }) }
-      : {}),
     ...buildLocateTool({ ctx, client, reads: ledger }),
+    ...(alertTools ? buildMonitoringAlertTools({ ctx, client }) : {}),
     ...buildFeedbackTool({ ctx, client }),
+    ...(alertTools ? buildAnalyzeQueryAlertTool({ ctx, client }) : {}),
+    ...(alertTools ? buildPlanMonitoringTool({ ctx, client }) : {}),
   };
 
   // Code mode: when the project has a connected repo, add the source tools.

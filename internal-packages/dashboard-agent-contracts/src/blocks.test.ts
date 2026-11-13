@@ -302,10 +302,9 @@ describe("actions block", () => {
     intent: { kind: "ask", prompt: "Investigate the send-order-receipt failures." },
   };
 
-  it("round-trips through both schemas", () => {
+  it("still parses a stored watch offer, but the model can't send one", () => {
     const body = { type: "actions", actions: [watchAction, askAction] };
-    const input = viewBlockInputSchema.parse(body);
-    expect(input.type === "actions" && input.actions).toHaveLength(2);
+    expect(viewBlockInputSchema.safeParse(body).success).toBe(false);
     const strict = viewBlockSchema.parse({ ...body, ...envelope });
     expect(strict.type === "actions" && strict.actions[0].intent.kind).toBe("watch");
     expect(parseStoredViewBlock(body).type).toBe("actions");
@@ -673,25 +672,26 @@ describe("investigation evidence refs (the model-facing boundary)", () => {
 describe("host-emitted blocks are not model-facing", () => {
   it("refuses a block the model may not produce, and one that is not in the catalog", () => {
     expect(
-      viewBlockInputSchema.safeParse({
-        type: "watch_result",
-        outcome: "watching",
-        headline: "Watching the email-sends queue.",
-      }).success
-    ).toBe(false);
-    expect(
       viewBlockInputSchema.safeParse({ type: "report", vm: reportVm, asOf: "x" }).success
     ).toBe(false);
     expect(viewBlockInputSchema.safeParse({ type: "timeline", items: [] }).success).toBe(false);
-    // …while the host's own union still takes them.
+  });
+});
+
+describe("alert_created block", () => {
+  const body = {
+    type: "alert_created",
+    alertId: "alert_1",
+    name: "Queue depth above 100",
+    rows: [{ label: "Notifying", value: "Notifying: this chat." }],
+  };
+
+  it("is host-emitted: the model's union refuses it, the host's and the stored ones take it", () => {
+    expect(viewBlockInputSchema.safeParse(body).success).toBe(false);
     expect(
-      viewBlockSchema.safeParse({
-        type: "watch_result",
-        outcome: "watching",
-        headline: "Watching the email-sends queue.",
-        ...envelope,
-      }).success
+      viewBlockSchema.safeParse({ ...body, id: "alert:alert_1", revision: 0, version: 1 }).success
     ).toBe(true);
+    expect(parseStoredViewBlock(body)).toMatchObject({ type: "alert_created", alertId: "alert_1" });
   });
 });
 

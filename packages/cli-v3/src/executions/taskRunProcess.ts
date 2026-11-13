@@ -21,10 +21,16 @@ import { Evt } from "evt";
 import { type ChildProcess, fork } from "node:child_process";
 import { chalkError, chalkGrey, chalkRun, prettyPrintDate } from "../utilities/cliOutput.js";
 
-import { execOptionsForRuntime, execPathForRuntime } from "@trigger.dev/core/v3/build";
+import {
+  execOptionsForRuntime,
+  execPathForRuntime,
+  isBunRuntime,
+} from "@trigger.dev/core/v3/build";
 import { nodeOptionsWithMaxOldSpaceSize } from "@trigger.dev/core/v3/machines";
 import type { InferSocketMessageSchema } from "@trigger.dev/core/v3/zodSocket";
+import type { RunTokenInstallResult } from "@trigger.dev/core/v3/workers";
 import { logger } from "../utilities/logger.js";
+import { type OomKillCounterPaths, readOomKillCountWithin } from "./oomKills.js";
 import {
   CancelledProcessError,
   CleanupProcessError,
@@ -46,6 +52,11 @@ export type OnSetSuspendableMessage = InferSocketMessageSchema<
   "SET_SUSPENDABLE"
 >;
 
+const RUN_TOKEN_INSTALL_ACK_TIMEOUT_MS = 5_000;
+
+// Two small files under /proc and /sys, which read in well under a millisecond.
+const OOM_KILL_COUNTER_TIMEOUT_MS = 100;
+
 export type TaskRunProcessOptions = {
   workerManifest: WorkerManifest;
   serverWorker: ServerBackgroundWorker;
@@ -54,6 +65,12 @@ export type TaskRunProcessOptions = {
   isWarmStart?: boolean;
   cwd?: string;
   gracefulTerminationTimeoutInMs?: number;
+  /**
+   * Where out-of-memory kills of the task process are counted. Set it only where that cgroup holds
+   * no other task process, since any kill counted there is read as this one's. Unset turns the
+   * detection off.
+   */
+  oomKillCounter?: OomKillCounterPaths;
 };
 
 export type TaskRunProcessExecuteParams = {
@@ -79,6 +96,7 @@ export class TaskRunProcess {
   private _isMaxDurationExceeded: boolean = false;
   private _maxDurationInfo?: { maxDurationInSeconds: number; elapsedTimeInSeconds: number };
   private _stderr: Array<string> = [];
+  private _oomKillsAtAttemptStart: number | undefined;
 
   public onTaskRunHeartbeat: Evt<string> = new Evt();
   public onExit: Evt<{ code: number | null; signal: NodeJS.Signals | null; pid?: number }> =
@@ -141,6 +159,7 @@ export class TaskRunProcess {
 
     const fullEnv = {
       ...$env,
+      ...trustStoreEnv(process.env, $env),
       OTEL_IMPORT_HOOK_INCLUDES: workerManifest.otelImportHook?.include?.join(","),
       // TODO: this will probably need to use something different for bun (maybe --preload?)
       NODE_OPTIONS: execOptionsForRuntime(workerManifest.runtime, workerManifest, maxOldSpaceSize),
@@ -156,11 +175,16 @@ export class TaskRunProcess {
       cwd,
     });
 
+    // bun accepts --no-warnings but rejects node's --no-warnings=<type> form at startup
+    const noWarningsFlag = isBunRuntime(workerManifest.runtime)
+      ? "--no-warnings"
+      : "--no-warnings=ExperimentalWarning";
+
     this._child = fork(workerManifest.workerEntryPoint, executorArgs(workerManifest), {
       stdio: [/*stdin*/ "ignore", /*stdout*/ "pipe", /*stderr*/ "pipe", "ipc"],
       cwd,
       env: fullEnv,
-      execArgv: ["--trace-uncaught", "--no-warnings=ExperimentalWarning"],
+      execArgv: ["--trace-uncaught", noWarningsFlag],
       execPath: execPathForRuntime(workerManifest.runtime),
       serialization: "json",
     });
@@ -278,6 +302,9 @@ export class TaskRunProcess {
       resolver = resolve;
       rejecter = reject;
     });
+    // The child can exit while this method is still awaiting below, before the promise is awaited.
+    // Handled here so that is not an unhandled rejection; the await at the end still throws it.
+    promise.catch(() => {});
 
     const key = attemptKey(params.payload.execution);
 
@@ -289,6 +316,16 @@ export class TaskRunProcess {
     const { execution, traceContext, metrics } = params.payload;
 
     this._currentExecution = execution;
+
+    // Read before the attempt is dispatched, so a kill straight after it is not in the baseline.
+    // A read that does not finish in time leaves detection off for this attempt.
+    this._oomKillsAtAttemptStart = undefined;
+    if (this.options.oomKillCounter) {
+      this._oomKillsAtAttemptStart = await readOomKillCountWithin(
+        this.options.oomKillCounter,
+        OOM_KILL_COUNTER_TIMEOUT_MS
+      );
+    }
 
     if (this._child?.connected && !this._isBeingKilled && !this._child.killed) {
       logger.debug(
@@ -331,6 +368,32 @@ export class TaskRunProcess {
     return this._currentExecution !== undefined;
   }
 
+  /** Never throws, and never surfaces IPC errors: they can describe a payload carrying the token. */
+  async installRunToken(update: {
+    runId: string;
+    attemptNumber: number;
+    token: string;
+  }): Promise<RunTokenInstallResult> {
+    if (!this._ipc || !this._child?.connected || this.isBeingKilled) {
+      return { result: "failure", reason: "no_child" };
+    }
+
+    try {
+      const ack = await this._ipc.sendWithAck(
+        "UPDATE_RUN_TOKEN",
+        update,
+        RUN_TOKEN_INSTALL_ACK_TIMEOUT_MS
+      );
+      if (!ack) return { result: "failure", reason: "unsupported" };
+      return ack.installed
+        ? { result: "success" }
+        : { result: "failure", reason: "identity_mismatch" };
+    } catch (error) {
+      const timedOut = typeof error === "string" && error.includes("sendWithAck() timeout");
+      return { result: "failure", reason: timedOut ? "ack_timeout" : "ipc_error" };
+    }
+  }
+
   waitpointCompleted(waitpoint: CompletedWaitpoint) {
     if (!this._child?.connected || this._isBeingKilled || this._child.killed) {
       console.error(
@@ -365,6 +428,8 @@ export class TaskRunProcess {
 
   async #handleExit(code: number | null, signal: NodeJS.Signals | null) {
     logger.debug("handling child exit", { code, signal, pid: this.pid });
+
+    const killedForMemory = signal === "SIGKILL" && (await this.#oomKilledSinceAttemptStart());
 
     // Go through all the attempts currently pending and reject them
     for (const [id, status] of this._attemptStatuses.entries()) {
@@ -411,12 +476,11 @@ export class TaskRunProcess {
             rejecter(new CleanupProcessError());
           }
         } else {
+          const stderr = this._stderr.length ? this._stderr.join("\n") : undefined;
           rejecter(
-            new UnexpectedExitError(
-              code ?? -1,
-              signal,
-              this._stderr.length ? this._stderr.join("\n") : undefined
-            )
+            killedForMemory
+              ? new OutOfMemoryKillError(code ?? -1, signal, stderr)
+              : new UnexpectedExitError(code ?? -1, signal, stderr)
           );
         }
       }
@@ -425,6 +489,22 @@ export class TaskRunProcess {
     logger.debug("Task run process exited, posting onExit", { code, signal, pid: this.pid });
 
     this.onExit.post({ code, signal, pid: this.pid });
+  }
+
+  /**
+   * The kernel counts an out-of-memory kill in the cgroup the child shares with this process, so
+   * a SIGKILL that came with a new count was the out-of-memory killer, not another sender.
+   */
+  async #oomKilledSinceAttemptStart(): Promise<boolean> {
+    const before = this._oomKillsAtAttemptStart;
+    if (before === undefined || !this.options.oomKillCounter) {
+      return false;
+    }
+    const after = await readOomKillCountWithin(
+      this.options.oomKillCounter,
+      OOM_KILL_COUNTER_TIMEOUT_MS
+    );
+    return after !== undefined && after > before;
   }
 
   #handleLog(data: Buffer) {
@@ -572,6 +652,13 @@ export class TaskRunProcess {
       };
     }
 
+    if (error instanceof OutOfMemoryKillError) {
+      return {
+        ...internalErrorFromUnexpectedExit(error, dockerMode),
+        code: TaskRunErrorCodes.TASK_PROCESS_OOM_KILLED,
+      };
+    }
+
     if (error instanceof UnexpectedExitError) {
       return internalErrorFromUnexpectedExit(error, dockerMode);
     }
@@ -604,6 +691,35 @@ export class TaskRunProcess {
       message: String(error),
     };
   }
+}
+
+/** A child the kernel's out-of-memory killer ended. */
+class OutOfMemoryKillError extends UnexpectedExitError {
+  constructor(code: number, signal: NodeJS.Signals | null, stderr: string | undefined) {
+    super(code, signal, stderr);
+    this.name = "OutOfMemoryKillError";
+  }
+}
+
+const TRUST_STORE_ENV_KEYS = [
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "REQUESTS_CA_BUNDLE",
+  "PIP_CERT",
+] as const;
+
+export function trustStoreEnv(
+  controllerEnv: NodeJS.ProcessEnv,
+  runEnv: Record<string, string | undefined>
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of TRUST_STORE_ENV_KEYS) {
+    const value = runEnv[key] ?? controllerEnv[key];
+    if (value) {
+      env[key] = value;
+    }
+  }
+  return env;
 }
 
 function executorArgs(workerManifest: WorkerManifest): string[] {

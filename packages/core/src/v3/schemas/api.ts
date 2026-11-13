@@ -2,6 +2,7 @@ import { z } from "zod/v4";
 import { discriminatedUnion } from "../utils/zod.js";
 import { DeserializedJsonSchema } from "../../schemas/json.js";
 import { EXTERNAL_DEPLOYMENT_ID_MAX_LENGTH } from "../externalDeploymentId.js";
+import { CONCURRENCY_LIMIT_NAME_PATTERN } from "../isomorphic/queueName.js";
 import {
   FlushedRunMetadata,
   GitMeta,
@@ -298,32 +299,84 @@ export type IdempotencyKeyOptionsSchema = z.infer<typeof IdempotencyKeyOptionsSc
 const ConcurrencyKeySchema = z.union([z.string(), z.number()]).transform((value) => String(value));
 
 /**
+ * A key per limit: `default` is the run's own `concurrencyKey`, and every other entry
+ * names a limit and gives that limit its own key for this run. A server that does not
+ * know this form rejects it rather than keying those limits by `default`.
+ */
+const ConcurrencyKeyMapSchema = z
+  /** The record parse drops an own `__proto__` entry, which would key that limit by `default`. */
+  .custom<Record<string, unknown>>((keys) => !Object.hasOwn(keys ?? {}, "__proto__"), {
+    message: "concurrencyKey entries can't be named `__proto__`",
+  })
+  .pipe(z.record(z.string(), ConcurrencyKeySchema))
+  .superRefine((keys, ctx) => {
+    if (!keys.default) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "concurrencyKey needs a `default` key: runs are queued and scheduled fairly per default key, and limits without their own entry use it",
+      });
+    }
+    for (const [name, key] of Object.entries(keys)) {
+      if (name === "default") {
+        continue;
+      }
+      if (!CONCURRENCY_LIMIT_NAME_PATTERN.test(name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message:
+            "concurrencyKey entries other than `default` are concurrency limit names: 1-122 characters using only letters, numbers, underscores and hyphens",
+        });
+      }
+      if (key.length < 1 || key.length > 128) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [name],
+          message: "A concurrency limit's key must be 1-128 characters",
+        });
+      }
+    }
+  });
+
+const TriggerConcurrencyKeySchema = z.union([ConcurrencyKeySchema, ConcurrencyKeyMapSchema]);
+
+/**
  * Trigger-time named concurrency limits. The charset rule matches what the queue
  * concern enforces, so a bad name is a uniform up-front 400 on every path instead
  * of a late validation error after the request (or earlier batch items) succeeded.
  */
 const TriggerConcurrencyLimitsSchema = z
   .string()
-  .regex(/^[a-zA-Z0-9_-]{1,122}$/, {
+  .regex(CONCURRENCY_LIMIT_NAME_PATTERN, {
     message:
       "Concurrency limit names are 1-122 characters using only letters, numbers, underscores and hyphens",
   })
   .array()
   .max(2);
 
-const ExternalDeploymentId = z.preprocess((value) => {
-  // `null` is the opt-out sentinel callers write; treat it as absent, not a validation error.
-  if (value === null) {
-    return undefined;
-  }
+const ExternalDeploymentId = z.preprocess(
+  (value) => {
+    // `null` is the opt-out sentinel callers write; treat it as absent, not a validation error.
+    if (value === null) {
+      return undefined;
+    }
 
-  if (typeof value !== "string") {
-    return value;
-  }
+    if (typeof value !== "string") {
+      return value;
+    }
 
-  const trimmed = value.trim();
-  return trimmed === "" ? undefined : trimmed;
-}, z.string().max(EXTERNAL_DEPLOYMENT_ID_MAX_LENGTH, `externalId must be at most ${EXTERNAL_DEPLOYMENT_ID_MAX_LENGTH} characters`).optional()) as unknown as z.ZodOptional<z.ZodString>;
+    const trimmed = value.trim();
+    return trimmed === "" ? undefined : trimmed;
+  },
+  z
+    .string()
+    .max(
+      EXTERNAL_DEPLOYMENT_ID_MAX_LENGTH,
+      `externalId must be at most ${EXTERNAL_DEPLOYMENT_ID_MAX_LENGTH} characters`
+    )
+    .optional()
+) as unknown as z.ZodOptional<z.ZodString>;
 
 export const TriggerTaskRequestBody = z
   .object({
@@ -382,7 +435,7 @@ export const TriggerTaskRequestBody = z
           .max(3)
           .optional(),
         concurrency: TriggerConcurrencyLimitsSchema.optional(),
-        concurrencyKey: ConcurrencyKeySchema.optional(),
+        concurrencyKey: TriggerConcurrencyKeySchema.optional(),
         delay: z.string().or(z.coerce.date()).optional(),
         idempotencyKey: z
           .string()
@@ -459,7 +512,7 @@ export const BatchTriggerTaskItem = z.object({
   context: z.any().optional(),
   options: z
     .object({
-      concurrencyKey: ConcurrencyKeySchema.optional(),
+      concurrencyKey: TriggerConcurrencyKeySchema.optional(),
       delay: z.string().or(z.coerce.date()).optional(),
       idempotencyKey: z
         .string()
@@ -739,6 +792,21 @@ export const BuildServerMetadata = z.object({
   configFilePath: z.string().optional(),
   skipEnqueue: z.boolean().optional(),
   fromBundle: z.boolean().optional(),
+  // Short code of the deployment this one was redeployed from.
+  redeployOf: z.string().optional(),
+  trustedDeploy: z
+    .object({
+      grantId: z.string(),
+      issuer: z.string(),
+      subject: z.string(),
+      repository: z.string(),
+      repositoryId: z.string(),
+      repositoryOwnerId: z.string(),
+      runId: z.string(),
+      runAttempt: z.string(),
+      workflowRef: z.string(),
+    })
+    .optional(),
 });
 
 export type BuildServerMetadata = z.infer<typeof BuildServerMetadata>;
@@ -838,6 +906,15 @@ export const CreateArtifactResponseBody = z.object({
 
 export type CreateArtifactResponseBody = z.infer<typeof CreateArtifactResponseBody>;
 
+export const DeployBaseImageRef = z.string().regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/);
+
+export const DeployBaseImages = z.object({
+  base: DeployBaseImageRef.optional(),
+  buildBase: DeployBaseImageRef.optional(),
+});
+
+export type DeployBaseImages = z.infer<typeof DeployBaseImages>;
+
 export const InitializeDeploymentResponseBody = z.object({
   id: z.string(),
   contentHash: z.string(),
@@ -849,6 +926,7 @@ export const InitializeDeploymentResponseBody = z.object({
   outcome: z.enum(["created", "existing"]).optional(),
   isPromoted: z.boolean().optional(),
   externalBuildData: ExternalBuildData.optional().nullable(),
+  baseImages: DeployBaseImages.optional(),
   canceledDeployments: z.array(z.object({ version: z.string(), shortCode: z.string() })).optional(),
   eventStream: z
     .object({
@@ -877,6 +955,7 @@ const InitializeDeploymentRequestBodyBase = z.object({
   buildId: z.string().optional(),
   externalId: ExternalDeploymentId,
   force: z.boolean().optional(),
+  supportsInstanceBaseImages: z.boolean().optional(),
 });
 type BaseOutput = z.output<typeof InitializeDeploymentRequestBodyBase>;
 
@@ -1027,6 +1106,7 @@ export const GetDeploymentResponseBody = z.object({
    */
   externalId: z.string().optional(),
   externalBuildData: ExternalBuildData.optional().nullable(),
+  baseImages: DeployBaseImages.optional(),
   errorData: DeploymentErrorData.nullish(),
   canceledReason: z.string().nullish(),
   worker: z
@@ -1192,6 +1272,44 @@ export const DevDisconnectResponseBody = z.object({
 export type DevDisconnectResponseBody = z.infer<typeof DevDisconnectResponseBody>;
 
 export type CreateUploadPayloadUrlResponseBody = z.infer<typeof CreateUploadPayloadUrlResponseBody>;
+
+export const ReplayRunRequestBody = z
+  .strictObject({
+    payload: z.unknown().optional(),
+    /**
+     * How `payload` is encoded. `application/super+json` means `payload` is a SuperJSON
+     * string, which keeps types like `Date` and `BigInt`. Defaults to plain JSON.
+     */
+    payloadType: z.enum(["application/json", "application/super+json"]).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    tags: RunTags.optional(),
+    queue: z.string().optional(),
+    concurrencyKey: ConcurrencyKeySchema.optional(),
+    machine: MachinePresetName.optional(),
+    version: z.string().optional(),
+    region: z.string().optional(),
+    delay: z.string().or(z.coerce.date()).optional(),
+    ttl: z.string().or(z.number().nonnegative().int()).optional(),
+    idempotencyKey: z
+      .string()
+      .max(2048, "idempotencyKey must be 2048 characters or less")
+      .optional(),
+    idempotencyKeyTTL: z.string().optional(),
+    maxAttempts: z.number().int().min(1).optional(),
+    maxDuration: z.number().nonnegative().optional(),
+    priority: z.number().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.payloadType === "application/super+json" && typeof value.payload !== "string") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "payload must be a SuperJSON string when payloadType is application/super+json",
+        path: ["payload"],
+      });
+    }
+  });
+
+export type ReplayRunRequestBody = z.input<typeof ReplayRunRequestBody>;
 
 export const ReplayRunResponse = z.object({
   id: z.string(),
@@ -2416,6 +2534,43 @@ export const RetrieveRunTraceResponseBody = z.object({
 });
 
 export type RetrieveRunTraceResponseBody = z.infer<typeof RetrieveRunTraceResponseBody>;
+
+export const RetrieveRunTracePageSpan = z.object({
+  id: z.string(),
+  parentId: z.string().optional(),
+  runId: z.string(),
+  message: z.string(),
+  startTime: z.coerce.date(),
+  duration: z.number(),
+  isError: z.boolean(),
+  isPartial: z.boolean(),
+  isCancelled: z.boolean(),
+  level: z.string(),
+  attemptNumber: z.number().optional(),
+});
+
+export type RetrieveRunTracePageSpan = z.infer<typeof RetrieveRunTracePageSpan>;
+
+export const RetrieveRunTraceAttemptFailure = z.object({
+  spanId: z.string(),
+  attemptNumber: z.number(),
+  runId: z.string(),
+});
+
+export type RetrieveRunTraceAttemptFailure = z.infer<typeof RetrieveRunTraceAttemptFailure>;
+
+export const RetrieveRunTracePageResponseBody = z.object({
+  data: z.array(RetrieveRunTracePageSpan),
+  attemptFailures: z.array(RetrieveRunTraceAttemptFailure),
+  pagination: z.object({
+    next: z.string().optional(),
+    // Some spans or records were left out: paging stopped early (e.g. an emergency cap)
+    // or a span had more records than one read allows.
+    truncated: z.boolean().optional(),
+  }),
+});
+
+export type RetrieveRunTracePageResponseBody = z.infer<typeof RetrieveRunTracePageResponseBody>;
 
 export const RetrieveSpanDetailResponseBody = z.object({
   spanId: z.string(),

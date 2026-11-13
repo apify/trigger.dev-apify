@@ -1,11 +1,13 @@
 import type { ModelMessage, UIMessage } from "ai";
-import { PENDING_MESSAGE_INJECTED_TYPE } from "./ai-shared.js";
+import { BACKGROUND_INJECTION_TYPE, PENDING_MESSAGE_INJECTED_TYPE } from "./ai-shared.js";
 
 /** Private model forms, keyed by the durable UI injection marker. */
 export type SteeringInjection = {
   id: string;
   messageIds: string[];
   messages: ModelMessage[];
+  /** `background` for `chat.inject` drained mid-turn; absent means steering. */
+  kind?: "steering" | "background";
   /** Inputs removed by snapshot retention, not an explicit history edit. */
   trimmedMessageIds?: string[];
 };
@@ -20,21 +22,33 @@ type StepInput = {
  * override and append only the newly completed response messages. The same
  * logic works when the installed AI SDK already retains overrides: its input
  * is not concatenated again. State belongs to one generation, not one turn.
+ *
+ * Response messages can already be in the input an override was retained from:
+ * tool calls approved before the first step (a head-start handover) are executed
+ * up front, and their results open both that input and every later step's
+ * response messages. Those are skipped, so each result is sent once.
  */
 export function retainStepMessages<T extends StepInput, R extends { messages?: ModelMessage[] }>(
   prepare: (input: T) => Promise<R | undefined>
 ): (input: T) => Promise<R | undefined> {
   let retained: ModelMessage[] | undefined;
+  let retainedFrom: ModelMessage[] | undefined;
   let responseCount = 0;
   let previousSteps = -1;
   return async (input) => {
     if (input.steps.length <= previousSteps) {
       retained = undefined;
+      retainedFrom = undefined;
       responseCount = 0;
     }
     const responses = input.steps.at(-1)?.response.messages ?? [];
+    if (retainedFrom) {
+      responseCount += alreadyIncluded(retainedFrom, responses.slice(responseCount));
+      retainedFrom = undefined;
+    }
     const messages = retained ? [...retained, ...responses.slice(responseCount)] : input.messages;
     const result = await prepare({ ...input, messages });
+    if (!retained && result?.messages) retainedFrom = input.messages;
     retained = result?.messages ?? (retained ? messages : undefined);
     responseCount = responses.length;
     previousSteps = input.steps.length;
@@ -42,16 +56,49 @@ export function retainStepMessages<T extends StepInput, R extends { messages?: M
   };
 }
 
+/** How many of `next` already end `input`, as the longest overlap. */
+function alreadyIncluded(input: ModelMessage[], next: ModelMessage[]): number {
+  const same = (a: ModelMessage, b: ModelMessage) =>
+    a === b || JSON.stringify(a) === JSON.stringify(b);
+  for (let count = Math.min(input.length, next.length); count > 0; count--) {
+    const tail = input.slice(input.length - count);
+    if (tail.every((message, i) => same(message, next[i]!))) return count;
+  }
+  return 0;
+}
+
+const isInjectionMarker = (part: { type: string }) =>
+  part.type === PENDING_MESSAGE_INJECTED_TYPE || part.type === BACKGROUND_INJECTION_TYPE;
+
+/** Drop injection marker parts; only the agent's own assistant messages carry them. */
+export function withoutInjectionMarkers<T extends UIMessage>(message: T): T {
+  return message.parts.some(isInjectionMarker)
+    ? { ...message, parts: message.parts.filter((part) => !isInjectionMarker(part)) }
+    : message;
+}
+
+/** Injection markers, read from assistant messages only. */
 export function steeringMarkers(messages: readonly UIMessage[]) {
   return messages.flatMap((message) =>
-    message.parts.flatMap((part) => {
-      if (part.type !== PENDING_MESSAGE_INJECTED_TYPE) return [];
+    (message.role === "assistant" ? message.parts : []).flatMap((part) => {
+      if (part.type !== PENDING_MESSAGE_INJECTED_TYPE && part.type !== BACKGROUND_INJECTION_TYPE)
+        return [];
       const p = part as {
         id?: string;
         data?: { messageIds?: string[]; messages?: Array<{ id: string; text: string }> };
       };
       return typeof p.id === "string" && Array.isArray(p.data?.messageIds)
-        ? [{ id: p.id, messageIds: p.data.messageIds, messages: p.data.messages ?? [] }]
+        ? [
+            {
+              id: p.id,
+              messageIds: p.data.messageIds,
+              messages: p.data.messages ?? [],
+              kind:
+                part.type === BACKGROUND_INJECTION_TYPE
+                  ? ("background" as const)
+                  : ("steering" as const),
+            },
+          ]
         : [];
     })
   );

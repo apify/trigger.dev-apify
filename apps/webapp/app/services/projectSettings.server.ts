@@ -1,7 +1,12 @@
 import { type PrismaClient } from "@trigger.dev/database";
 import { prisma } from "~/db.server";
 import { DeleteProjectService } from "~/services/deleteProject.server";
-import { BranchTrackingConfigSchema, type BranchTrackingConfig } from "~/v3/github";
+import {
+  BranchTrackingConfigSchema,
+  BuildFiltersSchema,
+  type BranchTrackingConfig,
+  type BuildFilters,
+} from "~/v3/github";
 import { checkGitHubBranchExists } from "~/services/gitHub.server";
 import { errAsync, fromPromise, okAsync, ResultAsync } from "neverthrow";
 import { type BuildSettings } from "~/v3/buildSettings";
@@ -126,7 +131,8 @@ export class ProjectSettingsService {
     projectId: string,
     productionBranch?: string,
     stagingBranch?: string,
-    previewDeploymentsEnabled?: boolean
+    previewDeploymentsEnabled?: boolean,
+    buildFilters?: Partial<BuildFilters>
   ) {
     const getExistingConnectedRepo = () =>
       fromPromise(
@@ -214,6 +220,7 @@ export class ProjectSettingsService {
       productionBranch: string | undefined;
       stagingBranch: string | undefined;
       previewDeploymentsEnabled: boolean | undefined;
+      buildFilters: Partial<BuildFilters> | undefined;
     }) =>
       fromPromise(
         this.#prismaClient.connectedGithubRepository.update({
@@ -226,6 +233,7 @@ export class ProjectSettingsService {
               staging: data.stagingBranch ? { branch: data.stagingBranch } : {},
             } satisfies BranchTrackingConfig,
             previewDeploymentsEnabled: data.previewDeploymentsEnabled,
+            buildFilters: data.buildFilters,
           },
         }),
         (error) => ({ type: "other" as const, cause: error })
@@ -251,14 +259,17 @@ export class ProjectSettingsService {
                 })
               : okAsync(oldStagingBranch),
             this.isPreviewEnvironmentEnabled(projectId),
-          ])
+          ]).map(([productionBranch, stagingBranch, previewEnvironmentEnabled]) => ({
+            productionBranch,
+            stagingBranch,
+            previewDeploymentsEnabled: previewDeploymentsEnabled && previewEnvironmentEnabled,
+            buildFilters: buildFilters && {
+              ...BuildFiltersSchema.safeParse(connectedRepo.buildFilters ?? {}).data,
+              ...buildFilters,
+            },
+          }))
         );
       })
-      .map(([productionBranch, stagingBranch, previewEnvironmentEnabled]) => ({
-        productionBranch,
-        stagingBranch,
-        previewDeploymentsEnabled: previewDeploymentsEnabled && previewEnvironmentEnabled,
-      }))
       .andThen(updateConnectedRepo);
   }
 

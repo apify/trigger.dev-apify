@@ -3,10 +3,17 @@ import {
   parseNaturalLanguageDuration,
 } from "@trigger.dev/core/v3/isomorphic";
 import type { TaskRunError } from "@trigger.dev/core/v3/schemas";
+import { tryCatch } from "@trigger.dev/core/utils";
+import { toWireRoute, type SnapshotRouteWire } from "@internal/run-store";
 import type { MinimalAuthenticatedEnvironment } from "../../shared/index.js";
 import type { EnqueueSystem } from "./enqueueSystem.js";
-import type { ExecutionSnapshotSystem } from "./executionSnapshotSystem.js";
+import {
+  getLatestExecutionSnapshot,
+  type ExecutionSnapshotSystem,
+  type PreviousSnapshot,
+} from "./executionSnapshotSystem.js";
 import type { SystemResources } from "./systems.js";
+import { classifyWaitpointCoordinator } from "../waitpointCoordinator/routing.js";
 
 import { boundedIn } from "@trigger.dev/database";
 export type PendingVersionSystemOptions = {
@@ -29,7 +36,22 @@ export type PendingVersionSystemOptions = {
    */
   lagMaxRetries?: number;
   externalDeploymentParkDeadlineMs?: number;
+  finalizationGuardDelayMs?: number;
   executionSnapshotSystem: ExecutionSnapshotSystem;
+  /**
+   * Resolve a run's associated RUN waitpoint id (legacy row or store-derived). Injected as a thunk into
+   * WaitpointSystem, which is constructed after this system. Absent in a bare test harness — then park
+   * expiry falls back to the Postgres associated-waitpoint id, its pre-store behaviour.
+   */
+  resolveAssociatedRunWaitpointId?: (params: {
+    runId: string;
+    legacyAssociatedWaitpointId?: string;
+    organizationId?: string;
+  }) => Promise<string | undefined>;
+  /** Check the same organisation flag before constructing association-discovery work. */
+  waitpointStoreEnabled?: (organizationId?: string) => boolean | Promise<boolean>;
+  /** Uses the same late-bound WaitpointSystem as association resolution; bare harnesses stay legacy. */
+  serializeRunError?: (waitpointId: string, error: unknown) => string;
 };
 
 const DEFAULT_LAG_RETRY_DELAY_MS = 5_000;
@@ -214,6 +236,16 @@ export class PendingVersionSystem {
 
       const stillDelayed = run.delayUntil !== null && run.delayUntil > now;
 
+      const snapshotRoute = await this.#snapshotRouteBeforeTransaction(
+        run.id,
+        backgroundWorker.runtimeEnvironment.organization.id
+      );
+      await this.#settlePendingUnitBeforeTransaction(run.id, snapshotRoute);
+      const previousSnapshot = await this.#latestSnapshotBeforeTransaction(
+        run.id,
+        backgroundWorker.runtimeEnvironment.organization.id
+      );
+
       // Atomic unit: the status promotion and the new QUEUED snapshot must commit together
       // or a crash between them leaves the run promoted-to-PENDING with no snapshot. Under the run-ops
       // split these route to the run's owning DB but, as two router calls, would each auto-commit.
@@ -240,6 +272,8 @@ export class PendingVersionSystem {
             {
               run: { id: run.id, status: "DELAYED" },
               snapshot: { executionStatus: "DELAYED", description: "Run is delayed" },
+              snapshotRoute,
+              previousSnapshot,
               batchId: run.batchId ?? undefined,
               environmentId: backgroundWorker.runtimeEnvironment.id,
               environmentType: backgroundWorker.runtimeEnvironment.type,
@@ -257,6 +291,8 @@ export class PendingVersionSystem {
         await this.enqueueSystem.enqueueRun({
           run: updatedRun,
           env: backgroundWorker.runtimeEnvironment,
+          snapshotRoute,
+          previousSnapshot,
           store,
           tx,
           // PENDING_VERSION re-enqueue is the first time this run is actually
@@ -511,6 +547,39 @@ export class PendingVersionSystem {
 
     const now = new Date();
 
+    // Resolve the associated waitpoint id BEFORE the terminal commit. Discovery is deterministic (the run
+    // anchor + the monotonic org signal) and does not need the run to be expired, so doing it here means a
+    // MemoryDB lookup failure rejects the job while the run is still PENDING_VERSION and the redelivery
+    // re-runs it. Resolving after the commit would strand the parent: the retry's status guard sees EXPIRED
+    // and returns before the waitpoint is ever completed. A parked child of a redis-primary parent can hold
+    // a store RUN waitpoint (no Postgres row); fall back to the legacy row id when the store is not wired.
+    const parkedWaitpointId =
+      run.associatedWaitpoint?.id ??
+      (this.options.resolveAssociatedRunWaitpointId &&
+      this.options.waitpointStoreEnabled &&
+      (await this.options.waitpointStoreEnabled(run.organizationId ?? undefined))
+        ? await this.options.resolveAssociatedRunWaitpointId({
+            runId,
+            organizationId: run.organizationId ?? undefined,
+          })
+        : undefined);
+
+    // The expiry retry skips terminal runs. Keep the existing finalization job durable before
+    // committing a native child's expiry, so a lost finishWaitpoint enqueue cannot strand its parent.
+    const needsFinalizationGuard =
+      parkedWaitpointId &&
+      this.options.waitpointStoreEnabled &&
+      classifyWaitpointCoordinator(parkedWaitpointId) === "store" &&
+      (await this.options.waitpointStoreEnabled(run.organizationId ?? undefined));
+    if (needsFinalizationGuard) {
+      await this.$.worker.enqueue({
+        id: `ensureRunFinalized:${runId}`,
+        job: "ensureRunFinalized",
+        payload: { runId },
+        availableAt: new Date(Date.now() + (this.options.finalizationGuardDelayMs ?? 60_000)),
+      });
+    }
+
     const result = await this.$.runStore.expireParkedRun(
       runId,
       {
@@ -536,13 +605,20 @@ export class PendingVersionSystem {
       return;
     }
 
-    if (run.associatedWaitpoint) {
+    if (parkedWaitpointId) {
       await this.$.worker.enqueue({
-        id: `finishWaitpoint.externalDeploymentPark.${run.associatedWaitpoint.id}`,
+        id: `finishWaitpoint.externalDeploymentPark.${parkedWaitpointId}`,
         job: "finishWaitpoint",
         payload: {
-          waitpointId: run.associatedWaitpoint.id,
-          error: JSON.stringify(error),
+          waitpointId: parkedWaitpointId,
+          organizationId: run.organizationId ?? undefined,
+          error:
+            this.options.waitpointStoreEnabled &&
+            classifyWaitpointCoordinator(parkedWaitpointId) === "store" &&
+            (await this.options.waitpointStoreEnabled(run.organizationId ?? undefined))
+              ? (this.options.serializeRunError?.(parkedWaitpointId, error) ??
+                JSON.stringify(error))
+              : JSON.stringify(error),
         },
       });
     }
@@ -590,6 +666,13 @@ export class PendingVersionSystem {
   }): Promise<boolean> {
     const stillDelayed = run.delayUntil !== null && run.delayUntil > new Date();
 
+    const snapshotRoute = await this.#snapshotRouteBeforeTransaction(run.id, env.organization.id);
+    await this.#settlePendingUnitBeforeTransaction(run.id, snapshotRoute);
+    const previousSnapshot = await this.#latestSnapshotBeforeTransaction(
+      run.id,
+      env.organization.id
+    );
+
     const promoted = await this.$.runStore.runInTransaction(run.id, async (store, tx) => {
       const updateResult = await store.promotePendingVersionRuns(
         run.id,
@@ -613,6 +696,8 @@ export class PendingVersionSystem {
           {
             run: { id: run.id, status: "DELAYED" },
             snapshot: { executionStatus: "DELAYED", description: "Run is delayed" },
+            snapshotRoute,
+            previousSnapshot,
             batchId: run.batchId ?? undefined,
             environmentId: env.id,
             environmentType: env.type,
@@ -630,6 +715,8 @@ export class PendingVersionSystem {
       await this.enqueueSystem.enqueueRun({
         run: updatedRun,
         env,
+        snapshotRoute,
+        previousSnapshot,
         store,
         tx,
         includeTtl: true,
@@ -667,6 +754,42 @@ export class PendingVersionSystem {
     });
 
     return true;
+  }
+
+  // The run's snapshot route, read BEFORE runInTransaction opens and passed to the snapshot write
+  // inside it. Without a route the snapshot store resolves the run's residency itself from inside the
+  // transaction, with a read on the pooled writer client the transaction already holds a connection
+  // from, so concurrent promotions can exhaust the pool and every transaction times out. The read is
+  // the same one, moved out of the transaction; without the snapshot store it is a no-op.
+  async #snapshotRouteBeforeTransaction(
+    runId: string,
+    organizationId: string
+  ): Promise<SnapshotRouteWire | undefined> {
+    const route = await this.$.runStore.readSnapshotRoute(runId, organizationId);
+    return route ? toWireRoute(route) : undefined;
+  }
+
+  // Only an ordering floor for the promotion's snapshot, so a failed read promotes without one.
+  async #latestSnapshotBeforeTransaction(
+    runId: string,
+    organizationId: string
+  ): Promise<PreviousSnapshot | undefined> {
+    const [error, snapshot] = await tryCatch(
+      getLatestExecutionSnapshot(this.$.prisma, runId, this.$.runStore, undefined, organizationId)
+    );
+    return error ? undefined : snapshot;
+  }
+
+  // The promotion publishes the run to the queue inside its transaction, and a rollback does not undo
+  // that publish. An earlier snapshot unit still pending would make the transaction's prepare busy and
+  // roll it back after the publish, so settle it first. Only a run with MemoryDB residency can have one.
+  async #settlePendingUnitBeforeTransaction(
+    runId: string,
+    route: SnapshotRouteWire | undefined
+  ): Promise<void> {
+    if (route?.residency === "mirrored" || route?.residency === "redis-primary") {
+      await this.$.runStore.settlePendingUnit(runId);
+    }
   }
 
   async #findDeployedWorkerForExternalId(

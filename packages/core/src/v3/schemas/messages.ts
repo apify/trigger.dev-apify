@@ -47,6 +47,8 @@ export const indexerToWorkerMessages = {
   WEBHOOKS_FAILED_TO_INDEX: z.object({
     version: z.literal("v1").default("v1"),
     collisions: z.array(z.object({ id: z.string(), filePaths: z.array(z.string()) })),
+    /** Subscribers that reference an undefined endpoint, or reuse a subscriber id on one endpoint. */
+    problems: z.array(z.string()).default([]),
   }),
   UNCAUGHT_EXCEPTION: UncaughtExceptionMessage,
 };
@@ -120,5 +122,15 @@ export const WorkerToExecutorMessageCatalog = {
       version: z.literal("v1").default("v1"),
       waitpoint: CompletedWaitpoint,
     }),
+  },
+  /** Replaces TRIGGER_RUN_TOKEN, but only while the process is still executing this run attempt. */
+  UPDATE_RUN_TOKEN: {
+    message: z.object({
+      runId: z.string(),
+      attemptNumber: z.number().int(),
+      token: z.string(),
+    }),
+    // Children without a handler ack with no payload, which callers must treat as not installed.
+    callback: z.object({ installed: z.boolean() }).optional(),
   },
 };

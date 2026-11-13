@@ -491,6 +491,17 @@ export type LatestExecutionSnapshotRead = Prisma.TaskRunExecutionSnapshotGetPayl
 }> & { completedWaitpoints: SnapshotReadWaitpoint[] };
 
 export interface RunStore {
+  /** Canonical configured owning database, including declared shard aliases. No I/O. */
+  getWaitpointKeyScope(ownerId?: string): string;
+
+  /** Isolated writer lane for enabled keyed creation; never borrows the ordinary pool. */
+  runInWaitpointKeyTransaction<R>(
+    ownerId: string | undefined,
+    organizationId: string,
+    acceptUntil: number,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
+  ): Promise<R>;
+
   /**
    * Run a co-resident multi-write unit atomically on the store that OWNS `runId`. The callback gets
    * the owning `RunStore` plus a `tx` opened on THAT store's OWN client; passing `tx` to the inner
@@ -520,7 +531,12 @@ export interface RunStore {
   // Attempt lifecycle
   startAttempt<S extends Prisma.TaskRunSelect>(
     runId: string,
-    data: { attemptNumber: number; executedAt?: Date; isWarmStart: boolean },
+    data: {
+      attemptNumber: number;
+      executedAt?: Date;
+      isWarmStart: boolean;
+      annotations?: Prisma.InputJsonValue;
+    },
     args: { select: S },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
@@ -545,9 +561,16 @@ export interface RunStore {
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
   requeueRun<S extends Prisma.TaskRunSelect>(
     runId: string,
-    args: { select: S },
+    /** `workerQueue` moves the run to that worker queue as it is requeued. */
+    args: { select: S; workerQueue?: string },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
+  /**
+   * Write the sticky internal annotations marker before MemoryDB waitpoint state. The caller holds
+   * the same run lifecycle lock as attempt stamping, so a stamp cannot overwrite a concurrent mark.
+   */
+  markRunWaitpointsOnStore(runId: string): Promise<void>;
+
   recordBulkActionMembership(
     runId: string,
     bulkActionId: string,
@@ -856,6 +879,10 @@ export interface RunStore {
   // Server-only fallback for jobs without preceding snapshot context. The decorator resolves actual
   // birth storage or throws; an undecorated Postgres store returns undefined without extra work.
   readSnapshotRoute(runId: string, organizationId: string): Promise<SnapshotRoute | undefined>;
+  // Resolves an earlier snapshot unit still pending for the run, so an engine transaction about to
+  // publish to the run queue does not meet it as a busy prepare. Call it outside any transaction. A
+  // store without MemoryDB residency does nothing.
+  settlePendingUnit(runId: string): Promise<void>;
 
   // Implicit-join group
   /** `runId` (when known) routes to the run's store — the snapshot + its join co-locate with the run;
@@ -1008,6 +1035,8 @@ export interface RunStore {
   // --- BatchTaskRun (run-ops) ---
   // Batch row is born on the run-ops store at create. `findBatchTaskRunById`
   // reads the primary by default (worker reads the just-written row; replica lag).
+  markBatchWaitpointOnStore(batchId: string, waitpointId: string): Promise<void>;
+
   createBatchTaskRun(
     data: CreateBatchTaskRunData,
     tx?: PrismaClientOrTransaction

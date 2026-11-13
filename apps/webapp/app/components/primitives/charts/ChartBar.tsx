@@ -10,6 +10,7 @@ import {
   type XAxisProps,
   type YAxisProps,
 } from "recharts";
+import { verticalMarkerLine, type VerticalMarker } from "./VerticalMarker";
 import { ChartTooltip, ChartTooltipContent } from "~/components/primitives/charts/Chart";
 import TooltipPortal from "~/components/primitives/TooltipPortal";
 import { useChartContext } from "./ChartContext";
@@ -58,6 +59,16 @@ type ReferenceLineProps = {
   label: string;
 };
 
+export type ChartBarReferenceArea = {
+  x1: number;
+  x2: number;
+  fill?: string;
+  fillOpacity?: number;
+  stroke?: string;
+  strokeOpacity?: number;
+  strokeDasharray?: string;
+};
+
 // ============================================================================
 // COMPOUND COMPONENT API
 // ============================================================================
@@ -71,6 +82,9 @@ export type ChartBarRendererProps = {
   yAxisProps?: Partial<YAxisProps>;
   /** Reference line (horizontal) */
   referenceLine?: ReferenceLineProps;
+  /** Shaded x range, drawn in front of the bars */
+  referenceArea?: ChartBarReferenceArea | ChartBarReferenceArea[] | null;
+  verticalMarker?: VerticalMarker;
   /** Custom tooltip label formatter */
   tooltipLabelFormatter?: (label: string, payload: any[]) => string;
   /** Optional formatter for numeric tooltip values (e.g. bytes, duration) */
@@ -100,6 +114,8 @@ export function ChartBarRenderer({
   xAxisProps: xAxisPropsProp,
   yAxisProps: yAxisPropsProp,
   referenceLine,
+  referenceArea,
+  verticalMarker,
   tooltipLabelFormatter,
   tooltipValueFormatter,
   barRadius = 2,
@@ -334,6 +350,20 @@ export function ChartBarRenderer({
           />
         );
       })}
+
+      {verticalMarker && verticalMarkerLine(verticalMarker)}
+
+      {referenceArea &&
+        [referenceArea]
+          .flat()
+          .map((area) => (
+            <ReferenceArea
+              key={`${area.x1}-${area.x2}`}
+              {...area}
+              isFront
+              className="pointer-events-none"
+            />
+          ))}
 
       {/* Synced drag-to-zoom selection — mirrored across charts in the same group. */}
       {syncZoomSelection && (

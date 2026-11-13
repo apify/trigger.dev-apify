@@ -7,8 +7,10 @@ import {
   authenticatedEnvironmentForAuthentication,
   branchNameFromRequest,
 } from "~/services/apiAuth.server";
+import { authorizePatEnvironmentAccess } from "~/services/environmentVariableApiAccess.server";
 import { logger } from "~/services/logger.server";
 import zlib from "node:zlib";
+import { personalAccessTokenUnauthorizedResponse } from "~/services/personalAccessToken.server";
 
 const ParamsSchema = z.object({
   projectRef: z.string(),
@@ -24,10 +26,14 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
   }
 
   try {
-    const authenticationResult = await authenticateRequest(request);
+    const authenticationResult = await authenticateRequest(request, {
+      personalAccessToken: true,
+      organizationAccessToken: true,
+      apiKey: true,
+    });
 
     if (!authenticationResult) {
-      return json({ error: "Invalid or Missing API key" }, { status: 401 });
+      return personalAccessTokenUnauthorizedResponse(request, "Invalid or Missing API key");
     }
 
     const environment = await authenticatedEnvironmentForAuthentication(
@@ -36,6 +42,20 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
       parsedParams.data.envSlug,
       branchNameFromRequest(request)
     );
+
+    // Legacy API-key authentication already scopes the caller to its environment.
+    if (authenticationResult.type !== "apiKey") {
+      const denied = await authorizePatEnvironmentAccess({
+        request,
+        authType: authenticationResult.type,
+        organizationId: environment.organizationId,
+        projectId: environment.project.id,
+        envType: environment.type,
+        resource: "deployments",
+        action: "read",
+      });
+      if (denied) return denied;
+    }
 
     // Find the background worker and tasks and files
     const backgroundWorker = await prisma.backgroundWorker.findFirst({

@@ -53,6 +53,19 @@ import type {
 export class DelegatingRunStore implements RunStore {
   constructor(protected readonly delegate: RunStore) {}
 
+  getWaitpointKeyScope(ownerId?: string): string {
+    return this.delegate.getWaitpointKeyScope(ownerId);
+  }
+
+  runInWaitpointKeyTransaction<R>(
+    ownerId: string | undefined,
+    organizationId: string,
+    acceptUntil: number,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
+  ): Promise<R> {
+    return this.delegate.runInWaitpointKeyTransaction(ownerId, organizationId, acceptUntil, fn);
+  }
+
   runInTransaction<R>(
     runId: string | undefined,
     fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
@@ -80,7 +93,12 @@ export class DelegatingRunStore implements RunStore {
 
   startAttempt<S extends Prisma.TaskRunSelect>(
     runId: string,
-    data: { attemptNumber: number; executedAt?: Date; isWarmStart: boolean },
+    data: {
+      attemptNumber: number;
+      executedAt?: Date;
+      isWarmStart: boolean;
+      annotations?: Prisma.InputJsonValue;
+    },
     args: { select: S },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
@@ -114,10 +132,14 @@ export class DelegatingRunStore implements RunStore {
 
   requeueRun<S extends Prisma.TaskRunSelect>(
     runId: string,
-    args: { select: S },
+    args: { select: S; workerQueue?: string },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
     return this.delegate.requeueRun(runId, args, tx);
+  }
+
+  markRunWaitpointsOnStore(runId: string): Promise<void> {
+    return this.delegate.markRunWaitpointsOnStore(runId);
   }
 
   recordBulkActionMembership(
@@ -490,6 +512,10 @@ export class DelegatingRunStore implements RunStore {
     return this.delegate.readSnapshotRoute(runId, organizationId);
   }
 
+  settlePendingUnit(runId: string): Promise<void> {
+    return this.delegate.settlePendingUnit(runId);
+  }
+
   findSnapshotCompletedWaitpointIds(
     snapshotId: string,
     client?: ReadClient,
@@ -658,6 +684,10 @@ export class DelegatingRunStore implements RunStore {
     client?: ReadClient
   ): Promise<Prisma.TaskRunCheckpointGetPayload<{}> | null> {
     return this.delegate.findTaskRunCheckpointById(checkpointId, ownerRunId, client);
+  }
+
+  markBatchWaitpointOnStore(batchId: string, waitpointId: string): Promise<void> {
+    return this.delegate.markBatchWaitpointOnStore(batchId, waitpointId);
   }
 
   createBatchTaskRun(

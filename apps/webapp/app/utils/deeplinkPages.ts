@@ -24,6 +24,7 @@ export const ENV_PAGE_TARGETS: ReadonlyMap<string, DeeplinkTarget> = new Map([
   ["limits", page("limits")],
   ["logs", page("logs")],
   ["models", page("models")],
+  ["oidc", page("oidc")],
   ["playground", page("playground")],
   ["prompts", page("prompts")],
   ["query", page("query")],
@@ -31,15 +32,19 @@ export const ENV_PAGE_TARGETS: ReadonlyMap<string, DeeplinkTarget> = new Map([
   ["regions", page("regions")],
   ["runs", page("runs")],
   ["schedules", page("schedules")],
+  ["security-notices", page("security-notices")],
   ["sessions", page("sessions")],
   ["settings", page("settings")],
   ["tasks", { landing: "", prefix: "tasks" }],
   ["test", page("test")],
+  ["trusted-publishing", page("trusted-publishing")],
   ["waitpoints", { landing: "waitpoints/tokens", prefix: "waitpoints/tokens" }],
   ["webhooks", page("webhooks")],
 ]);
 
+// Org pages resolve under the org's settings path.
 export const ORG_PAGE_TARGETS: ReadonlyMap<string, DeeplinkTarget> = new Map([
+  ["billing", page("billing")],
   ["projects", page("projects")],
 ]);
 

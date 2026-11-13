@@ -1,8 +1,14 @@
+import { DecryptCommand, EncryptCommand, KMSClient } from "@aws-sdk/client-kms";
 import type { PrismaClientOrTransaction } from "~/db.server";
 import { prisma } from "~/db.server";
 import { z } from "zod";
 import { env } from "~/env.server";
-import nodeCrypto from "node:crypto";
+import {
+  decryptValue,
+  encryptValue,
+  EncryptedValueSchema,
+  type EncryptionKeyring,
+} from "~/utils/encryptionKeyring.server";
 import { safeJsonParse } from "~/utils/json";
 import { logger } from "../logger.server";
 import type { SecretStoreOptions } from "./secretStoreOptionsSchema.server";
@@ -10,6 +16,9 @@ import type { SecretStoreOptions } from "./secretStoreOptionsSchema.server";
 import { boundedIn } from "@trigger.dev/database";
 type ProviderInitializationOptions = {
   DATABASE: {
+    prismaClient?: PrismaClientOrTransaction;
+  };
+  AWS_KMS: {
     prismaClient?: PrismaClientOrTransaction;
   };
   AWS_PARAM_STORE: {
@@ -60,21 +69,27 @@ export class SecretStore {
   }
 }
 
-export const EncryptedSecretValueSchema = z.object({
-  nonce: z.string(),
-  ciphertext: z.string(),
-  tag: z.string(),
-});
+export const EncryptedSecretValueSchema = EncryptedValueSchema;
 
 export type EncryptedSecretValue = z.infer<typeof EncryptedSecretValueSchema>;
 
-/** This stores secrets in the Postgres Database, encrypted using aes-256-gcm */
-class PrismaSecretStore implements SecretStoreProvider {
+const AWS_KMS_SECRET_VERSION = "aws-kms";
+
+const AwsKmsSecretValueSchema = z.object({
+  keyId: z.string(),
+  ciphertext: z.string(),
+});
+
+/**
+ * This stores secrets in the Postgres Database, encrypted using aes-256-gcm with the platform keyring,
+ * or with an AWS KMS key when `awsKmsKeyId` is set. Reads handle both, based on each row's version.
+ */
+export class PrismaSecretStore implements SecretStoreProvider {
   #prismaClient: PrismaClientOrTransaction;
 
   constructor(
-    private readonly encryptionKey: string,
-    private options?: ProviderInitializationOptions["DATABASE"]
+    private readonly encryptionKey: EncryptionKeyring,
+    private options?: ProviderInitializationOptions["DATABASE"] & { awsKmsKeyId?: string }
   ) {
     this.#prismaClient = options?.prismaClient ?? prisma;
   }
@@ -151,6 +166,11 @@ class PrismaSecretStore implements SecretStoreProvider {
       return schema.parse(secret.value);
     }
 
+    if (secret.version === AWS_KMS_SECRET_VERSION) {
+      const kmsValue = AwsKmsSecretValueSchema.parse(secret.value);
+      return schema.parse(JSON.parse(await decryptWithAwsKms(secret.key, kmsValue)));
+    }
+
     const encryptedData = EncryptedSecretValueSchema.safeParse(secret.value);
 
     if (!encryptedData.success) {
@@ -159,11 +179,7 @@ class PrismaSecretStore implements SecretStoreProvider {
       );
     }
 
-    const decrypted = await this.#decrypt(
-      encryptedData.data.nonce,
-      encryptedData.data.ciphertext,
-      encryptedData.data.tag
-    );
+    const decrypted = await decryptSecret(this.encryptionKey, encryptedData.data);
 
     const parsedDecrypted = safeJsonParse(decrypted);
 
@@ -176,17 +192,22 @@ class PrismaSecretStore implements SecretStoreProvider {
   }
 
   async setSecret<T extends object>(key: string, value: T): Promise<void> {
-    const encrypted = await this.#encrypt(JSON.stringify(value));
+    const plaintext = JSON.stringify(value);
+    const awsKmsKeyId = this.options?.awsKmsKeyId;
+    const encrypted = awsKmsKeyId
+      ? await encryptWithAwsKms(awsKmsKeyId, key, plaintext)
+      : await encryptSecret(this.encryptionKey, plaintext);
+    const version = awsKmsKeyId ? AWS_KMS_SECRET_VERSION : "2";
 
     await this.#prismaClient.secretStore.upsert({
       create: {
         key,
         value: encrypted,
-        version: "2",
+        version,
       },
       update: {
         value: encrypted,
-        version: "2",
+        version,
       },
       where: {
         key,
@@ -201,22 +222,6 @@ class PrismaSecretStore implements SecretStoreProvider {
       },
     });
   }
-
-  async #decrypt(nonce: string, ciphertext: string, tag: string): Promise<string> {
-    return await decryptSecret(this.encryptionKey, {
-      nonce,
-      ciphertext,
-      tag,
-    });
-  }
-
-  async #encrypt(value: string): Promise<{
-    nonce: string;
-    ciphertext: string;
-    tag: string;
-  }> {
-    return await encryptSecret(this.encryptionKey, value);
-  }
 }
 
 export function getSecretStore<
@@ -227,9 +232,20 @@ export function getSecretStore<
     case "DATABASE": {
       return new SecretStore(
         new PrismaSecretStore(
-          env.ENCRYPTION_KEY,
+          env.ENCRYPTION_KEYRING,
           options as ProviderInitializationOptions["DATABASE"]
         )
+      );
+    }
+    case "AWS_KMS": {
+      if (!env.SECRET_STORE_AWS_KMS_KEY_ID) {
+        throw new Error("The AWS_KMS secret store requires SECRET_STORE_AWS_KMS_KEY_ID");
+      }
+      return new SecretStore(
+        new PrismaSecretStore(env.ENCRYPTION_KEYRING, {
+          ...(options as ProviderInitializationOptions["AWS_KMS"]),
+          awsKmsKeyId: env.SECRET_STORE_AWS_KMS_KEY_ID,
+        })
       );
     }
     default: {
@@ -238,39 +254,70 @@ export function getSecretStore<
   }
 }
 
+export function isAwsKmsSecretStoreEnabled(): boolean {
+  return !!env.SECRET_STORE_AWS_KMS_KEY_ID;
+}
+
+let awsKmsClient: KMSClient | undefined;
+
+function getAwsKmsClient(): KMSClient {
+  awsKmsClient ??= new KMSClient({ region: env.AWS_REGION ?? env.AWS_DEFAULT_REGION });
+  return awsKmsClient;
+}
+
+// The encryption context binds each ciphertext to its SecretStore key, so a blob copied to
+// another row fails to decrypt.
+async function encryptWithAwsKms(
+  keyId: string,
+  secretKey: string,
+  plaintext: string
+): Promise<z.infer<typeof AwsKmsSecretValueSchema>> {
+  const result = await getAwsKmsClient().send(
+    new EncryptCommand({
+      KeyId: keyId,
+      Plaintext: Buffer.from(plaintext, "utf8"),
+      EncryptionContext: { secretKey },
+    })
+  );
+  if (!result.CiphertextBlob || !result.KeyId) {
+    throw new Error("AWS KMS encrypt returned no ciphertext");
+  }
+
+  // Store the resolved key ARN so existing secrets still decrypt if the configured key changes.
+  return {
+    keyId: result.KeyId,
+    ciphertext: Buffer.from(result.CiphertextBlob).toString("base64"),
+  };
+}
+
+async function decryptWithAwsKms(
+  secretKey: string,
+  value: z.infer<typeof AwsKmsSecretValueSchema>
+): Promise<string> {
+  const result = await getAwsKmsClient().send(
+    new DecryptCommand({
+      KeyId: value.keyId,
+      CiphertextBlob: Buffer.from(value.ciphertext, "base64"),
+      EncryptionContext: { secretKey },
+    })
+  );
+  if (!result.Plaintext) {
+    throw new Error("AWS KMS decrypt returned no plaintext");
+  }
+
+  return Buffer.from(result.Plaintext).toString("utf8");
+}
+
 export async function decryptSecret(
-  encryptionKey: string,
+  encryptionKey: EncryptionKeyring,
   secret: EncryptedSecretValue
 ): Promise<string> {
-  const decipher = nodeCrypto.createDecipheriv(
-    "aes-256-gcm",
-    encryptionKey,
-    Buffer.from(secret.nonce, "hex")
-  );
-
-  decipher.setAuthTag(Buffer.from(secret.tag, "hex"));
-
-  let decrypted = decipher.update(secret.ciphertext, "hex", "utf8");
-  decrypted += decipher.final("utf8");
-
-  return decrypted;
+  return decryptValue(secret, encryptionKey);
 }
 
 export async function encryptSecret(
-  encryptionKey: string,
+  encryptionKey: EncryptionKeyring,
   value: string
 ): Promise<EncryptedSecretValue> {
-  const nonce = nodeCrypto.randomBytes(12);
-  const cipher = nodeCrypto.createCipheriv("aes-256-gcm", encryptionKey, nonce);
-
-  let encrypted = cipher.update(value, "utf8", "hex");
-  encrypted += cipher.final("hex");
-
-  const tag = cipher.getAuthTag().toString("hex");
-
-  return {
-    nonce: nonce.toString("hex"),
-    ciphertext: encrypted,
-    tag,
-  };
+  return encryptValue(value, encryptionKey);
 }

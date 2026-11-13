@@ -24,8 +24,10 @@ import {
   type GlobalRateLimiter,
 } from "@trigger.dev/redis-worker";
 import type { ControlPlaneResolver } from "./controlPlaneResolver.js";
+import type { WaitpointStoreCoordinator } from "./waitpointCoordinator/storeCoordinator.js";
+import type { WaitpointSystemOptions } from "./systems/waitpointSystem.js";
 import type { FairQueueSelectionStrategyOptions } from "../run-queue/fairQueueSelectionStrategy.js";
-import type { RunQueueMetricsEmitter, RunQueueOptions } from "../run-queue/index.js";
+import type { RunQueueMetricsEmitter } from "../run-queue/index.js";
 import type { MinimalAuthenticatedEnvironment } from "../shared/index.js";
 import type { LockRetryConfig } from "./locking.js";
 import type { workerCatalog } from "./workerCatalog.js";
@@ -41,6 +43,12 @@ export type WorkerQueueDequeueOptions = WorkerQueuePopOptions & {
   runnerId?: string;
   tx?: PrismaClientOrTransaction;
   skipObserving?: boolean;
+  /**
+   * Set when this consumer can only start runs whose deployment has a `templateKey`. A fresh
+   * attempt of a deployment without one moves to the worker queue this returns. Restores keep
+   * their worker queue.
+   */
+  templateFallbackWorkerQueue?: (workerQueue: string) => string | undefined;
 };
 
 /**
@@ -69,7 +77,21 @@ export type CrossSeamGuardHook = (input: {
   routeKind: "MANUAL" | "DATETIME" | "RESUME_TOKEN" | "IDEMPOTENCY_REUSE" | "RUN";
 }) => Promise<CrossSeamGuardDecision>;
 
+/**
+ * How dequeue treats a run whose deployment hasn't finished deploying.
+ * - `off`: start it, as before the check existed (no extra reads).
+ * - `shadow`: start it, but record what enforce would have done (log + metric).
+ * - `enforce`: fail it if the deployment failed, timed out, was canceled or is stuck; hold it
+ *   while the deployment is still in progress.
+ */
+export type DeploymentStatusMode = "off" | "shadow" | "enforce";
+
 export type RunEngineOptions = {
+  /** Independent of snapshot residency. Omitted means the existing Postgres waitpoint behavior. */
+  waitpointStoreEnabled?: (
+    organizationId: string,
+    organizationFlags?: unknown
+  ) => boolean | Promise<boolean>;
   prisma: PrismaClient;
   readOnlyPrisma?: PrismaReplicaClient;
   /** Optional RunStore implementation to inject. Defaults to a PostgresRunStore
@@ -107,6 +129,16 @@ export type RunEngineOptions = {
     masterQueueConsumerDequeueCount?: number;
     workerOptions?: WorkerConcurrencyOptions;
     retryOptions?: RetryOptions;
+    /** How long a run waits before re-checking a deployment that is still deploying. Defaults to 30s. */
+    deploymentWaitRetryMs?: number;
+    /**
+     * How long after a deployment started deploying a run keeps waiting for it. Past this the
+     * deployment is treated as dead and the run fails. Set it above the deploy timeout. Defaults
+     * to 16 minutes.
+     */
+    deploymentWaitMaxMs?: number;
+    /** Read on every dequeue that resolves a deployment, so it can change without a restart. Defaults to `shadow`. */
+    deploymentStatusMode?: () => DeploymentStatusMode;
     defaultEnvConcurrency?: number;
     defaultEnvConcurrencyBurstFactor?: number;
     logLevel?: LogLevel;
@@ -114,12 +146,19 @@ export type RunEngineOptions = {
     totalConcurrencyEnabled?: boolean;
     /** Enforce the gates carried in message payloads. See RunQueueOptions.gatesEnabled. */
     gatesEnabled?: boolean;
+    /** Enforce per-key overrides set through the override API. See RunQueueOptions.concurrencyKeyLimitsEnabled. */
+    concurrencyKeyLimitsEnabled?: boolean;
     /** Bounds for the saturated-set reconcile. See RunQueueOptions.reconcile. */
     reconcile?: {
       enabled?: boolean;
       scanCount?: number;
       lockTtlSeconds?: number;
       maxPassesPerDequeue?: number;
+    };
+    /** Read past gate-blocked sub-queues at dequeue. See RunQueueOptions.gateSkipAhead. */
+    gateSkipAhead?: {
+      enabled?: boolean;
+      readMultiplier?: number;
     };
     /** Optional queue-metrics emitter; enables gauge + counter emission from the RunQueue. */
     queueMetrics?: RunQueueMetricsEmitter;
@@ -133,6 +172,7 @@ export type RunEngineOptions = {
       processMarkedSchedule?: string;
       scanJitterInMs?: number;
       processMarkedJitterInMs?: number;
+      scanCount?: number;
     };
     /** TTL system options for automatic run expiration */
     ttlSystem?: {
@@ -156,9 +196,6 @@ export type RunEngineOptions = {
       /** Max time (ms) to wait for more items before flushing a batch (default: 5000) */
       batchMaxWaitMs?: number;
     };
-    /** Fair (virtual-time) ordering across concurrency-key variants of a base queue.
-     *  Passed through to RunQueue; off by default (undefined = today's behaviour). */
-    ckVirtualTimeScheduling?: RunQueueOptions["ckVirtualTimeScheduling"];
   };
   runLock: {
     redis: RedisOptions;
@@ -197,6 +234,8 @@ export type RunEngineOptions = {
       factor?: number;
       /** Whether to add jitter to retry delays. Default: true */
       randomize?: boolean;
+      /** Attempt ceiling for infrastructure-class failures. Default: maxAttempts */
+      infrastructureMaxAttempts?: number;
     };
   };
   debounce?: {
@@ -258,10 +297,27 @@ export type RunEngineOptions = {
    */
   finalizationGuardDelayMs?: number;
   /**
+   * What `startRunAttempt` does when the run already has an attempt executing: "log" records it
+   * and starts another attempt as before, "enforce" refuses with a 409. Default: "log".
+   */
+  duplicateAttemptStartCheck?: "off" | "log" | "enforce";
+  /**
    * Delay before the `ensureWaitpointCompleted` write-ahead guard fires after a manual/API waitpoint
    * completion whose inline side effects never acked it. Default: 30s.
    */
   completionGuardDelayMs?: number;
+  /**
+   * Dark MemoryDB waitpoint routing/mint wiring, forwarded verbatim to {@link WaitpointSystem}. Omitted
+   * in production today: with no `store` the routing coordinator is a 1:1 legacy passthrough and every
+   * mint stays legacy. A later activation ticket supplies a store coordinator and a real mint policy.
+   */
+  waitpointRouting?: WaitpointSystemOptions["waitpointRouting"];
+  /**
+   * The MemoryDB completed-record reader, for resolving store-format completed waitpoints in a
+   * Redis-primary resume cycle. Dark by default (undefined leaves the resolver Postgres-only).
+   */
+  waitpointStore?: WaitpointSystemOptions["waitpointStore"];
+  waitpointFanoutStore?: WaitpointStoreCoordinator;
   heartbeatTimeoutsMs?: Partial<HeartbeatTimeouts>;
   repairSnapshotTimeoutMs?: number;
   treatProductionExecutionStallsAsOOM?: boolean;
@@ -342,16 +398,18 @@ export type EngineStartRunAttemptResult = StartRunAttemptResult & {
   run: { region: string | null; workerQueue: string };
 };
 
-export type RestoreOutcome = "requeue" | "fail";
+export type RestoreOutcome = "requeue" | "fail" | "fallback";
 
-export type RestoreOutcomeResult =
-  | { ok: true; outcome: RestoreOutcome }
-  | {
-      ok: false;
-      code: "SNAPSHOT_CONFLICT";
-      latestSnapshotId: string;
-      latestExecutionStatus: TaskRunExecutionStatus;
-    };
+type SnapshotConflict = {
+  ok: false;
+  code: "SNAPSHOT_CONFLICT";
+  latestSnapshotId: string;
+  latestExecutionStatus: TaskRunExecutionStatus;
+};
+
+export type RestoreOutcomeResult = { ok: true; outcome: RestoreOutcome } | SnapshotConflict;
+
+export type ReleaseRunResult = { ok: true; requeued: boolean } | SnapshotConflict;
 
 export type HeartbeatTimeouts = {
   PENDING_EXECUTING: number;
@@ -449,6 +507,8 @@ export type TriggerParams = {
     existingRun: TaskRun;
     waitpoint: Waitpoint;
     debounceKey: string;
+    /** Native waitpoints only: await inside the trace callback before persisting its partial span. */
+    blockRun?: (spanIdToComplete?: string) => Promise<void>;
   }) => Promise<string | undefined>;
 };
 

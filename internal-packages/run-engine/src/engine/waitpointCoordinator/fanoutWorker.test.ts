@@ -9,12 +9,19 @@
  */
 import { createRedisClient, Redis, type RedisOptions } from "@internal/redis";
 import { redisTest } from "@internal/testcontainers";
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
 import { createTestMetricsMeter } from "../tests/helpers/replicaTestHelpers.js";
 import { fanoutRetryDelayMs } from "./fanoutPolicy.js";
-import { WaitpointFanoutWorker, type FanoutWorkerHooks } from "./fanoutWorker.js";
+import {
+  WaitpointFanoutWorker,
+  type FanoutWorkerHooks,
+  type WaitpointFanoutWorkerOptions,
+} from "./fanoutWorker.js";
 import {
   edgeField,
+  runBlockKeys,
+  runResultKey,
+  runWithdrawalKey,
   fanoutIndexKeys,
   fanoutPartition,
   waitpointKeys,
@@ -29,6 +36,7 @@ import {
   type WaitpointCompletion,
   type WaitpointRecordInput,
 } from "./storeCoordinator.js";
+import { StoreWaitpointCoordinator } from "./storeWaitpointCoordinator.js";
 
 const ENV_ID = "env_1";
 const PROJECT_ID = "proj_1";
@@ -51,6 +59,11 @@ function coordinator(redisOptions: RedisOptions, overrides: { clock?: () => numb
     terminalRetentionMs: RETENTION_MS,
     ...overrides,
   });
+}
+
+// The callback fixture publishes on the real coordinator connection without changing its methods.
+function coordinatorRedis(store: WaitpointStoreCoordinator): Redis {
+  return (store as unknown as { redis: Redis }).redis;
 }
 
 /**
@@ -77,6 +90,8 @@ function worker(
     hintGraceMs?: number;
     clock?: () => number;
     hooks?: FanoutWorkerHooks;
+    onResumable?: WaitpointFanoutWorkerOptions["onResumable"];
+    onCachedSpanComplete?: WaitpointFanoutWorkerOptions["onCachedSpanComplete"];
   } = {}
 ) {
   return new WaitpointFanoutWorker({
@@ -90,6 +105,14 @@ function worker(
     workerId: options.workerId ?? "worker-a",
     clock: options.clock,
     hooks: options.hooks,
+    // Publish a durable continuation in the fixture Redis; the worker exercises real I/O even when
+    // a delivery test does not inspect the resume consumer.
+    onResumable:
+      options.onResumable ??
+      (async (context) => {
+        await coordinatorRedis(store).rpush("test:resume-publications", JSON.stringify(context));
+      }),
+    onCachedSpanComplete: options.onCachedSpanComplete,
   });
 }
 
@@ -225,7 +248,10 @@ describe("completion with one watcher", () => {
       expect(tick.visits).toHaveLength(1);
       expect(tick.visits[0]).toMatchObject({ delivered: 1, outcome: "drained", pages: 1 });
 
-      expect(JSON.parse((await receiptFor(probe, "run_1", "w_a"))!)).toEqual(completion());
+      expect(JSON.parse((await receiptFor(probe, "run_1", "w_a"))!)).toEqual({
+        ...completion(),
+        record: record("w_a"),
+      });
       expect(await probe.scard("wp:v1:run:{run_1}:pend")).toBe(0);
 
       const keys = waitpointKeys("w_a");
@@ -388,6 +414,8 @@ describe("registration ordering", () => {
         });
 
         expect(late.outcome).toBe("completed");
+        if (late.outcome !== "completed")
+          throw new Error("Late registration must return completion");
         expect(late.completion).toEqual(completion());
         // The drained fanout is not restarted, and no watcher is queued behind it.
         expect(await probe.exists(waitpointKeys("w_a").queue)).toBe(0);
@@ -609,7 +637,10 @@ describe("worker failure and reclaiming", () => {
         // run still holds exactly one receipt.
         expect(redelivered).toMatchObject({ duplicates: 1, delivered: 0, outcome: "drained" });
         expect(await probe.hlen("wp:v1:run:{run_1}:done")).toBe(1);
-        expect(JSON.parse((await receiptFor(probe, "run_1", "w_a"))!)).toEqual(completion());
+        expect(JSON.parse((await receiptFor(probe, "run_1", "w_a"))!)).toEqual({
+          ...completion(),
+          record: record("w_a"),
+        });
       } finally {
         probe.disconnect();
         await store.quit();
@@ -2532,7 +2563,10 @@ describe("block-scoped watcher registration", () => {
       // Refused, and told which block the run is actually on. It neither overwrote the
       // receipt nor re-armed a handoff block two already owns.
       expect(late).toMatchObject({ outcome: "stale", currentBlockId: BLOCK_2 });
-      expect(JSON.parse((await receiptFor(probe, RUN, "w_a"))!)).toEqual(completion());
+      expect(JSON.parse((await receiptFor(probe, RUN, "w_a"))!)).toEqual({
+        ...completion(),
+        record: record("w_a"),
+      });
       const state = await store.readBlockState(RUN);
       expect(state.blockId).toBe(BLOCK_2);
       expect(state.deliveredIds).toEqual(["w_a"]);
@@ -2914,6 +2948,8 @@ describe("high watcher cardinality", () => {
   redisTest(
     "foreground completion and every command stay bounded at 500 watchers",
     async ({ redisOptions }) => {
+      // Install before construction: the coordinator captures its dispatch method.
+      const sent = captureCommands();
       const store = coordinator(redisOptions);
       const probe = createRedisClient(redisOptions);
       const WATCHERS = 500;
@@ -2936,13 +2972,16 @@ describe("high watcher cardinality", () => {
         // Every command this process issues, captured at the ioredis dispatch point. The
         // argument count is the wire size, so a command that grew with watcher count would
         // show up here as a wider call rather than only as a slower one.
-        const sent = captureCommands();
+        // Discard setup and script warmup traffic before measuring the protocol.
+        sent.take();
         try {
           await store.complete({ waitpointId: "w_one", completion: completion() });
           const solo = sent.take();
           await store.complete({ waitpointId: "w_many", completion: completion() });
           const many = sent.take();
 
+          expect(solo.length).toBeGreaterThan(0);
+          expect(many.length).toBeGreaterThan(0);
           // Identical shape at 1 watcher and at 500: same commands, same widths.
           expect(many.map((c) => c.name)).toEqual(solo.map((c) => c.name));
           expect(many.map((c) => c.args.length)).toEqual(solo.map((c) => c.args.length));
@@ -2959,6 +2998,7 @@ describe("high watcher cardinality", () => {
         expect(await probe.exists(waitpointKeys("w_many").queue)).toBe(0);
         expect(await receiptFor(probe, "run_499", "w_many")).not.toBeNull();
       } finally {
+        sent.restore();
         probe.disconnect();
         await store.quit();
       }
@@ -2970,12 +3010,15 @@ describe("primary-only authoritative operations", () => {
   redisTest(
     "every authoritative read and write is a script, never a bare command",
     async ({ redisOptions }) => {
+      // Install before construction: the coordinator captures its dispatch method.
+      const sent = captureCommands();
       const store = coordinator(redisOptions);
       try {
         await pending(store, "w_a");
         await blockRuns(store, "w_a", ["run_1"]);
 
-        const sent = captureCommands();
+        // Discard setup and script warmup traffic before measuring the protocol.
+        sent.take();
         try {
           // A representative slice of the whole protocol, including the read-only paths.
           await store.complete({ waitpointId: "w_a", completion: completion() });
@@ -2997,14 +3040,24 @@ describe("primary-only authoritative operations", () => {
           // EVAL and EVALSHA are always routed to the slot's primary. A bare ZRANGEBYSCORE
           // or HGET here would be eligible for a replica read under scaleReads, which is
           // exactly the stale authoritative read this protocol must not make.
+          // The fixture bridge publishes a real durable continuation outside the coordinator's
+          // authoritative protocol. Keep that traffic visible and assert its exact boundary.
+          const publications = issued.filter(
+            (c) => c.name.toLowerCase() === "rpush" && c.args[0] === "test:resume-publications"
+          );
+          expect(publications).toHaveLength(1);
+          expect(JSON.parse(String(publications[0]!.args[1]))).toMatchObject({ runId: "run_1" });
           const nonScript = issued.filter(
-            (c) => !["eval", "evalsha", "script"].includes(c.name.toLowerCase())
+            (c) =>
+              !["eval", "evalsha", "script"].includes(c.name.toLowerCase()) &&
+              !publications.includes(c)
           );
           expect(nonScript.map((c) => c.name)).toEqual([]);
         } finally {
           sent.restore();
         }
       } finally {
+        sent.restore();
         await store.quit();
       }
     }
@@ -3115,7 +3168,9 @@ describe("metrics", () => {
  * Capture every command this process dispatches through ioredis.
  *
  * Patched onto the prototype, because the coordinator owns its client and must not grow a
- * production accessor for it. `sendCommand` is the single funnel every built-in wrapper and
+ * production accessor for it. Install before coordinator construction, since its scoped
+ * command-budget wrapper captures the dispatch method. `sendCommand` is the single funnel
+ * every built-in wrapper and
  * every `defineCommand` script passes through, so nothing issued from Node escapes it —
  * while commands Redis runs INSIDE a script are never dispatched from here, which is
  * precisely the distinction these tests assert on.
@@ -3251,9 +3306,12 @@ describe("completion encoding reuse", () => {
         expect(new Set(store.encodedSeen).size).toBe(1);
         expect(store.perWatcherSerializations).toHaveLength(0);
 
-        // And the envelope every run received is unchanged.
+        // Every run receives the same frozen completion and immutable record metadata.
         for (const runId of runIds) {
-          expect(JSON.parse((await receiptFor(probe, runId, "w_a"))!)).toEqual(completion());
+          expect(JSON.parse((await receiptFor(probe, runId, "w_a"))!)).toEqual({
+            ...completion(),
+            record: record("w_a"),
+          });
         }
       } finally {
         probe.disconnect();
@@ -3945,6 +4003,365 @@ describe("a quarantined claim reports failures, not attempts", () => {
       } finally {
         probe.disconnect();
         await store.quit();
+      }
+    }
+  );
+});
+
+describe("cached-span completion", () => {
+  redisTest(
+    "completes live cached spans, skips withdrawn watchers, and reports late spans inline",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions);
+      let w: WaitpointFanoutWorker | undefined;
+      try {
+        // A RUN waitpoint completed by run_child: its record carries completedByTaskRunId.
+        await store.createIfAbsent({
+          record: record("w_a", { completedByTaskRunId: "run_child" }),
+          status: "PENDING",
+        });
+        // Two runs block on w_a: one carries a spanIdToComplete, one does not.
+        await store.registerBlocks({
+          runId: "run_span",
+          blockId: "blk_run_span",
+          edges: [{ ...edge("w_a"), spanIdToComplete: "span_1" }],
+        });
+        await store.registerBlocks({
+          runId: "run_nospan",
+          blockId: "blk_run_nospan",
+          edges: [edge("w_a")],
+        });
+        await store.registerBlocks({
+          runId: "run_withdrawn",
+          blockId: "blk_withdrawn",
+          edges: [{ ...edge("w_a"), spanIdToComplete: "span_withdrawn" }],
+        });
+        await store.unregisterWatcher({
+          waitpointId: "w_a",
+          runId: "run_withdrawn",
+          blockId: "blk_withdrawn",
+        });
+        await store.complete({ waitpointId: "w_a", completion: completion() });
+
+        w = worker(store, {
+          onResumable: async () => {
+            await coordinatorRedis(store).rpush("test:resume-publications", "resume");
+          },
+          onCachedSpanComplete: async (ctx) => {
+            await coordinatorRedis(store).rpush("test:span-publications", JSON.stringify(ctx));
+          },
+        });
+        expect(await w.visit("w_a")).toMatchObject({
+          delivered: 2,
+          staleWatchers: 1,
+          outcome: "drained",
+        });
+
+        // Fired once, for the span-carrying watcher only, carrying the completed run identity.
+        expect(
+          (await coordinatorRedis(store).lrange("test:span-publications", 0, -1)).map((value) =>
+            JSON.parse(value)
+          )
+        ).toEqual([
+          {
+            waitpointId: "w_a",
+            blockedRunId: "run_span",
+            spanId: "span_1",
+            spanCreatedAt: NOW,
+            hasError: false,
+            cachedRunId: "run_child",
+          },
+        ]);
+
+        // A registration after completion never queues a watcher: its caller receives the span inline.
+        const late = await store.registerBlocks({
+          runId: "run_late",
+          blockId: "blk_late",
+          edges: [{ ...edge("w_a"), spanIdToComplete: "span_late" }],
+        });
+        expect(late.cachedSpanCompletions).toEqual([
+          {
+            blockedRunId: "run_late",
+            spanId: "span_late",
+            spanCreatedAt: NOW,
+            hasError: false,
+            cachedRunId: "run_child",
+          },
+        ]);
+        expect(await w.visit("w_a")).toMatchObject({ pages: 0, outcome: "done" });
+        expect(await coordinatorRedis(store).llen("test:span-publications")).toBe(1);
+      } finally {
+        await w?.dispose();
+        await store.quit();
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  for (const parentState of ["acked", "terminal", "new-block"] as const) {
+    redisTest(
+      `finishes all indexed spans across bounded pages after parent ${parentState}, without resuming it`,
+      async ({ redisOptions }) => {
+        vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+        const store = coordinator(redisOptions);
+        const adapter = new StoreWaitpointCoordinator({ store });
+        const runId = "run_span_pages";
+        const blockId = "blk_span_pages";
+        const spanPublications = async () =>
+          (await coordinatorRedis(store).lrange("test:span-publications", 0, -1)).map((value) =>
+            JSON.parse(value)
+          );
+        const w = worker(store, {
+          maxPagesPerVisit: 1,
+          onCachedSpanComplete: async (ctx) => {
+            if (ctx.spanId === "span_100")
+              await coordinatorRedis(store).rpush(
+                "test:last-span-publication",
+                JSON.stringify(ctx)
+              );
+            await coordinatorRedis(store).rpush("test:span-publications", JSON.stringify(ctx));
+          },
+          onResumable: async () => {
+            await coordinatorRedis(store).rpush("test:resume-publications", "resume");
+          },
+        });
+        try {
+          if (parentState === "terminal")
+            await coordinatorRedis(store).set("test:last-span-publication", "wrong-type");
+          await store.createIfAbsent({
+            record: record("w_a", { type: "RUN", completedByTaskRunId: "run_child" }),
+            status: "PENDING",
+          });
+          // One shared cached child reused at 101 batch indexes: one distinct blocker, 101 spans.
+          await store.registerBlocks({
+            runId,
+            blockId,
+            edges: Array.from({ length: 101 }, (_, batchIndex) => ({
+              ...edge("w_a", batchIndex),
+              type: "RUN",
+              batchId: "batch_span_pages",
+              spanIdToComplete: `span_${batchIndex}`,
+            })),
+          });
+          await store.complete({
+            waitpointId: "w_a",
+            completion: completion({ outputIsError: true }),
+          });
+
+          // Production page size and visit budget. The first page can already publish the continuation.
+          expect(await w.visit("w_a")).toMatchObject({
+            pages: 1,
+            delivered: 1,
+            duplicates: 99,
+            outcome: "more",
+          });
+          expect(await spanPublications()).toHaveLength(100);
+          expect(await coordinatorRedis(store).llen("test:resume-publications")).toBeGreaterThan(0);
+          expect(await store.readBlockState(runId)).toMatchObject({
+            pendingIds: [],
+            handoff: "owed",
+          });
+
+          if (parentState === "acked") {
+            await store.acknowledgeResumeHandoff({ runId, blockId });
+          } else {
+            await adapter.acknowledgeResume({ runId, blockId });
+            if (parentState === "terminal") {
+              await adapter.releaseRunBlockers({ runId, reason: "terminal" });
+            } else {
+              await pending(store, "w_b");
+              await store.registerBlocks({ runId, blockId: "blk_new", edges: [edge("w_b")] });
+              // A newer block can itself owe a continuation; this OLD watcher must not publish it.
+              await store.deliverCompletion({
+                runId,
+                blockId: "blk_new",
+                waitpointId: "w_b",
+                completion: completion(),
+              });
+            }
+          }
+          const parentBefore = await store.readBlockState(runId);
+          const resumesBefore = await coordinatorRedis(store).llen("test:resume-publications");
+
+          if (parentState === "terminal") {
+            // Failure after the parent finished must retain this span's existing fanout retry owner.
+            expect(await w.visit("w_a")).toMatchObject({
+              pages: 1,
+              failures: 1,
+              rejected: 0,
+              outcome: "released",
+            });
+            expect(await spanPublications()).toHaveLength(100);
+            expect(await store.describeWaitpoint("w_a")).toMatchObject({ fanout: "pending" });
+            expect(await store.readBlockState(runId)).toEqual(parentBefore);
+            expect(await coordinatorRedis(store).llen("test:resume-publications")).toBe(
+              resumesBefore
+            );
+            await coordinatorRedis(store).del("test:last-span-publication");
+            vi.setSystemTime(Date.now() + 60_000);
+          }
+
+          expect(await w.visit("w_a")).toMatchObject({
+            pages: 1,
+            delivered: 0,
+            duplicates: 0,
+            rejected: 1,
+            failures: 0,
+            outcome: "drained",
+          });
+          expect(await spanPublications()).toHaveLength(101);
+          expect(new Set((await spanPublications()).map(({ spanId }) => spanId))).toEqual(
+            new Set(Array.from({ length: 101 }, (_, index) => `span_${index}`))
+          );
+          expect((await spanPublications())[100]).toEqual({
+            waitpointId: "w_a",
+            blockedRunId: runId,
+            spanId: "span_100",
+            spanCreatedAt: NOW,
+            hasError: true,
+            cachedRunId: "run_child",
+          });
+          // Neither receipt/pending state nor any continuation is re-armed by finishing the old span.
+          expect(await store.readBlockState(runId)).toEqual(parentBefore);
+          expect(await coordinatorRedis(store).llen("test:resume-publications")).toBe(
+            resumesBefore
+          );
+          expect(await store.describeWaitpoint("w_a")).toMatchObject({ fanout: "done" });
+        } finally {
+          await w.dispose();
+          await store.quit();
+          vi.useRealTimers();
+        }
+      }
+    );
+  }
+
+  redisTest(
+    "cached-span completion precedes resume publication; a cached-span failure blocks the resume and keeps the entry retryable",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions);
+      let w: WaitpointFanoutWorker | undefined;
+      try {
+        await store.createIfAbsent({
+          record: record("w_a", { completedByTaskRunId: "run_child" }),
+          status: "PENDING",
+        });
+        // A single-blocker run whose delivery empties its pending set — so it owes a resume.
+        await store.registerBlocks({
+          runId: "run_span",
+          blockId: "blk_span",
+          edges: [{ ...edge("w_a"), spanIdToComplete: "span_1" }],
+        });
+        await store.complete({ waitpointId: "w_a", completion: completion() });
+
+        await coordinatorRedis(store).set("test:cached-span-publication", "wrong-type");
+        vi.useFakeTimers({ toFake: ["Date"], shouldAdvanceTime: true });
+        w = worker(store, {
+          onCachedSpanComplete: async () => {
+            await coordinatorRedis(store).rpush("test:cached-span-publication", "cached-span");
+            await coordinatorRedis(store).rpush("test:publication-order", "cached-span");
+          },
+          onResumable: async () => {
+            await coordinatorRedis(store).rpush("test:resume-publications", "resume");
+            await coordinatorRedis(store).rpush("test:publication-order", "resume");
+          },
+        });
+
+        // First visit: the run-side delivery succeeds, then cached-span publication throws. The resume must
+        // NOT be published, and the fanout entry must remain retryable (released, not retired as delivered).
+        const first = await w.visit("w_a");
+        expect(await coordinatorRedis(store).get("test:cached-span-publication")).toBe(
+          "wrong-type"
+        );
+        expect(await coordinatorRedis(store).llen("test:resume-publications")).toBe(0);
+        expect(await coordinatorRedis(store).lrange("test:publication-order", 0, -1)).toEqual([]);
+        expect(first).toMatchObject({ outcome: "released" });
+
+        // Second visit (past the retry backoff): cached-span succeeds, then the resume publishes. The
+        // callback order is cached-span BEFORE resume, and the page drains.
+        await coordinatorRedis(store).del("test:cached-span-publication");
+        vi.setSystemTime(Date.now() + 60_000);
+        const second = await w.visit("w_a");
+        expect(await coordinatorRedis(store).lrange("test:publication-order", 0, -1)).toEqual([
+          "cached-span",
+          "resume",
+        ]);
+        expect(await coordinatorRedis(store).llen("test:resume-publications")).toBe(1);
+        expect(second).toMatchObject({ outcome: "drained" });
+      } finally {
+        await w?.dispose();
+        await store.quit();
+        vi.useRealTimers();
+      }
+    }
+  );
+});
+
+describe("delivery after terminal retention", () => {
+  redisTest(
+    "restarted fanout cannot resurrect a run after its terminal marker expires while withdrawal remains owed",
+    async ({ redisOptions }) => {
+      const store = new WaitpointStoreCoordinator({ redisOptions, terminalRetentionMs: 20 });
+      const probe = createRedisClient(redisOptions);
+      const clock = fakeClock();
+      let first = true;
+      const stopped = worker(store, {
+        clock: clock.now,
+        hooks: {
+          beforeDeliver: async () => {
+            if (!first) return;
+            first = false;
+            await store.terminalRetainAndClear({
+              runId: "expired-run",
+              blockId: `${BLOCK}_expired-run`,
+            });
+            throw new Error("withdrawal/worker interrupted before delivery");
+          },
+        },
+      });
+      const restarted = worker(store, { workerId: "restarted", clock: clock.now });
+      try {
+        await pending(store, "late-source");
+        await blockRuns(store, "late-source", ["expired-run"]);
+        await store.complete({ waitpointId: "late-source", completion: completion() });
+        clock.advance(1_000);
+        expect((await stopped.visit("late-source")).failures).toBe(1);
+        await expect
+          .poll(() => probe.exists(runBlockKeys("expired-run").state), {
+            timeout: 2000,
+            interval: 5,
+            message: "terminal marker did not expire",
+          })
+          .toBe(0);
+        expect(await probe.pttl(waitpointKeys("late-source").record)).toBe(-1);
+        expect(await probe.exists(runWithdrawalKey("expired-run", `${BLOCK}_expired-run`))).toBe(1);
+        // Worker/queue processing may stop for arbitrarily long, independently of retry count.
+        clock.advance(7 * 24 * 60 * 60 * 1000);
+        const result = await restarted.visit("late-source");
+        expect(result.outcome).toBe("drained");
+        expect(result.rejected).toBe(1);
+        expect(
+          await probe.exists(
+            runResultKey("expired-run"),
+            ...Object.values(runBlockKeys("expired-run"))
+          )
+        ).toBe(0);
+        // Explicit primitive early delivery remains supported for callers that own absorption.
+        expect(
+          (
+            await store.deliverCompletion({
+              runId: "early-run",
+              blockId: "early",
+              waitpointId: "late-source",
+              completion: completion(),
+            })
+          ).outcome
+        ).toBe("delivered");
+      } finally {
+        await stopped.stop();
+        await restarted.stop();
+        await store.quit();
+        await probe.quit();
       }
     }
   );

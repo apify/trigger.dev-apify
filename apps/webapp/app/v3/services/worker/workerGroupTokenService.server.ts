@@ -8,7 +8,6 @@ import type {
   CheckpointInput,
   CompleteRunAttemptResult,
   DequeuedMessage,
-  ExecutionResult,
   MachinePreset,
   StartRunAttemptResult,
   TaskRunExecutionResult,
@@ -18,13 +17,21 @@ import { SemanticInternalAttributes } from "@trigger.dev/core/v3";
 import { fromFriendlyId } from "@trigger.dev/core/v3/isomorphic";
 import {
   WORKER_HEADERS,
+  type RunTokenHeartbeatReport,
   type WeightedWorkerQueueSubscription,
   type WorkerQueueClass,
 } from "@trigger.dev/core/v3/workers";
-import type { RuntimeEnvironment, WorkerInstanceGroup } from "@trigger.dev/database";
-import { Prisma, WorkerInstanceGroupType } from "@trigger.dev/database";
+import {
+  Prisma,
+  type RuntimeEnvironment,
+  type WorkerInstanceGroup,
+  type WorkerInstanceGroupType,
+} from "@trigger.dev/database";
+import { acceptsWorkerStamp } from "./workerGroupAccess";
+import { matchesAnyManagedWorkerSecret } from "./managedWorkerSecret.server";
+import { sanitizeWorkerHeaders } from "./sanitizeWorkerHeaders";
 import { json } from "@remix-run/server-runtime";
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash } from "crypto";
 import { customAlphabet } from "nanoid";
 import { z } from "zod";
 import { env } from "~/env.server";
@@ -32,16 +39,21 @@ import { evaluateCreatedAtGate, runAgeBucket } from "./workloadTokenAuthorizatio
 import { dequeueWorkerQueues } from "~/runEngine/concerns/workerQueueDequeue.server";
 import {
   createWorkerQueueConsumer,
+  refusedSubscriptions,
+  workerServesQueue,
   type WorkerQueueConsumer,
   type WorkerQueueConsumerOptions,
 } from "~/runEngine/concerns/workerQueueSubscriptions.server";
 import { generateJWTTokenForEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
+import { mintRunToken, runTokenInjectionEnabled } from "~/services/oidc/runToken.server";
 import { defaultMachine } from "~/services/platform.v3.server";
 import { singleton } from "~/utils/singleton";
-import { resolveVariablesForEnvironment } from "~/v3/environmentVariables/environmentVariablesRepository.server";
+import { resolveAttemptVariables } from "~/services/environmentEncryption/attemptVariables.server";
+import type { EnvironmentVariable } from "~/v3/environmentVariables/repository";
 import { machinePresetFromName } from "~/v3/machinePresets.server";
 import { meteringClaims } from "~/v3/utils/meteringClaims.server";
+import { refreshRunTokenOnHeartbeat } from "./runTokenRefresh.server";
 import type { WithRunEngineOptions } from "../baseService.server";
 import { WithRunEngine } from "../baseService.server";
 
@@ -65,7 +77,14 @@ if (workloadCreatedAtGateEnabled && !workloadTokenCutoff) {
   );
 }
 
-type WorkloadGateAction = "start" | "complete" | "continue" | "snapshots_since";
+type WorkloadGateAction =
+  | "start"
+  | "complete"
+  | "continue"
+  | "snapshots_since"
+  | "restore_outcome"
+  | "release"
+  | "suspend";
 
 const meter = getMeter("workload-auth-gate");
 
@@ -114,20 +133,85 @@ export class WorkerGroupTokenService extends WithRunEngine {
     const workerGroup = await this._prisma.workerInstanceGroup.findFirst({
       where: {
         token: {
-          tokenHash,
+          OR: [
+            { tokenHash },
+            { previousTokenHash: tokenHash, previousTokenValidUntil: { gt: new Date() } },
+          ],
         },
+      },
+      include: {
+        token: { select: { tokenHash: true, previousTokenValidUntil: true } },
       },
     });
 
     if (!workerGroup) {
-      logger.warn("[WorkerGroupTokenService] No matching worker group found", { token });
+      logger.warn("[WorkerGroupTokenService] No matching worker group found");
       return null;
     }
 
-    return workerGroup;
+    const { token: matchedToken, ...group } = workerGroup;
+    const tokenValidUntil =
+      matchedToken.tokenHash === tokenHash
+        ? undefined
+        : (matchedToken.previousTokenValidUntil ?? undefined);
+
+    return { ...group, tokenValidUntil };
   }
 
-  async rotateToken({ workerGroupId }: { workerGroupId: string }) {
+  async rotateToken({ workerGroupId, graceMs }: { workerGroupId: string; graceMs: number }) {
+    const workerGroup = await this._prisma.workerInstanceGroup.findFirst({
+      where: {
+        id: workerGroupId,
+      },
+      include: {
+        token: true,
+      },
+    });
+
+    if (!workerGroup) {
+      logger.error("[WorkerGroupTokenService] WorkerGroup not found", { workerGroupId });
+      return { outcome: "not_found" as const };
+    }
+
+    const activeGraceUntil = workerGroup.token.previousTokenValidUntil;
+    if (activeGraceUntil && activeGraceUntil.getTime() > Date.now()) {
+      logger.error("[WorkerGroupTokenService] Previous token still within grace", {
+        workerGroupId,
+        previousTokenValidUntil: activeGraceUntil,
+      });
+      return { outcome: "grace_active" as const, previousTokenValidUntil: activeGraceUntil };
+    }
+
+    const rawToken = await this.generateToken();
+    const previousTokenValidUntil = new Date(Date.now() + graceMs);
+
+    const updated = await this._prisma.workerGroupToken.updateMany({
+      where: {
+        id: workerGroup.tokenId,
+        tokenHash: workerGroup.token.tokenHash,
+      },
+      data: {
+        tokenHash: rawToken.hash,
+        previousTokenHash: workerGroup.token.tokenHash,
+        previousTokenValidUntil,
+      },
+    });
+
+    if (updated.count === 0) {
+      logger.error("[WorkerGroupTokenService] Concurrent token rotation detected", {
+        workerGroupId,
+      });
+      return { outcome: "conflict" as const };
+    }
+
+    return {
+      outcome: "rotated" as const,
+      plaintext: rawToken.plaintext,
+      previousTokenValidUntil,
+    };
+  }
+
+  async revokePreviousToken({ workerGroupId }: { workerGroupId: string }) {
     const workerGroup = await this._prisma.workerInstanceGroup.findFirst({
       where: {
         id: workerGroupId,
@@ -139,26 +223,18 @@ export class WorkerGroupTokenService extends WithRunEngine {
       return;
     }
 
-    const rawToken = await this.generateToken();
-
     const workerGroupToken = await this._prisma.workerGroupToken.update({
       where: {
         id: workerGroup.tokenId,
       },
       data: {
-        tokenHash: rawToken.hash,
+        previousTokenHash: null,
+        previousTokenValidUntil: null,
       },
     });
 
-    if (!workerGroupToken) {
-      logger.error("[WorkerGroupTokenService] WorkerGroupToken not found", { workerGroupId });
-      return;
-    }
-
     return {
       id: workerGroupToken.id,
-      tokenHash: workerGroupToken.tokenHash,
-      plaintext: rawToken.plaintext,
     };
   }
 
@@ -188,7 +264,6 @@ export class WorkerGroupTokenService extends WithRunEngine {
 
     if (!token.startsWith(this.tokenPrefix)) {
       logger.error("[WorkerGroupTokenService] Token does not start with expected prefix", {
-        token,
         prefix: this.tokenPrefix,
       });
       return;
@@ -212,22 +287,13 @@ export class WorkerGroupTokenService extends WithRunEngine {
       return;
     }
 
-    const encoder = new TextEncoder();
-
-    const a = encoder.encode(managedWorkerSecret);
-    const b = encoder.encode(env.MANAGED_WORKER_SECRET);
-
-    if (a.byteLength !== b.byteLength) {
-      logger.error("[WorkerGroupTokenService] Managed secret length mismatch", {
-        managedWorkerSecret,
-        headers: this.sanitizeHeaders(request),
-      });
-      return;
-    }
-
-    if (!timingSafeEqual(a, b)) {
+    if (
+      !matchesAnyManagedWorkerSecret(managedWorkerSecret, [
+        env.MANAGED_WORKER_SECRET,
+        env.MANAGED_WORKER_SECRET_PREVIOUS,
+      ])
+    ) {
       logger.error("[WorkerGroupTokenService] Managed secret mismatch", {
-        managedWorkerSecret,
         headers: this.sanitizeHeaders(request),
       });
       return;
@@ -241,7 +307,7 @@ export class WorkerGroupTokenService extends WithRunEngine {
         const workerGroup = await this.findWorkerGroup({ token });
 
         if (!workerGroup) {
-          logger.warn("[WorkerGroupTokenService] Worker group not found", { token });
+          logger.warn("[WorkerGroupTokenService] Worker group not found", { instanceName });
           return;
         }
 
@@ -261,7 +327,8 @@ export class WorkerGroupTokenService extends WithRunEngine {
         return new AuthenticatedWorkerInstance({
           prisma: this._prisma,
           engine: this._engine,
-          type: WorkerInstanceGroupType.MANAGED,
+          type: workerGroup.type,
+          projectId: workerGroup.projectId,
           name: workerGroup.name,
           workerGroupId: workerGroup.id,
           workerInstanceId: workerInstance.id,
@@ -269,6 +336,8 @@ export class WorkerGroupTokenService extends WithRunEngine {
           region: workerGroup.region,
           workloadType: workerGroup.workloadType,
           allowedSubscriptions: env.RUN_ENGINE_WORKER_QUEUE_SUBSCRIPTIONS[workerGroup.id] ?? [],
+          mixedRuntime: env.RUN_ENGINE_MIXED_RUNTIME_WORKER_GROUPS.includes(workerGroup.id),
+          tokenValidUntil: workerGroup.tokenValidUntil,
         });
       }
     );
@@ -276,6 +345,15 @@ export class WorkerGroupTokenService extends WithRunEngine {
     if (result.err) {
       logger.error("[WorkerGroupTokenService] Failed to authenticate worker instance", {
         error: result.err,
+      });
+      return;
+    }
+
+    if (result.val?.tokenValidUntil && result.val.tokenValidUntil.getTime() <= Date.now()) {
+      await authenticatedWorkerInstanceCache.authenticatedWorkerInstance.remove(cacheKey.join("-"));
+      logger.warn("[WorkerGroupTokenService] Previous worker group token has expired", {
+        instanceName,
+        workerGroupId: result.val.workerGroupId,
       });
       return;
     }
@@ -352,18 +430,13 @@ export class WorkerGroupTokenService extends WithRunEngine {
     }
   }
 
-  private sanitizeHeaders(request: Request, skipHeaders = ["authorization"]) {
-    const sanitizedHeaders: Partial<Record<string, string>> = {};
-
-    for (const [key, value] of request.headers.entries()) {
-      if (!skipHeaders.includes(key.toLowerCase())) {
-        sanitizedHeaders[key] = value;
-      }
-    }
-
-    return sanitizedHeaders;
+  private sanitizeHeaders(request: Request) {
+    return sanitizeWorkerHeaders(request.headers);
   }
 }
+
+// Each process warns once per group, as an instance is built on every worker request.
+const warnedRefusedGroups = new Set<string>();
 
 const WorkerInstanceEnv = z.enum(["dev", "staging", "prod"]).default("prod");
 type WorkerInstanceEnv = z.infer<typeof WorkerInstanceEnv>;
@@ -371,16 +444,20 @@ type WorkerInstanceEnv = z.infer<typeof WorkerInstanceEnv>;
 export type AuthenticatedWorkerInstanceOptions = WithRunEngineOptions<
   WorkerQueueConsumerOptions & {
     type: WorkerInstanceGroupType;
+    projectId?: string | null;
     name: string;
+    tokenValidUntil?: Date;
   }
 >;
 
 export class AuthenticatedWorkerInstance extends WithRunEngine {
   readonly type: WorkerInstanceGroupType;
+  readonly projectId: string | null;
   readonly name: string;
   readonly workerGroupId: string;
   readonly workerInstanceId: string;
   readonly masterQueue: string;
+  readonly tokenValidUntil?: Date;
   private readonly queueConsumer: WorkerQueueConsumer;
 
   // FIXME: Required for unmanaged workers
@@ -390,11 +467,23 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     super({ prisma: opts.prisma, engine: opts.engine });
 
     this.type = opts.type;
+    this.projectId = opts.projectId ?? null;
+    if (this.type === "UNMANAGED" && !this.projectId)
+      throw new Error("Unmanaged worker group must belong to a project");
     this.name = opts.name;
     this.workerGroupId = opts.workerGroupId;
     this.workerInstanceId = opts.workerInstanceId;
     this.masterQueue = opts.masterQueue;
+    this.tokenValidUntil = opts.tokenValidUntil;
     this.queueConsumer = createWorkerQueueConsumer(opts);
+
+    if (refusedSubscriptions(opts).length > 0 && !warnedRefusedGroups.has(opts.workerGroupId)) {
+      warnedRefusedGroups.add(opts.workerGroupId);
+      logger.warn(
+        "[WorkerGroupTokenService] Refusing container lanes for a MICROVM worker group that is not mixed",
+        { workerGroupId: opts.workerGroupId }
+      );
+    }
   }
 
   async connect(metadata: Record<string, any>): Promise<void> {
@@ -498,46 +587,80 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     runFriendlyId,
     snapshotFriendlyId,
     runnerId,
+    environmentId,
+    runTokenReport,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     runnerId?: string;
-  }): Promise<ExecutionResult> {
-    return await this._engine.heartbeatRun({
+    environmentId?: string;
+    runTokenReport?: RunTokenHeartbeatReport;
+  }): Promise<{ runToken?: string }> {
+    const heartbeat = await this._engine.heartbeatRun({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       workerId: this.workerInstanceId,
       runnerId,
     });
+
+    const runToken = await refreshRunTokenOnHeartbeat({
+      report: runTokenReport,
+      heartbeat,
+      snapshotFriendlyId,
+      environmentId,
+      findRun: (runId) =>
+        this._engine.runStore.findRun(
+          { id: runId },
+          { select: { taskIdentifier: true, runtimeEnvironmentId: true, lockedById: true } }
+        ),
+      replica: this._replica,
+    });
+
+    return { runToken };
   }
 
   async startRunAttempt({
     runFriendlyId,
     snapshotFriendlyId,
     isWarmStart,
+    workerCell,
+    workerLane,
     runnerId,
     environmentId,
+    supportsRunTokenRefresh,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     isWarmStart?: boolean;
+    workerCell?: string;
+    workerLane?: string;
     runnerId?: string;
     environmentId?: string;
+    supportsRunTokenRefresh?: boolean;
   }): Promise<
     StartRunAttemptResult & {
       envVars: Record<string, string>;
     }
   > {
-    await this.assertCreatedAtGate({
-      runId: fromFriendlyId(runFriendlyId),
-      environmentId,
-      action: "start",
-    });
+    const runId = fromFriendlyId(runFriendlyId);
+
+    await this.assertCreatedAtGate({ runId, environmentId, action: "start" });
+
+    // Resolved before the attempt exists, so an unavailable key leaves the run startable.
+    const environment = await this.findAttemptEnvironment(runId, environmentId);
+    const variables = await resolveAttemptVariables(
+      environment,
+      environment.parentEnvironment ?? undefined
+    );
+
+    const stamped = acceptsWorkerStamp(this.type);
 
     const engineResult = await this._engine.startRunAttempt({
-      runId: fromFriendlyId(runFriendlyId),
+      runId,
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       isWarmStart,
+      workerCell: stamped ? workerCell : undefined,
+      workerLane: stamped ? workerLane : undefined,
       workerId: this.workerInstanceId,
       runnerId,
       environmentId,
@@ -545,34 +668,26 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
 
     const defaultMachinePreset = machinePresetFromName(defaultMachine);
 
-    const environmentReader =
-      env.CONTROL_PLANE_DEQUEUE_READS_FROM_REPLICA === "1" ? this._replica : this._prisma;
+    const runToken =
+      supportsRunTokenRefresh === true &&
+      environmentId === environment.id &&
+      runTokenInjectionEnabled(environment.organization?.featureFlags)
+        ? await this.mintRunTokenOrSkip(environment, engineResult)
+        : undefined;
 
-    const environment = await environmentReader.runtimeEnvironment.findFirst({
-      where: {
-        id: engineResult.execution.environment.id,
-      },
-      include: {
-        parentEnvironment: true,
-        // Feeds resolveProdApiOrigin; only loaded when internal-origin routing is possible.
-        ...(env.INTERNAL_API_ORIGIN ? { organization: { select: { featureFlags: true } } } : {}),
-      },
-    });
-
-    const envVars = environment
-      ? await this.getEnvVars(
-          environment,
-          engineResult.run.id,
-          engineResult.execution.machine ?? defaultMachinePreset,
-          meteringClaims({
-            environmentType: environment.type,
-            region: engineResult.run.region,
-            workerQueue: engineResult.run.workerQueue,
-          }),
-          environment.parentEnvironment ?? undefined,
-          engineResult.run.taskEventStore ?? undefined
-        )
-      : {};
+    const envVars = await this.getEnvVars(
+      variables,
+      environment,
+      engineResult.run.id,
+      engineResult.execution.machine ?? defaultMachinePreset,
+      meteringClaims({
+        environmentType: environment.type,
+        region: engineResult.run.region,
+        workerQueue: engineResult.run.workerQueue,
+      }),
+      engineResult.run.taskEventStore ?? undefined,
+      runToken
+    );
 
     return {
       ...engineResult,
@@ -580,16 +695,75 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     };
   }
 
+  // The engine validates the header's scope before any resolved variables are returned.
+  private async findAttemptEnvironment(runId: string, environmentId?: string) {
+    if (!environmentId) {
+      const run = await this._engine.runStore.findRun(
+        { id: runId },
+        { select: { runtimeEnvironmentId: true } }
+      );
+      if (!run) throw json({ error: "Run environment unavailable" }, { status: 503 });
+      environmentId = run.runtimeEnvironmentId;
+    }
+
+    const environmentReader =
+      env.CONTROL_PLANE_DEQUEUE_READS_FROM_REPLICA === "1" ? this._replica : this._prisma;
+
+    const environment = await environmentReader.runtimeEnvironment.findFirst({
+      where: {
+        id: environmentId,
+        ...(this.type === "UNMANAGED" ? { projectId: this.projectId! } : {}),
+      },
+      include: {
+        parentEnvironment: true,
+        // Feeds resolveProdApiOrigin and the run-token flag; only loaded when either can apply.
+        ...(env.INTERNAL_API_ORIGIN || env.RUN_TOKEN_ISSUER_URL
+          ? { organization: { select: { featureFlags: true } } }
+          : {}),
+      },
+    });
+    if (!environment) throw json({ error: "Runtime environment unavailable" }, { status: 503 });
+    return environment;
+  }
+
+  // A signing failure must not fail the attempt: the run still has TRIGGER_SECRET_KEY.
+  private async mintRunTokenOrSkip(
+    environment: RuntimeEnvironment,
+    engineResult: StartRunAttemptResult
+  ): Promise<string | undefined> {
+    const { execution } = engineResult;
+    try {
+      return await mintRunToken({
+        organizationId: environment.organizationId,
+        projectId: environment.projectId,
+        environmentId: environment.id,
+        environmentType: environment.type,
+        runFriendlyId: execution.run.id,
+        attemptNumber: execution.attempt.number,
+        taskIdentifier: execution.task.id,
+        deploymentFriendlyId: execution.deployment?.id,
+      });
+    } catch (error) {
+      logger.warn("Failed to mint run token, continuing without it", {
+        runId: execution.run.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
   async completeRunAttempt({
     runFriendlyId,
     snapshotFriendlyId,
     completion,
+    forceRequeue,
     runnerId,
     environmentId,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
     completion: TaskRunExecutionResult;
+    forceRequeue?: boolean;
     runnerId?: string;
     environmentId?: string;
   }): Promise<CompleteRunAttemptResult> {
@@ -603,6 +777,7 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
       completion,
+      forceRequeue,
       workerId: this.workerInstanceId,
       runnerId,
       environmentId,
@@ -624,6 +799,21 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     });
   }
 
+  async authorizeSuspend(runFriendlyId: string, environmentId?: string) {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "suspend",
+    });
+    const snapshot = await this._engine.runStore.findLatestExecutionSnapshot(
+      fromFriendlyId(runFriendlyId),
+      this._prisma,
+      environmentId
+    );
+    if (!snapshot) throw json({ error: "Run does not belong to this worker" }, { status: 403 });
+    return snapshot.environmentId;
+  }
+
   async createCheckpoint({
     runFriendlyId,
     snapshotFriendlyId,
@@ -634,6 +824,7 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     snapshotFriendlyId: string;
     checkpoint: CheckpointInput;
     runnerId?: string;
+    environmentId?: string;
   }) {
     return await this._engine.createCheckpoint({
       runId: fromFriendlyId(runFriendlyId),
@@ -678,15 +869,23 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
     message,
     runnerId,
     environmentId,
+    fallbackWorkerQueue,
   }: {
     runFriendlyId: string;
     snapshotFriendlyId: string;
-    outcome: "requeue" | "fail";
+    outcome: "requeue" | "fail" | "fallback";
     reason: string;
     message?: string;
     runnerId?: string;
     environmentId?: string;
+    fallbackWorkerQueue?: (workerQueue: string) => string | undefined;
   }) {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "restore_outcome",
+    });
+
     return await this._engine.reportRestoreOutcome({
       runId: fromFriendlyId(runFriendlyId),
       snapshotId: fromFriendlyId(snapshotFriendlyId),
@@ -696,6 +895,38 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
       workerId: this.workerInstanceId,
       runnerId,
       environmentId,
+      fallbackWorkerQueue,
+      servesWorkerQueue: (workerQueue) => workerServesQueue(this.queueConsumer, workerQueue),
+    });
+  }
+
+  async releaseRun({
+    runFriendlyId,
+    snapshotFriendlyId,
+    reason,
+    runnerId,
+    environmentId,
+  }: {
+    runFriendlyId: string;
+    snapshotFriendlyId: string;
+    reason: string;
+    runnerId?: string;
+    environmentId?: string;
+  }) {
+    await this.assertCreatedAtGate({
+      runId: fromFriendlyId(runFriendlyId),
+      environmentId,
+      action: "release",
+    });
+
+    return await this._engine.releaseRun({
+      runId: fromFriendlyId(runFriendlyId),
+      snapshotId: fromFriendlyId(snapshotFriendlyId),
+      reason,
+      workerId: this.workerInstanceId,
+      runnerId,
+      environmentId,
+      servesWorkerQueue: (workerQueue) => workerServesQueue(this.queueConsumer, workerQueue),
     });
   }
 
@@ -723,7 +954,7 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
 
   toJSON(): WorkerGroupTokenAuthenticationResponse {
     return {
-      type: WorkerInstanceGroupType.MANAGED,
+      type: this.type,
       name: this.name,
       workerGroupId: this.workerGroupId,
       workerInstanceId: this.workerInstanceId,
@@ -732,15 +963,14 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
   }
 
   private async getEnvVars(
+    variables: EnvironmentVariable[],
     environment: RuntimeEnvironment,
     runId: string,
     machinePreset: MachinePreset,
     metering: Record<string, string>,
-    parentEnvironment?: RuntimeEnvironment,
-    taskEventStore?: string
+    taskEventStore?: string,
+    runToken?: string
   ): Promise<Record<string, string>> {
-    const variables = await resolveVariablesForEnvironment(environment, parentEnvironment);
-
     const jwt = await generateJWTTokenForEnvironment(environment, {
       ...metering,
       run_id: runId,
@@ -754,6 +984,10 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
         { key: "TRIGGER_MACHINE_PRESET", value: machinePreset.name },
       ]
     );
+
+    if (runToken) {
+      variables.push({ key: "TRIGGER_RUN_TOKEN", value: runToken });
+    }
 
     if (taskEventStore) {
       const resourceAttributes = JSON.stringify({
@@ -775,20 +1009,10 @@ export class AuthenticatedWorkerInstance extends WithRunEngine {
   }
 }
 
-export type WorkerGroupTokenAuthenticationResponse =
-  | {
-      type: typeof WorkerInstanceGroupType.MANAGED;
-      name: string;
-      workerGroupId: string;
-      workerInstanceId: string;
-      masterQueue: string;
-    }
-  | {
-      type: typeof WorkerInstanceGroupType.UNMANAGED;
-      name: string;
-      workerGroupId: string;
-      workerInstanceId: string;
-      masterQueue: string;
-      environmentId: string;
-      deploymentId: string;
-    };
+export type WorkerGroupTokenAuthenticationResponse = {
+  type: WorkerInstanceGroupType;
+  name: string;
+  workerGroupId: string;
+  workerInstanceId: string;
+  masterQueue: string;
+};

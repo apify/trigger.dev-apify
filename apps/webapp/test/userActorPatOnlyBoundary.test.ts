@@ -1,7 +1,7 @@
 /**
  * The boundary a delegated user-actor token has to respect, as one test: it is a first-class
- * credential on the actor-aware routes, which check its claims, and is refused at the entrance
- * of the PAT-only helper, which checks nothing — including the admin gate that helper backs.
+ * credential on the actor-aware routes, which check its claims; the alert channel route refuses
+ * it after the write check, and the PAT-only helper behind the admin gate refuses it outright.
  */
 
 import { postgresTest } from "@internal/testcontainers";
@@ -21,9 +21,12 @@ vi.mock("~/db.server", () => {
   );
   return { prisma: proxy, $replica: proxy, sqlDatabaseSchema: undefined };
 });
-vi.mock("~/env.server", () => ({
-  env: { SESSION_SECRET, ENCRYPTION_KEY },
-}));
+vi.mock("~/env.server", async () => {
+  const { withLegacyEncryptionKeyring } = await import("./helpers/encryptionEnv");
+  return {
+    env: withLegacyEncryptionKeyring({ SESSION_SECRET, ENCRYPTION_KEY, ADMIN_API_ENABLED: true }),
+  };
+});
 vi.mock("~/services/logger.server", () => ({
   logger: { debug: vi.fn(), error: vi.fn(), warn: vi.fn(), info: vi.fn() },
 }));
@@ -61,6 +64,19 @@ vi.mock("~/services/rbac.server", async () => {
             organizationId: context.organizationId ?? "",
           },
           ability: buildJwtAbility(claims.cap ?? ["read:all"]),
+        };
+      },
+      authenticatePat: async (request: Request) => {
+        const { authenticateApiRequestWithPersonalAccessToken } =
+          await import("~/services/personalAccessToken.server");
+        const auth = await authenticateApiRequestWithPersonalAccessToken(request);
+        if (!auth) return { ok: false, status: 401, error: "Invalid or Missing Access Token" };
+        return {
+          ok: true,
+          userId: auth.userId,
+          tokenId: "pat_test",
+          lastAccessedAt: new Date(),
+          ability: { can: () => true, canSuper: () => false },
         };
       },
     },
@@ -159,7 +175,7 @@ function listProjects(token: string) {
   });
 }
 
-/** Arm 2: a mutation behind the PAT-only helper. */
+/** Arm 2: an actor-aware mutation the read-only cap does not cover. */
 function createAlertChannel(token: string, projectRef: string) {
   return call(alertChannelsAction, {
     request: bearer(`https://api.trigger.dev/api/v1/projects/${projectRef}/alert-channels`, token, {
@@ -203,9 +219,22 @@ postgresTest(
       seeded.project.externalRef
     );
 
-    // Refused: the legacy mutation helper checks nothing.
+    // Refused: the cap has no write:alerts.
     const mutation = await createAlertChannel(token, seeded.project.externalRef);
-    expect(mutation.status).toBe(401);
+    expect(mutation.status).toBe(403);
+    expect(
+      await prisma.projectAlertChannel.count({ where: { projectId: seeded.project.id } })
+    ).toBe(0);
+
+    // Refused: the alert channel route is PAT-only even when the cap covers it.
+    const writeToken = await signUserActorToken(SESSION_SECRET, {
+      userId: seeded.user.id,
+      client: "dashboard-agent",
+      environmentId: seeded.environment.id,
+      cap: [...READ_ONLY_CAP, "write:alerts"],
+    });
+    const writeMutation = await createAlertChannel(writeToken, seeded.project.externalRef);
+    expect(writeMutation.status).toBe(401);
     expect(
       await prisma.projectAlertChannel.count({ where: { projectId: seeded.project.id } })
     ).toBe(0);

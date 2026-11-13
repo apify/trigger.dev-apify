@@ -14,6 +14,7 @@ import { ShortcutKey } from "./ShortcutKey";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./Tooltip";
 import { Icon, type RenderIcon } from "./Icon";
 import { Spinner } from "./Spinner";
+import { sanitizeLinkTarget } from "~/utils/sanitizeUrl";
 
 const sizes = {
   small: {
@@ -247,6 +248,8 @@ export type ButtonContentPropsType = {
   variant: ButtonVariant;
   shortcutPosition?: "before-trailing-icon" | "after-trailing-icon";
   tooltip?: ReactNode;
+  /** Milliseconds before `tooltip` opens. Opens at once when unset. */
+  tooltipDelay?: number;
   iconSpacing?: string;
   hideShortcutKey?: boolean;
   isLoading?: boolean;
@@ -264,6 +267,7 @@ export function ButtonContent(props: ButtonContentPropsType) {
     textAlignLeft,
     className,
     tooltip,
+    tooltipDelay,
     iconSpacing,
     hideShortcutKey,
     isLoading,
@@ -371,7 +375,7 @@ export function ButtonContent(props: ButtonContentPropsType) {
   if (tooltip) {
     return (
       <TooltipProvider>
-        <Tooltip>
+        <Tooltip delayDuration={tooltipDelay}>
           <TooltipTrigger asChild>{buttonContent}</TooltipTrigger>
           <TooltipContent className="flex items-center gap-1.5 py-1.5 pl-2.5 pr-2 text-xs text-text-bright">
             {tooltip} {shortcut && renderShortcutKey()}
@@ -386,13 +390,32 @@ export function ButtonContent(props: ButtonContentPropsType) {
 
 type ButtonPropsType = Pick<
   JSX.IntrinsicElements["button"],
-  "type" | "disabled" | "onClick" | "name" | "value" | "form" | "autoFocus" | "aria-label"
+  | "type"
+  | "disabled"
+  | "onClick"
+  | "name"
+  | "value"
+  | "form"
+  | "autoFocus"
+  | "aria-label"
+  | "aria-describedby"
 > &
   React.ComponentProps<typeof ButtonContent>;
 
 /* oxlint-disable react/button-has-type -- Callers can select button, reset, or submit semantics. */
 export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
-  ({ type, disabled, autoFocus, onClick, "aria-label": ariaLabel, ...props }, ref) => {
+  (
+    {
+      type,
+      disabled,
+      autoFocus,
+      onClick,
+      "aria-label": ariaLabel,
+      "aria-describedby": ariaDescribedBy,
+      ...props
+    },
+    ref
+  ) => {
     const innerRef = useRef<HTMLButtonElement>(null);
     useImperativeHandle(ref, () => innerRef.current as HTMLButtonElement);
 
@@ -422,6 +445,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
         form={props.form}
         autoFocus={autoFocus}
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
       >
         <ButtonContent
           {...props}
@@ -434,7 +458,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonPropsType>(
     if (props.tooltip) {
       return (
         <TooltipProvider>
-          <Tooltip>
+          <Tooltip delayDuration={props.tooltipDelay}>
             <TooltipTrigger asChild>
               <span className={cn("flex", isDisabled && "cursor-default")}>{buttonElement}</span>
             </TooltipTrigger>
@@ -489,7 +513,9 @@ export const LinkButton = ({
     disabled: disabled || !props.shortcut,
   });
 
-  if (disabled) {
+  const linkTarget = typeof to === "string" ? sanitizeLinkTarget(to) : to;
+
+  if (disabled || linkTarget === undefined) {
     return (
       <div
         className={cn(
@@ -502,13 +528,13 @@ export const LinkButton = ({
     );
   }
 
-  if (to.toString().startsWith("/resources")) {
+  if (linkTarget.toString().startsWith("/resources")) {
     return (
       <a
-        href={to.toString()}
+        href={linkTarget.toString()}
         ref={innerRef}
         target="_blank"
-        rel={newTabRel(to.toString())}
+        rel={newTabRel(linkTarget.toString())}
         className={cn("group/button block focus-custom", props.fullWidth ? "w-full" : "")}
         onClick={onClick}
         onMouseDown={onMouseDown}
@@ -522,10 +548,10 @@ export const LinkButton = ({
     );
   }
 
-  if (to.toString().startsWith("http")) {
+  if (linkTarget.toString().startsWith("http")) {
     return (
       <ExtLink
-        href={to.toString()}
+        href={linkTarget.toString()}
         ref={innerRef}
         className={cn("group/button block focus-custom", props.fullWidth ? "w-full" : "")}
         onClick={onClick}
@@ -541,7 +567,7 @@ export const LinkButton = ({
   } else {
     return (
       <Link
-        to={to}
+        to={linkTarget}
         ref={innerRef}
         replace={replace}
         className={cn("group/button block focus-custom", props.fullWidth ? "w-full" : "w-fit")}

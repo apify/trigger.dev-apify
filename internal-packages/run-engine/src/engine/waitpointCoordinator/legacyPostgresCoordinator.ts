@@ -1,4 +1,8 @@
-import type { RunStore } from "@internal/run-store";
+import {
+  DelegatingRunStore,
+  type RunStore,
+  type WaitpointColocationOptions,
+} from "@internal/run-store";
 import { tryCatch } from "@trigger.dev/core/v3";
 import {
   mintWaitpointIdFor,
@@ -6,18 +10,30 @@ import {
   UnclassifiableRunId,
 } from "@trigger.dev/core/v3/isomorphic";
 import type { Logger } from "@trigger.dev/core/logger";
-import type { PrismaClient, Waitpoint } from "@trigger.dev/database";
+import type { PrismaClient, PrismaClientOrTransaction, Waitpoint } from "@trigger.dev/database";
 import { boundedIn, Prisma } from "@trigger.dev/database";
 import { nanoid } from "nanoid";
 import { UnclassifiableWaitpointId } from "../errors.js";
 import type {
+  AbandonRunBlockersParams,
+  AbsorbBlockersParams,
+  AbsorbedBlockersParams,
+  AbsorbBlockersResult,
+  AcknowledgeResumeParams,
+  PrepareWaitpointResumeParams,
+  WaitpointResumeIntent,
   AssociatedWaitpointData,
+  AssociatedWaitpointPlan,
+  BlockerRegistration,
   ClearRunBlockStateParams,
+  CreateBatchWaitpointParams,
+  ReleaseRunBlockersParams,
   CompleteParams,
   CompleteResult,
   CreateDateTimeWaitpointParams,
   CreateManualWaitpointParams,
   CreateWaitpointResult,
+  RegisterBlockersResult,
   RegisterBlocksLocklessParams,
   RegisterBlocksParams,
   RunBlockEdge,
@@ -52,6 +68,16 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
     this.#getRunStore = options.runStore;
     this.prisma = options.prisma;
     this.logger = options.logger;
+  }
+
+  /** Enabled key arbitration only: reuse the original legacy creators on the owning transaction. */
+  withKeyClaim(claim: NonNullable<CreateDateTimeWaitpointParams["keyClaim"]>) {
+    const store = new KeyClaimRunStore(claim.store, claim.tx);
+    return new LegacyPostgresWaitpointCoordinator({
+      runStore: () => store,
+      prisma: this.prisma,
+      logger: this.logger,
+    });
   }
 
   async clearRunBlockState({
@@ -118,6 +144,90 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
   async registerBlocksLockless(params: RegisterBlocksLocklessParams): Promise<void> {
     await this.#writeBlockEdges(params);
   }
+
+  async finalizeBlockers(_params: AbsorbedBlockersParams): Promise<void> {}
+
+  async hasAbsorbedBlockers(_params: AbsorbedBlockersParams): Promise<boolean> {
+    return false;
+  }
+
+  // Phase 1. Legacy has no absorb/register split: the edge write IS the absorption, and the separate
+  // pending re-count is the same READ COMMITTED re-read `registerBlocks` does. The count is carried in
+  // the noop continuation so phase 3 can return it unchanged.
+  async absorbBlockers({ client, ...edge }: AbsorbBlockersParams): Promise<AbsorbBlockersResult> {
+    await this.#writeBlockEdges(edge);
+    const pendingCount = await this.runStore.countPendingWaitpoints(
+      edge.waitpointIds,
+      client,
+      edge.runId
+    );
+    return { pendingCount, registration: { kind: "noop", pendingCount } };
+  }
+
+  // Phase 3. Nothing to register for a Postgres blocker — completion fans out at complete() time by
+  // querying the edges. Returns the pending count absorb carried, so the caller's resume decision is
+  // identical to today's single-call behaviour.
+  async registerBlockers(registration: BlockerRegistration): Promise<RegisterBlockersResult> {
+    if (registration.kind !== "noop") {
+      throw new Error(
+        `LegacyPostgresWaitpointCoordinator.registerBlockers received a ${registration.kind} continuation`
+      );
+    }
+    return { pendingCount: registration.pendingCount };
+  }
+
+  // Postgres has no store block-operation id.
+  async currentStoreBlockId(): Promise<string | undefined> {
+    return undefined;
+  }
+
+  // Postgres has no watcher registration or resume handoff to acknowledge — completion already fanned
+  // out at complete() time — so the resume cleanup is just deleting the run's consumed edge rows.
+  async prepareResume(
+    _params: PrepareWaitpointResumeParams
+  ): Promise<WaitpointResumeIntent | undefined> {
+    return undefined;
+  }
+
+  async readResumeIntent(): Promise<WaitpointResumeIntent | undefined> {
+    return undefined;
+  }
+
+  async acknowledgeResume(params: AcknowledgeResumeParams): Promise<void> {
+    await this.clearRunBlockState({ runId: params.runId, edgeIds: params.edgeIds });
+  }
+
+  // No terminal-fence to install for Postgres: deleting the edge rows is the cancel/terminal cleanup.
+  async releaseRunBlockers(params: ReleaseRunBlockersParams): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No terminal marker to avoid either: a retry abandon is the same edge delete for Postgres.
+  async abandonRunBlockers(params: AbandonRunBlockersParams): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No store watchers to withdraw on the legacy half — the retained store replay never reaches here.
+  async resumeRetainedWithdrawal(): Promise<{ count: number }> {
+    return { count: 0 };
+  }
+
+  // A pure-Postgres run IS legacy-only: delete its edges in the caller's client, before the transition.
+  async clearLegacyBlockersBeforeTransition(params: {
+    runId: string;
+    organizationId?: string;
+    tx?: PrismaClientOrTransaction;
+  }): Promise<{ count: number }> {
+    return this.clearRunBlockState({ runId: params.runId, tx: params.tx });
+  }
+
+  // No store contribution to compensate on the legacy half of a mixed absorption.
+  async compensateAbsorption(): Promise<void> {}
+
+  // No store block to fence: a pure-Postgres run never installs a MemoryDB cycle over a previous one.
+  async armCleanupFence(): Promise<void> {}
+
+  async assertNoCleanupOwed(): Promise<void> {}
 
   async complete({ waitpointId, output }: CompleteParams): Promise<CompleteResult> {
     // Residency store-selection guard. complete arrives with only (waitpointId, output) — no run
@@ -390,6 +500,8 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
         return { kind: "created", waitpoint };
       } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+          // A failed statement aborts the claim transaction; only a fresh transaction can retry it.
+          if (this.runStore instanceof KeyClaimRunStore) throw error;
           // Handle unique constraint violation (conflict)
           attempts++;
           if (attempts >= maxRetries) {
@@ -404,6 +516,32 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
     }
 
     throw new Error(`Failed to create waitpoint after ${maxRetries} attempts due to conflicts.`);
+  }
+
+  async createBatchWaitpoint({
+    batchId,
+    environmentId,
+    projectId,
+    tx,
+  }: CreateBatchWaitpointParams): Promise<CreateWaitpointResult> {
+    // From the batch, not the blocked run: the create passes only completedByBatchId, which is the owner
+    // the router validates against. The id anchors to the batch id. A duplicate batch idempotency key
+    // raises P2002, which the caller maps to its own "already created" contract.
+    const waitpoint = await this.runStore.createWaitpoint(
+      {
+        data: {
+          ...mintWaitpointIdFor(batchId),
+          type: "BATCH",
+          idempotencyKey: batchId,
+          userProvidedIdempotencyKey: false,
+          completedByBatchId: batchId,
+          environmentId,
+          projectId,
+        },
+      },
+      tx
+    );
+    return { kind: "created", waitpoint };
   }
 
   mintAssociatedWaitpointData({
@@ -442,6 +580,26 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
     });
   }
 
+  // Legacy only ever mints legacy; the router selects store when eligible and never reaches here for one.
+  async planAssociatedWaitpoint(params: {
+    projectId: string;
+    environmentId: string;
+    anchorRunId: string;
+  }): Promise<AssociatedWaitpointPlan> {
+    return { residency: "legacy", data: this.mintAssociatedWaitpointData(params) };
+  }
+
+  // A legacy run's RUN waitpoint is a Postgres row reached through `run.associatedWaitpoint`, never a
+  // derived store id, so there is nothing to discover here.
+  async findAssociatedRunWaitpointId(): Promise<string | undefined> {
+    return undefined;
+  }
+
+  // A legacy run's association is a Postgres row read directly by the caller, never a store record.
+  async readAssociatedRunWaitpoint(): Promise<Waitpoint | undefined> {
+    return undefined;
+  }
+
   /**
    * The edge write, shared by both register paths so they cannot drift.
    *
@@ -465,5 +623,39 @@ export class LegacyPostgresWaitpointCoordinator implements WaitpointCoordinator 
       batchId,
       batchIndex,
     });
+  }
+}
+
+/** Used only after the enabled caller has acquired the physical key owner's transaction. */
+class KeyClaimRunStore extends DelegatingRunStore {
+  constructor(
+    delegate: RunStore,
+    private readonly claimTx: PrismaClientOrTransaction
+  ) {
+    super(delegate);
+  }
+
+  override findWaitpoint<T extends Prisma.WaitpointFindFirstArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointFindFirstArgs>,
+    _client?: Parameters<RunStore["findWaitpoint"]>[1],
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T> | null> {
+    return this.delegate.findWaitpoint(args, this.claimTx, opts);
+  }
+
+  override updateWaitpoint<T extends Prisma.WaitpointUpdateArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointUpdateArgs>,
+    _tx?: PrismaClientOrTransaction,
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T>> {
+    return this.delegate.updateWaitpoint(args, this.claimTx, opts);
+  }
+
+  override upsertWaitpoint<T extends Prisma.WaitpointUpsertArgs>(
+    args: Prisma.SelectSubset<T, Prisma.WaitpointUpsertArgs>,
+    _tx?: PrismaClientOrTransaction,
+    opts?: WaitpointColocationOptions
+  ): Promise<Prisma.WaitpointGetPayload<T>> {
+    return this.delegate.upsertWaitpoint(args, this.claimTx, opts);
   }
 }

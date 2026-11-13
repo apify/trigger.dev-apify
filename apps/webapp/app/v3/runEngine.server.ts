@@ -1,4 +1,8 @@
-import { RunEngine } from "@internal/run-engine";
+import { createWaitpointStoreEnabledResolver } from "./utils/waitpointStoreEnabled.server";
+import { FEATURE_FLAG } from "./featureFlags";
+import { globalFlagsRegistry } from "./globalFlagsRegistry.server";
+import { RunEngine, StoreWaitpointCoordinator } from "@internal/run-engine";
+import { waitpointStoreConnection } from "./waitpointStore.server";
 import { $replica, prisma } from "~/db.server";
 import { env } from "~/env.server";
 import { createBatchGlobalRateLimiter } from "~/runEngine/concerns/batchGlobalRateLimiter.server";
@@ -19,7 +23,30 @@ export const engine = singleton("RunEngine", createRunEngine);
 export type { RunEngine };
 
 function createRunEngine() {
+  const waitpointConnection = waitpointStoreConnection;
   const engine = new RunEngine({
+    waitpointStore: waitpointConnection?.store,
+    waitpointFanoutStore: waitpointConnection?.store,
+    waitpointRouting: waitpointConnection
+      ? {
+          store: new StoreWaitpointCoordinator({ store: waitpointConnection.store }),
+          mintPolicy: {
+            // WaitpointSystem checks the one organization/global activation flag first.
+            resolveMintMode: () => "redis",
+            isCapabilityReady: () => true,
+            eligibleTypes: new Set<"RUN" | "DATETIME" | "BATCH" | "MANUAL">([
+              "RUN",
+              "DATETIME",
+              "BATCH",
+              "MANUAL",
+            ]),
+          },
+        }
+      : undefined,
+    waitpointStoreEnabled: createWaitpointStoreEnabledResolver(
+      () => globalFlagsRegistry.current(),
+      prisma
+    ),
     prisma,
     readOnlyPrisma: $replica,
     crossSeamGuard: pickRunOpsStoreForCompletion,
@@ -60,15 +87,29 @@ function createRunEngine() {
       baseCostInCents: env.CENTS_PER_RUN,
     },
     queue: {
+      // A deploying deployment reaches DEPLOYED or TIMED_OUT within DEPLOY_TIMEOUT_MS of
+      // entering DEPLOYING, so twice that only catches deployments whose timeout never fired.
+      deploymentWaitMaxMs: env.DEPLOY_TIMEOUT_MS * 2,
+      // Global flag first so the mode can change without a deploy; it's read from the in-memory
+      // flag snapshot, so this adds no query per dequeue. Per-org overrides would need the org's
+      // flags on the dequeue path, which isn't loaded there.
+      deploymentStatusMode: () =>
+        globalFlagsRegistry.current()?.[FEATURE_FLAG.deploymentStatusMode] ??
+        env.RUN_ENGINE_DEPLOYMENT_STATUS_MODE,
       defaultEnvConcurrency: env.DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT,
       defaultEnvConcurrencyBurstFactor: env.DEFAULT_ENV_EXECUTION_CONCURRENCY_BURST_FACTOR,
       totalConcurrencyEnabled: env.RUN_ENGINE_TOTAL_CONCURRENCY_LIMITS_ENABLED === "1",
       gatesEnabled: env.RUN_ENGINE_QUEUE_GATES_ENABLED === "1",
+      concurrencyKeyLimitsEnabled: env.RUN_ENGINE_CONCURRENCY_KEY_LIMITS_ENABLED === "1",
       reconcile: {
         enabled: env.RUN_ENGINE_QUEUE_RECONCILE_ENABLED === "1",
         scanCount: env.RUN_ENGINE_QUEUE_RECONCILE_SCAN_COUNT,
         lockTtlSeconds: env.RUN_ENGINE_QUEUE_RECONCILE_LOCK_TTL_SECONDS,
         maxPassesPerDequeue: env.RUN_ENGINE_QUEUE_RECONCILE_MAX_PASSES_PER_DEQUEUE,
+      },
+      gateSkipAhead: {
+        enabled: env.RUN_ENGINE_QUEUE_GATE_SKIP_AHEAD_ENABLED === "1",
+        readMultiplier: env.RUN_ENGINE_QUEUE_GATE_SKIP_AHEAD_READ_MULTIPLIER,
       },
       logLevel: env.RUN_ENGINE_RUN_QUEUE_LOG_LEVEL,
       redis: {
@@ -105,6 +146,7 @@ function createRunEngine() {
         processMarkedSchedule: env.RUN_ENGINE_CONCURRENCY_SWEEPER_PROCESS_MARKED_SCHEDULE,
         scanJitterInMs: env.RUN_ENGINE_CONCURRENCY_SWEEPER_SCAN_JITTER_IN_MS,
         processMarkedJitterInMs: env.RUN_ENGINE_CONCURRENCY_SWEEPER_PROCESS_MARKED_JITTER_IN_MS,
+        scanCount: env.RUN_ENGINE_CONCURRENCY_SWEEPER_SCAN_COUNT,
       },
       ttlSystem: {
         disabled: env.RUN_ENGINE_TTL_SYSTEM_DISABLED,
@@ -116,14 +158,6 @@ function createRunEngine() {
         batchMaxSize: env.RUN_ENGINE_TTL_WORKER_BATCH_MAX_SIZE,
         batchMaxWaitMs: env.RUN_ENGINE_TTL_WORKER_BATCH_MAX_WAIT_MS,
       },
-      ckVirtualTimeScheduling: env.RUN_ENGINE_CK_VTIME_SCHEDULING_ENABLED
-        ? {
-            enabled: true,
-            quantum: env.RUN_ENGINE_CK_VTIME_QUANTUM,
-            scanWindowMultiplier: env.RUN_ENGINE_CK_VTIME_WINDOW_MULTIPLIER,
-            stateTtlSeconds: env.RUN_ENGINE_CK_VTIME_STATE_TTL_SECONDS,
-          }
-        : undefined,
     },
     runLock: {
       redis: {
@@ -176,6 +210,7 @@ function createRunEngine() {
       factor: env.RUN_ENGINE_SUSPENDED_HEARTBEAT_RETRIES_FACTOR,
     },
     retryWarmStartThresholdMs: env.RUN_ENGINE_RETRY_WARM_START_THRESHOLD_MS,
+    duplicateAttemptStartCheck: env.RUN_ENGINE_DUPLICATE_ATTEMPT_START_CHECK,
     pendingVersionRunIdLookup: runEnginePendingVersionLookup,
     externalDeploymentParkDeadlineMs: env.EXTERNAL_DEPLOYMENT_PARK_DEADLINE_MS,
     billing: {
@@ -256,6 +291,7 @@ function createRunEngine() {
         maxTimeoutInMs: 30_000,
         factor: 2,
         randomize: true,
+        infrastructureMaxAttempts: env.BATCH_QUEUE_INFRA_RETRY_MAX_ATTEMPTS,
       },
     },
     // Debounce configuration
@@ -266,6 +302,9 @@ function createRunEngine() {
       useReplicaForFastPathRead: env.RUN_ENGINE_DEBOUNCE_USE_REPLICA_FOR_FAST_PATH_READ === "1",
     },
   });
+
+  // Keep the engine and shared MemoryDB connection for the process lifetime so HTTP,
+  // snapshot readers and other event consumers can finish during the server drain.
 
   return engine;
 }

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file provides guidance to Claude Code when working with this repository. Subdirectory CLAUDE.md files provide deeper context when you navigate into specific areas.
+This file provides guidance to Claude Code when working with this repository. Subdirectory AGENTS.md files provide deeper context when you navigate into specific areas.
 
 ## Build and Development Commands
 
@@ -44,6 +44,8 @@ Only run typecheck/build after major changes (new files, significant refactors, 
 
 We use vitest exclusively. **Never mock anything** - use testcontainers instead.
 
+Prefer integration tests that exercise real production behavior and dependencies. Before adding a unit test, name the specific regression it catches that no existing test, type, or CI suite catches. If you can't, don't add it. A test that only restates the condition you just wrote, or still passes when the logic it covers is broken, is not worth adding. Put the regression in a one-line comment: `// Catches: <bug>`. This repo is public: describe the bug in terms of this repo's code and generic callers ("a caller on an older version"), never by naming services, infrastructure or production figures from outside it. Avoid tests coupled to implementation details, source spelling, CSS, markup or copy. Do not duplicate production logic in tests or add redundant cases. Verify new tests are discovered by the intended suite. We have historical unit tests; this is not evidence that new unit tests should be added.
+
 ```bash
 pnpm run test --filter webapp                          # All tests for a package
 cd internal-packages/run-engine
@@ -51,7 +53,10 @@ pnpm run test ./src/engine/tests/ttl.test.ts --run     # Single test file
 pnpm run build --filter @internal/run-engine           # May need to build deps first
 ```
 
-Test files go next to source files (e.g., `MyService.ts` -> `MyService.test.ts`).
+Where test files go:
+
+- **Webapp:** put tests in `apps/webapp/test/`, not next to the source. Vitest there only runs files matched by the `include` list in `apps/webapp/vitest.config.ts`.
+- **Packages:** follow the package's existing layout. Next to the source (`MyService.ts` -> `MyService.test.ts`) and a `test/` folder are both fine.
 
 ### Testcontainers for Redis/PostgreSQL
 
@@ -167,11 +172,11 @@ User API call -> Webapp routes -> Services -> RunEngine -> Redis Queue -> Superv
 
 ### v3 (engine V1) removed
 
-v3 (engine V1: MarQS + Graphile worker) is end-of-life and its execution code has been removed. The `apps/webapp/app/v3/` directory name is historical - everything there now serves V2 (Run Engine 2.0, `@internal/run-engine` + redis-worker). There is no V1 execution path: a `RunEngineVersion` `V1` branch only rejects or finalizes gracefully so v3 clients get a clean 4xx, never a 5xx. Do not reintroduce V1. See `apps/webapp/CLAUDE.md` and `.claude/rules/legacy-v3-code.md`.
+v3 (engine V1: MarQS + Graphile worker) is end-of-life and its execution code has been removed. The `apps/webapp/app/v3/` directory name is historical - everything there now serves V2 (Run Engine 2.0, `@internal/run-engine` + redis-worker). There is no V1 execution path: a `RunEngineVersion` `V1` branch only rejects or finalizes gracefully so v3 clients get a clean 4xx, never a 5xx. Do not reintroduce V1. See `apps/webapp/AGENTS.md` and `.claude/rules/legacy-v3-code.md`.
 
 ### Documentation
 
-Docs live in `docs/` as a Mintlify site (MDX format). See `docs/CLAUDE.md` for conventions.
+Docs live in `docs/` as a Mintlify site (MDX format). See `docs/AGENTS.md` for conventions.
 
 ### Reference Projects
 

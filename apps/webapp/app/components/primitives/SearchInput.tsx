@@ -5,6 +5,7 @@ import { Input } from "~/components/primitives/Input";
 import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { SimpleTooltip } from "~/components/primitives/Tooltip";
 import { useSearchParams } from "~/hooks/useSearchParam";
+import { type ShortcutDefinition, useShortcutKeys } from "~/hooks/useShortcutKeys";
 import { cn } from "~/utils/cn";
 
 export type SearchInputProps = {
@@ -30,6 +31,13 @@ export type SearchInputProps = {
    * mode; `paramName`/`resetParams` are ignored when it's set.
    */
   onValueChange?: (value: string) => void;
+  /** A key that focuses the input. Ignored while a dialog is open. */
+  shortcut?: ShortcutDefinition;
+  /**
+   * Fill the width of the container instead of sizing itself: no minimum width and no growing
+   * on focus. For a search that sits in a row whose layout decides its width.
+   */
+  fullWidth?: boolean;
 };
 
 export function SearchInput({
@@ -41,8 +49,23 @@ export function SearchInput({
   normalizeForValidation,
   value: controlledValue,
   onValueChange,
+  shortcut,
+  fullWidth = false,
 }: SearchInputProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useShortcutKeys({
+    shortcut,
+    disabled: shortcut === undefined,
+    action: (event) => {
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        return;
+      }
+      // Keep the key itself out of the input it focuses.
+      event.preventDefault();
+      inputRef.current?.focus();
+    },
+  });
 
   const { value, replace, del } = useSearchParams();
   const isControlled = onValueChange !== undefined;
@@ -118,16 +141,18 @@ export function SearchInput({
   };
 
   return (
-    <div className="flex items-center gap-1">
+    <div className={cn("flex items-center gap-1", fullWidth && "w-full min-w-0")}>
       <motion.div
-        initial={{ width: "auto" }}
-        animate={{ width: isFocused && text.length > 0 ? "24rem" : "auto" }}
+        initial={{ width: fullWidth ? "100%" : "auto" }}
+        animate={{
+          width: fullWidth ? "100%" : isFocused && text.length > 0 ? "24rem" : "auto",
+        }}
         transition={{
           type: "spring",
           stiffness: 300,
           damping: 30,
         }}
-        className="relative h-6 min-w-52"
+        className={cn("relative h-6", fullWidth ? "min-w-0" : "min-w-52")}
       >
         <Input
           type="text"
@@ -191,6 +216,8 @@ export function SearchInput({
                   disableHoverableContent
                 />
               </div>
+            ) : shortcut && !isFocused ? (
+              <ShortcutKey shortcut={shortcut} variant="small" />
             ) : undefined
           }
         />

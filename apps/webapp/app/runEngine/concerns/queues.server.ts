@@ -1,8 +1,11 @@
-import { sanitizeQueueName } from "@trigger.dev/core/v3/isomorphic";
+import { CONCURRENCY_LIMIT_NAME_PATTERN, sanitizeQueueName } from "@trigger.dev/core/v3/isomorphic";
 import type { PrismaClientOrTransaction } from "@trigger.dev/database";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
-import { findCurrentWorkerFromEnvironment } from "~/v3/models/workerDeployment.server";
+import {
+  findCurrentWorkerDeployment,
+  findCurrentWorkerFromEnvironment,
+} from "~/v3/models/workerDeployment.server";
 import type {
   LockedBackgroundWorker,
   QueueManager,
@@ -101,6 +104,7 @@ export class DefaultQueueManager implements QueueManager {
     let taskTtl: string | null | undefined;
     let taskKind: string | undefined;
     let taskGates: TaskMetadataGate[] | null | undefined;
+    let templateKey: string | null | undefined;
 
     // Determine queue name based on lockToVersion and provided options
     if (lockedBackgroundWorker) {
@@ -153,6 +157,7 @@ export class DefaultQueueManager implements QueueManager {
         }
         taskKind = lockedMeta?.triggerSource;
         taskGates = lockedMeta?.gates;
+        templateKey = lockedMeta?.templateKey;
       } else {
         // No queue override - resolve default queue + TTL + triggerSource via cache,
         // falling back to a single BackgroundWorkerTask lookup on miss.
@@ -192,6 +197,7 @@ export class DefaultQueueManager implements QueueManager {
         lockedQueueId = lockedMeta.queueId ?? undefined;
         taskKind = lockedMeta.triggerSource;
         taskGates = lockedMeta.gates;
+        templateKey = lockedMeta.templateKey;
       }
     } else {
       // Task is not locked to a specific version, use regular logic
@@ -208,6 +214,7 @@ export class DefaultQueueManager implements QueueManager {
       taskTtl = taskInfo.taskTtl;
       taskKind = taskInfo.taskKind;
       taskGates = taskInfo.taskGates;
+      templateKey = taskInfo.templateKey;
     }
 
     // Sanitize the final determined queue name once
@@ -223,7 +230,7 @@ export class DefaultQueueManager implements QueueManager {
     const triggerLimits = request.body.options?.concurrency;
 
     for (const name of triggerLimits ?? []) {
-      if (!/^[a-zA-Z0-9_-]{1,122}$/.test(name)) {
+      if (!CONCURRENCY_LIMIT_NAME_PATTERN.test(name)) {
         throw new ServiceValidationError(
           `Invalid concurrency limit name "${name}": names are 1-122 characters using only letters, numbers, underscores and hyphens.`
         );
@@ -260,29 +267,61 @@ export class DefaultQueueManager implements QueueManager {
       taskGates ??
       undefined;
 
+    /**
+     * An object concurrencyKey gives named limits their own key: `default` stays the
+     * run's key and every other entry keys the gate of the limit it names. An entry for
+     * a limit the run does not hold adds that limit to the run, on top of the others, so
+     * triggers keep working while the deploy that declares the limit is rolling out.
+     */
+    const runKey = request.body.options?.concurrencyKey;
+    const limitKeys = new Map<string, { name: string; key: string }>();
+    if (typeof runKey === "object" && runKey !== null) {
+      if (!runKey.default) {
+        throw new ServiceValidationError(
+          "concurrencyKey needs a `default` key: runs are queued and scheduled fairly per default key, and limits without their own entry use it."
+        );
+      }
+      for (const [name, key] of Object.entries(runKey)) {
+        if (name === "default") {
+          continue;
+        }
+        if (!CONCURRENCY_LIMIT_NAME_PATTERN.test(name)) {
+          throw new ServiceValidationError(
+            `Invalid concurrencyKey entry "${name}": entries other than \`default\` are concurrency limit names, 1-122 characters using only letters, numbers, underscores and hyphens.`
+          );
+        }
+        limitKeys.set(sanitizeQueueName(`limit/${name}`), { name, key });
+      }
+    }
+
+    const heldLimits = new Set(requestedGates?.map((gate) => sanitizeQueueName(gate.queue)));
+    const impliedGates = [...limitKeys.keys()]
+      .filter((gateQueue) => !heldLimits.has(gateQueue))
+      .map((queue): { queue: string; concurrencyKey?: string } => ({ queue }));
+
     const seenGates = new Set<string>();
-    const gates = requestedGates?.flatMap((gate) => {
-      const sanitized = sanitizeQueueName(gate.queue);
+    const gates = [...(requestedGates ?? []), ...impliedGates].flatMap((requestedGate) => {
+      const sanitized = sanitizeQueueName(requestedGate.queue);
       if (!sanitized) {
         return [];
       }
-      const dedupeKey = `${sanitized} ${gate.concurrencyKey ?? ""}`;
+      const concurrencyKey = limitKeys.get(sanitized)?.key ?? requestedGate.concurrencyKey;
+      const dedupeKey = `${sanitized} ${concurrencyKey ?? ""}`;
       if (seenGates.has(dedupeKey)) {
         return [];
       }
       seenGates.add(dedupeKey);
-      return [{ queue: sanitized, concurrencyKey: gate.concurrencyKey }];
+      return [{ queue: sanitized, concurrencyKey }];
     });
 
     /**
-     * Unreachable through the public schemas (three requested gates plus one inline
-     * gate is the ceiling), kept as a backstop so an overflowing set can never be
-     * silently truncated downstream. Replays of three-gate runs against a task that
-     * later gained an inline limit resolve to four and stay valid.
+     * A run holds at most four limits: the task's inline limit plus three others, whether
+     * declared on the task, named at trigger time or added by a concurrencyKey entry. A
+     * task with an inline limit and two named limits has room for one more.
      */
-    if (gates && gates.length > 4) {
+    if (gates.length > 4) {
       throw new ServiceValidationError(
-        `A run can hold at most four gates; this request resolves to ${gates.length}.`
+        `A run can hold at most four concurrency limits, counting the task's inline limit and any added by a concurrencyKey entry; this request resolves to ${gates.length}.`
       );
     }
 
@@ -291,7 +330,8 @@ export class DefaultQueueManager implements QueueManager {
       lockedQueueId,
       taskTtl,
       taskKind,
-      gates: gates && gates.length > 0 ? gates : undefined,
+      gates: gates.length > 0 ? gates : undefined,
+      templateKey,
     };
   }
 
@@ -300,6 +340,7 @@ export class DefaultQueueManager implements QueueManager {
     taskTtl?: string | null;
     taskKind?: string | undefined;
     taskGates?: TaskMetadataGate[] | null;
+    templateKey?: string | null;
   }> {
     const { taskId, environment, body } = request;
     const { queue } = body.options ?? {};
@@ -323,6 +364,7 @@ export class DefaultQueueManager implements QueueManager {
         taskTtl: meta?.ttl ?? undefined,
         taskKind: meta?.triggerSource,
         taskGates: meta?.gates,
+        templateKey: meta?.templateKey,
       };
     }
 
@@ -344,6 +386,7 @@ export class DefaultQueueManager implements QueueManager {
         taskTtl: meta.ttl,
         taskKind: meta.triggerSource,
         taskGates: meta.gates,
+        templateKey: meta.templateKey,
       };
     }
 
@@ -352,6 +395,7 @@ export class DefaultQueueManager implements QueueManager {
       taskTtl: meta.ttl,
       taskKind: meta.triggerSource,
       taskGates: meta.gates,
+      templateKey: meta.templateKey,
     };
   }
 
@@ -404,6 +448,7 @@ export class DefaultQueueManager implements QueueManager {
 
     recordTaskMetaResolve("locked", source);
 
+    const templateKey = row.worker.deployment?.templateKey ?? null;
     const entry: TaskMetadataEntry = {
       slug,
       ttl: row.ttl,
@@ -415,9 +460,9 @@ export class DefaultQueueManager implements QueueManager {
 
     // Fire-and-forget back-fill — `setByWorker` upserts the single field and
     // refreshes the hash TTL. Errors are logged inside the cache and swallowed.
-    void this.taskMetaCache.setByWorker(workerId, entry);
+    void this.taskMetaCache.setByWorker(workerId, entry, templateKey);
 
-    return entry;
+    return { ...entry, templateKey };
   }
 
   private findLockedTaskRow(
@@ -433,6 +478,7 @@ export class DefaultQueueManager implements QueueManager {
         triggerSource: true,
         gates: true,
         queue: { select: { id: true, name: true } },
+        worker: { select: { deployment: { select: { templateKey: true } } } },
       },
     });
   }
@@ -459,7 +505,18 @@ export class DefaultQueueManager implements QueueManager {
     // the adjacent BackgroundWorkerTask lookup below uses `replicaPrisma` too
     // (replica lag for "just deployed" is bounded the same way for both
     // queries; reading from the writer here would only widen the window).
-    const worker = await findCurrentWorkerFromEnvironment(environment, this.replicaPrisma);
+    let worker: { id: string } | null;
+    let templateKey: string | null = null;
+    if (environment.type === "DEVELOPMENT") {
+      worker = await findCurrentWorkerFromEnvironment(environment, this.replicaPrisma);
+    } else {
+      const deployment = await findCurrentWorkerDeployment({
+        environmentId: environment.id,
+        prismaClient: this.replicaPrisma,
+      });
+      worker = deployment?.worker ?? null;
+      templateKey = deployment?.templateKey ?? null;
+    }
     if (!worker) {
       recordTaskMetaResolve("current", "miss");
       return null;
@@ -495,9 +552,9 @@ export class DefaultQueueManager implements QueueManager {
     // keyspaces so a subsequent locked-or-not trigger hits the cache. The
     // env-keyspace TTL is preserved (promotion owns it); the by-worker TTL
     // is refreshed (sliding window keeps active workers warm).
-    void this.taskMetaCache.setByCurrentWorker(environment.id, worker.id, entry);
+    void this.taskMetaCache.setByCurrentWorker(environment.id, worker.id, entry, templateKey);
 
-    return entry;
+    return { ...entry, templateKey };
   }
 
   async validateQueueLimits(

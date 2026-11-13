@@ -15,30 +15,42 @@ import { login } from "./login.js";
 import { createGitMeta } from "../utilities/gitMeta.js";
 import { getBranch } from "@trigger.dev/core/v3";
 import { authenticateForDeploy } from "../deploy/auth.js";
+import {
+  promoteTrustedDeployment,
+  shouldUseGithubOidc,
+  trustedDeployApiUrl,
+} from "../deploy/trustedDeploy.js";
+import { type DeployEnvironment, resolveDeployEnvironment } from "../deploy/environment.js";
 
 const PromoteCommandOptions = CommonCommandOptions.extend({
+  authMethod: z.enum(["auto", "oidc"]).default("auto"),
   projectRef: z.string().optional(),
   apiUrl: z.string().optional(),
   skipUpdateCheck: z.boolean().default(false),
   config: z.string().optional(),
-  env: z.enum(["prod", "staging", "preview"]),
+  env: z.enum(["prod", "staging", "preview", "production"]).optional(),
+  prod: z.boolean().default(false),
   branch: z.string().optional(),
 });
 
-type PromoteCommandOptions = z.infer<typeof PromoteCommandOptions>;
+// `env` is resolved from --env, --prod and TRIGGER_ACCESS_TOKEN before the command runs
+type PromoteCommandOptions = Omit<z.infer<typeof PromoteCommandOptions>, "env"> & {
+  env: DeployEnvironment;
+};
 
 export function configurePromoteCommand(program: Command) {
   return commonOptions(
     program
       .command("promote")
       .description("Promote a previously deployed version to the current deployment")
+      .option("--auth-method <method>", "Authentication method: auto or oidc", "auto")
       .argument("[version]", "The version to promote")
       .option("-c, --config <config file>", "The name of the config file, found at [path]")
       .option(
         "-e, --env <env>",
-        "Deploy to a specific environment (currently only prod and staging are supported)",
-        "prod"
+        "The environment to promote in: prod, staging or preview. Defaults to the environment of the API key in TRIGGER_ACCESS_TOKEN, otherwise prod."
       )
+      .option("--prod", "Promote in the prod environment. Shorthand for --env prod.")
       .option(
         "-b, --branch <branch>",
         "The preview branch to promote when passing --env preview. If not provided, we'll detect your git branch."
@@ -50,7 +62,7 @@ export function configurePromoteCommand(program: Command) {
       )
   ).action(async (version, options) => {
     await handleTelemetry(async () => {
-      await printStandloneInitialBanner(true, options.profile);
+      await printStandloneInitialBanner(!options.skipUpdateCheck, options.profile);
       await promoteCommand(version, options);
     });
   });
@@ -58,7 +70,17 @@ export function configurePromoteCommand(program: Command) {
 
 async function promoteCommand(version: string, options: unknown) {
   return await wrapCommandAction("promoteCommand", PromoteCommandOptions, options, async (opts) => {
-    return await _promoteCommand(version, opts);
+    const environment = resolveDeployEnvironment({
+      env: opts.env,
+      prod: opts.prod,
+      accessToken: shouldUseGithubOidc(opts.authMethod, process.env.TRIGGER_ACCESS_TOKEN)
+        ? undefined
+        : process.env.TRIGGER_ACCESS_TOKEN,
+    });
+
+    logger.debug("Resolved promote environment", environment);
+
+    return await _promoteCommand(version, { ...opts, env: environment.env });
   });
 }
 
@@ -69,7 +91,37 @@ async function _promoteCommand(version: string, options: PromoteCommandOptions) 
     );
   }
 
-  intro(`Promoting version ${version}`);
+  intro(`Promoting version ${version} in ${options.env}`);
+
+  const resolvedConfig = await loadConfig({
+    overrides: { project: options.projectRef },
+    configFile: options.config,
+  });
+
+  logger.debug("Resolved config", resolvedConfig);
+
+  const gitMeta = await createGitMeta(resolvedConfig.workspaceDir);
+  logger.debug("gitMeta", gitMeta);
+
+  const branch =
+    options.env === "preview" ? getBranch({ specified: options.branch, gitMeta }) : undefined;
+  if (options.env === "preview" && !branch) {
+    throw new Error(
+      "Didn't auto-detect preview branch, so you need to specify one. Pass --branch <branch>."
+    );
+  }
+
+  if (shouldUseGithubOidc(options.authMethod, process.env.TRIGGER_ACCESS_TOKEN)) {
+    const promotion = await promoteTrustedDeployment(trustedDeployApiUrl(options), {
+      projectRef: resolvedConfig.project,
+      env: options.env,
+      branch,
+      version,
+    });
+    if (!promotion.success) throw new Error(promotion.error);
+    outro(`Promoted version ${version} in ${options.env}`);
+    return;
+  }
 
   const authorization = await authenticateForDeploy({
     accessToken: process.env.TRIGGER_ACCESS_TOKEN,
@@ -91,24 +143,6 @@ async function _promoteCommand(version: string, options: PromoteCommandOptions) 
     }
   }
 
-  const resolvedConfig = await loadConfig({
-    overrides: { project: options.projectRef },
-    configFile: options.config,
-  });
-
-  logger.debug("Resolved config", resolvedConfig);
-
-  const gitMeta = await createGitMeta(resolvedConfig.workspaceDir);
-  logger.debug("gitMeta", gitMeta);
-
-  const branch =
-    options.env === "preview" ? getBranch({ specified: options.branch, gitMeta }) : undefined;
-  if (options.env === "preview" && !branch) {
-    throw new Error(
-      "Didn't auto-detect preview branch, so you need to specify one. Pass --branch <branch>."
-    );
-  }
-
   const projectClient = await getProjectClient({
     accessToken: authorization.auth.accessToken,
     apiUrl: authorization.auth.apiUrl,
@@ -128,5 +162,5 @@ async function _promoteCommand(version: string, options: PromoteCommandOptions) 
     throw new Error(promotion.error);
   }
 
-  outro(`Promoted version ${version}`);
+  outro(`Promoted version ${version} in ${options.env}`);
 }

@@ -4,8 +4,9 @@ import {
   CreateInputStreamWaitpointRequestBody,
   type CreateInputStreamWaitpointResponseBody,
 } from "@trigger.dev/core/v3";
-import { WaitpointId } from "@trigger.dev/core/v3/isomorphic";
+import { parseWaitpointId, WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import { $replica } from "~/db.server";
+import { processStreamWaitpointCompletionPacket } from "~/runEngine/concerns/waitpointCompletionPacket.server";
 import { runStore } from "~/v3/runStore.server";
 import { createWaitpointTag, MAX_TAGS_PER_WAITPOINT } from "~/models/waitpointTag.server";
 import {
@@ -14,7 +15,8 @@ import {
 } from "~/services/inputStreamWaitpointCache.server";
 import { logger } from "~/services/logger.server";
 import { getRealtimeStreamInstance } from "~/services/realtime/v1StreamsGlobal.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
+import { keyedWaitpointBudgetResponse } from "~/services/routeBuilders/keyedWaitpointBudget.server";
 import { parseDelay } from "~/utils/delays";
 import { resolveIdempotencyKeyTTL } from "~/utils/idempotencyKeys.server";
 import { engine } from "~/v3/runEngine.server";
@@ -30,8 +32,17 @@ const { action, loader } = createActionApiRoute(
     body: CreateInputStreamWaitpointRequestBody,
     maxContentLength: 1024 * 10, // 10KB
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: (params) =>
+        everyResource([{ type: "runs", id: params.runFriendlyId }, { type: "waitpoints" }]),
+    },
   },
-  async ({ authentication, body, params }) => {
+  async ({ authentication, body, params, ability }) => {
+    if (!ability.can("read", { type: "inputStreams", id: params.runFriendlyId })) {
+      return json({ error: "Unauthorized" }, { status: 403 });
+    }
+
     try {
       const where = {
         friendlyId: params.runFriendlyId,
@@ -86,6 +97,7 @@ const { action, loader } = createActionApiRoute(
         runId: run.id,
         environmentId: authentication.environment.id,
         projectId: authentication.environment.projectId,
+        organizationId: authentication.environment.organization.id,
         idempotencyKey: body.idempotencyKey,
         idempotencyKeyExpiresAt,
         timeout,
@@ -122,21 +134,44 @@ const { action, loader } = createActionApiRoute(
             const record = records[0]!;
 
             // Record data is the raw user payload — no wrapper to unwrap
-            await engine.completeWaitpoint({
+            const storeDateTime =
+              (await engine.waitpointSystem.isWaitpointStoreEnabled(
+                authentication.environment.organization.id
+              )) &&
+              (result.waitpoint.type === "DATETIME" || result.waitpoint.type === "MANUAL") &&
+              parseWaitpointId(result.waitpoint.id).format !== "legacy";
+            const packet = storeDateTime
+              ? await processStreamWaitpointCompletionPacket(
+                  result.waitpoint.id,
+                  record.data,
+                  authentication.environment
+                )
+              : undefined;
+            const completionInput: Parameters<typeof engine.completeWaitpoint>[0] = {
               id: result.waitpoint.id,
               output: {
-                value: record.data,
-                type: "application/json",
+                value: packet ? packet.data! : record.data,
+                type: packet ? packet.dataType : "application/json",
                 isError: false,
               },
-            });
+              organizationId: authentication.environment.organization.id,
+            };
+            if (storeDateTime) completionInput.onlyIfPending = true;
+            await engine.completeWaitpoint(completionInput);
 
             // Clean up the Redis cache since we completed it ourselves
             await deleteInputStreamWaitpoint(run.friendlyId, body.streamId);
           }
-        } catch {
+        } catch (error) {
           // Non-fatal: if the S2 check fails, the waitpoint is still PENDING.
           // The next .send() will complete it via the Redis cache path.
+          logger.warn("input-stream wait race-check failed", {
+            runId: run.friendlyId,
+            streamId: body.streamId,
+            waitpointId: WaitpointId.toFriendlyId(result.waitpoint.id),
+            error,
+            environmentId: authentication.environment.id,
+          });
         }
       }
 
@@ -148,6 +183,11 @@ const { action, loader } = createActionApiRoute(
       if (error instanceof ServiceValidationError) {
         return json({ error: error.message }, { status: 422 });
       }
+      // Expected under load and retryable, so it is not reported as an error.
+      const busy = keyedWaitpointBudgetResponse(error, {
+        environmentId: authentication.environment.id,
+      });
+      if (busy) return busy;
 
       logger.error("Failed to create input-stream waitpoint", {
         error,

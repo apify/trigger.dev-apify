@@ -11,6 +11,8 @@ export type Shortcut = {
   enabled?: boolean;
   /** Set when the browser binds the same keystroke to something of its own. */
   preventDefault?: boolean;
+  /** Ignore the key while a dialog is open, so it can't act on the page under the dialog. */
+  ignoreWhileDialogOpen?: boolean;
 };
 
 export type ShortcutDefinition =
@@ -41,17 +43,25 @@ export function useShortcutKeys({
 
   const keys = createKeysFromShortcut(relevantShortcut);
 
-  const isEnabled = !disabled && areShortcutsEnabled && relevantShortcut?.enabled !== false;
+  const isEnabled =
+    !disabled &&
+    areShortcutsEnabled &&
+    !!relevantShortcut?.key &&
+    relevantShortcut.enabled !== false;
 
   useHotkeys(
     keys,
     (event) => {
-      if (!event.repeat) {
-        action(event);
-      }
+      if (event.repeat) return;
+      if (relevantShortcut?.ignoreWhileDialogOpen && isDialogOpen()) return;
+      action(event);
     },
     hotkeyOptions({ shortcut: relevantShortcut, isEnabled, enabledOnInputElements })
   );
+}
+
+function isDialogOpen() {
+  return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
 }
 
 export type HotkeyOptions = {

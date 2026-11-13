@@ -12,6 +12,7 @@ import { ShortcutsProvider } from "~/components/primitives/ShortcutsProvider";
 import { OperatingSystemContextProvider } from "~/components/primitives/OperatingSystemProvider";
 import { deployNowRequestError, GitHubDeploymentOnboarding } from "./GitHubDeploymentOnboarding";
 import { OnboardingDeploymentLogs } from "./OnboardingDeploymentLogs";
+import type { BuildFilters } from "~/v3/github";
 
 function render(node: React.ReactNode) {
   const router = createMemoryRouter([
@@ -171,6 +172,7 @@ it("wires the real connected-repository form into the existing save endpoint", (
         connectedGitHubRepo: {
           branchTracking: { prod: { branch: "main" }, staging: { branch: "staging" } },
           previewDeploymentsEnabled: true,
+          buildFilters: { ignorePaths: ["docs/**"], ignoreBranches: ["dependabot/**"] },
           createdAt: new Date("2026-09-15T00:00:00Z"),
           repository: {
             id: "repo",
@@ -198,6 +200,8 @@ it("wires the real connected-repository form into the existing save endpoint", (
     expect(html).toContain('name="previewDeploymentsEnabled"');
     expect(html).toContain('value="update-git-settings"');
     expect(html).toContain('value="/orgs/org/projects/project/env/prod/deployments"');
+    expect(html).not.toContain('name="ignorePaths"');
+    expect(html).not.toContain('name="ignoreBranches"');
     expect(html).not.toContain("Disconnect");
     expect(html).not.toContain("Upgrade");
     expect((html.match(/ disabled=""/g) ?? []).length).toBeGreaterThanOrEqual(autosave ? 3 : 4);
@@ -235,32 +239,41 @@ it("gives Preview parent and disabled branch environments actionable guidance", 
   ).toContain("Enable preview deployments in GitHub settings to deploy this branch");
 });
 
+function settingsForm(
+  props: Partial<ComponentProps<typeof ConnectedGitHubRepoForm>> = {},
+  buildFilters?: BuildFilters
+) {
+  return render(
+    createElement(ConnectedGitHubRepoForm, {
+      connectedGitHubRepo: {
+        branchTracking: { prod: { branch: "main" }, staging: { branch: "staging" } },
+        previewDeploymentsEnabled: true,
+        buildFilters,
+        createdAt: new Date("2026-09-15T00:00:00Z"),
+        repository: {
+          id: "repo",
+          name: "tasks",
+          fullName: "org/tasks",
+          private: true,
+          htmlUrl: "https://example.test/org/tasks",
+        },
+      },
+      previewEnvironmentEnabled: true,
+      stagingEnvironmentEnabled: true,
+      organizationSlug: "org",
+      projectSlug: "project",
+      environmentSlug: "prod",
+      billingPath: "/billing",
+      redirectUrl: "/orgs/org/projects/project/env/prod/deployments",
+      ignorePatternLimits: { maxPatterns: 100, maxLength: 256 },
+      ...props,
+    })
+  );
+}
+
 it("keeps the legacy connected-repository form on its original layout and explicit Save", () => {
   for (const canManageGithub of [false, true]) {
-    const html = render(
-      createElement(ConnectedGitHubRepoForm, {
-        connectedGitHubRepo: {
-          branchTracking: { prod: { branch: "main" }, staging: { branch: "staging" } },
-          previewDeploymentsEnabled: true,
-          createdAt: new Date("2026-09-15T00:00:00Z"),
-          repository: {
-            id: "repo",
-            name: "tasks",
-            fullName: "org/tasks",
-            private: true,
-            htmlUrl: "https://example.test/org/tasks",
-          },
-        },
-        previewEnvironmentEnabled: true,
-        stagingEnvironmentEnabled: true,
-        organizationSlug: "org",
-        projectSlug: "project",
-        environmentSlug: "prod",
-        billingPath: "/billing",
-        redirectUrl: "/orgs/org/projects/project/env/prod/deployments",
-        canManageGithub,
-      })
-    );
+    const html = settingsForm({ canManageGithub });
     expect(html).toContain('action="/resources/orgs/org/projects/project/env/prod/github"');
     expect(html).toContain('name="productionBranch"');
     expect(html).toContain('name="stagingBranch"');
@@ -277,10 +290,43 @@ it("keeps the legacy connected-repository form on its original layout and explic
   }
 });
 
+it("lists stored ignored paths after the branch fields and submits them one per line", () => {
+  const html = settingsForm({}, { ignorePaths: ["docs/**", "*.md"], ignoreBranches: [] });
+  expect(html).toContain('type="hidden" name="ignorePaths" value="docs/**\n*.md"');
+  expect(html.indexOf('name="ignorePaths"')).toBeGreaterThan(
+    html.indexOf('name="previewDeploymentsEnabled"')
+  );
+  expect(html.indexOf('name="ignorePaths"')).toBeLessThan(html.indexOf(">Save<"));
+  expect(settingsForm()).toContain('type="hidden" name="ignorePaths" value=""');
+});
+
+it("lists stored ignored branches above the ignored paths and submits them one per line", () => {
+  // Catches: the settings form not submitting the branches field, so saving can't change it.
+  const html = settingsForm(
+    {},
+    { ignorePaths: [], ignoreBranches: ["noPreview*", "noPreview/**"] }
+  );
+  expect(html).toContain('type="hidden" name="ignoreBranches" value="noPreview*\nnoPreview/**"');
+  expect(html.indexOf('name="ignoreBranches"')).toBeLessThan(html.indexOf('name="ignorePaths"'));
+  expect(settingsForm()).toContain('type="hidden" name="ignoreBranches" value=""');
+});
+
+it("says ignored paths don't apply only while a Vercel integration is connected", () => {
+  const notice = "apply while the Vercel integration is connected";
+  expect(settingsForm({ vercelIntegrationConnected: true })).toContain(notice);
+  expect(settingsForm({ vercelIntegrationConnected: false })).not.toContain(notice);
+});
+
 it("tells the user a missing branch has to be pushed instead of asking them to retry", () => {
   const missing = 'The branch "test" doesn\'t exist in acme/app. Push it to GitHub, then deploy.';
   expect(deployNowRequestError({ code: "BRANCH_NOT_FOUND", error: missing })).toBe(missing);
   expect(deployNowRequestError({ error: "Couldn't start the deploy" })).toBe(
     "Couldn't start the deployment. Try again."
   );
+});
+
+// Catches: the onboarding panel telling a gated org to retry instead of showing how to add a card.
+it("shows the card step instead of a retry when deploy now needs a verified card", () => {
+  const card = "Unlock your Free tier credits to deploy.";
+  expect(deployNowRequestError({ code: "CARD_VERIFICATION_REQUIRED", error: card })).toBe(card);
 });

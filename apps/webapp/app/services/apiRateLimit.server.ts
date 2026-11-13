@@ -1,7 +1,11 @@
 import { tryCatch } from "@trigger.dev/core/v3";
 import { env } from "~/env.server";
+import { bearerTokenFromAuthorizationHeader } from "~/utils/bearerToken";
 import { resolvePrivateApiKeyRateLimitScope } from "~/models/runtimeEnvironment.server";
+import { resolveRunToken } from "~/services/oidc/runTokenAuth.server";
+import { isRunTokenFormat } from "~/services/oidc/runTokenVerify";
 import { batchStreamGrants } from "~/runEngine/concerns/batchStreamGrantsInstance.server";
+import { clientIpFromHeaders } from "@trigger.dev/rbac";
 import { authenticateAuthorizationHeader } from "./apiAuth.server";
 import { recordApiRateLimitObservation } from "./apiRateLimitMetrics.server";
 import {
@@ -38,8 +42,11 @@ export function readApiRateLimitMetricsFlag(featureFlags: unknown): boolean {
 // testable without standing up the middleware and its Redis.
 export async function resolveApiRateLimitOverride(
   authorizationValue: string
-): Promise<{ config?: unknown; identifier?: string; tenant?: RateLimitTenant } | undefined> {
-  const rawApiKey = authorizationValue.replace(/^Bearer /, "");
+): Promise<
+  | { config?: unknown; identifier?: string; tenant?: RateLimitTenant; allowedIpRanges?: string[] }
+  | undefined
+> {
+  const rawApiKey = bearerTokenFromAuthorizationHeader(authorizationValue);
 
   if (rawApiKey.startsWith("tr_")) {
     const scope = await resolvePrivateApiKeyRateLimitScope(rawApiKey);
@@ -57,12 +64,36 @@ export async function resolveApiRateLimitOverride(
         environmentId: scope.environmentId,
         metricsEnabled: readApiRateLimitMetricsFlag(scope.featureFlags),
       },
+      allowedIpRanges: scope.allowedIpRanges,
     };
   }
 
+  // Run tokens share their environment's bucket, like private keys. Without this each run would
+  // get its own bucket keyed on the token hash.
+  const runToken = rawApiKey;
+  if (isRunTokenFormat(runToken)) {
+    const environment = (await resolveRunToken(runToken))?.environment;
+    if (!environment) {
+      return;
+    }
+
+    return {
+      config: environment.organization.apiRateLimiterConfig,
+      identifier: environment.id,
+      tenant: {
+        organizationId: environment.organizationId,
+        projectId: environment.projectId,
+        environmentId: environment.id,
+        metricsEnabled: readApiRateLimitMetricsFlag(environment.organization.featureFlags),
+      },
+    };
+  }
+
+  // Private keys (root and additional) returned above, so no IP-restricted key reaches here.
   const authenticatedEnv = await authenticateAuthorizationHeader(authorizationValue, {
     allowPublicKey: true,
     allowJWT: true,
+    clientIp: null,
   });
 
   if (!authenticatedEnv || !authenticatedEnv.ok) {
@@ -122,9 +153,7 @@ export const apiRateLimiter = authorizationRateLimitMiddleware({
   limiterConfigOverride: resolveApiRateLimitOverride,
   onResult: recordApiRateLimitObservation,
   pathMatchers: [/^\/api/],
-  // Allow /api/v1/tasks/:id/callback/:secret
   pathWhiteList: [
-    "/api/internal/stripe_webhooks",
     // Keep allowlisted: these CLI endpoints are intentionally unauthenticated,
     // so this Authorization-header-keyed limiter would 401 them. They are
     // throttled separately by authCodeRateLimiter.server.ts.
@@ -132,23 +161,19 @@ export const apiRateLimiter = authorizationRateLimitMiddleware({
     "/api/v1/token",
     "/api/v1/usage/ingest",
     "/api/v1/plain/customer-cards",
-    /^\/api\/v1\/tasks\/[^/]+\/callback\/[^/]+$/, // /api/v1/tasks/$id/callback/$secret
-    /^\/api\/v1\/runs\/[^/]+\/tasks\/[^/]+\/callback\/[^/]+$/, // /api/v1/runs/$runId/tasks/$id/callback/$secret
-    /^\/api\/v1\/http-endpoints\/[^/]+\/env\/[^/]+\/[^/]+$/, // /api/v1/http-endpoints/$httpEndpointId/env/$envType/$shortcode
-    /^\/api\/v1\/sources\/http\/[^/]+$/, // /api/v1/sources/http/$id
-    /^\/api\/v1\/endpoints\/[^/]+\/[^/]+\/index\/[^/]+$/, // /api/v1/endpoints/$environmentId/$endpointSlug/index/$indexHookIdentifier
     "/api/v1/timezones",
-    "/api/v1/usage/ingest",
     "/api/v1/auth/jwt/claims",
-    /^\/api\/v1\/runs\/[^/]+\/attempts$/, // /api/v1/runs/$runFriendlyId/attempts
+    // Dedicated per-run/environment limits prevent a throttled run from draining the API budget.
+    "/api/v1/auth/oidc/token",
+    // GitHub JWTs are verified and rate limited by the dedicated submission API.
+    "/api/v1/trusted-deploys/prepare",
+    "/api/v1/trusted-deploys/submit",
     /^\/api\/v1\/waitpoints\/tokens\/[^/]+\/callback\/[^/]+$/, // /api/v1/waitpoints/tokens/$waitpointFriendlyId/callback/$hash
     ...deploymentApiPaths, // rate limited separately by deploymentRateLimiter
     /^\/api\/v\d+\/deployments\/current$/, // runtime SDK surface, exempt as before the deploy budget split
     // Internal SDK plumbing — packets are presigned-URL handshakes for
     // payload uploads (v2 PUT) and downloads (v1 GET), authenticated via
     // run-scoped JWT, called once per task/turn boundary by the runtime.
-    // Same shape as `/api/v1/runs/$runFriendlyId/attempts` above; not a
-    // customer-facing surface so customer rate limits shouldn't apply.
     /^\/api\/v1\/packets\//,
     /^\/api\/v2\/packets\//,
     /^\/api\/v1\/sessions\/[^/]+\/snapshot-url$/,
@@ -167,9 +192,20 @@ export const apiRateLimiter = authorizationRateLimitMiddleware({
       return false;
     }
 
+    // Run tokens can upload batch items too, so they must be able to spend the phase-one grant.
+    const runToken = bearerTokenFromAuthorizationHeader(authorizationValue);
+    if (isRunTokenFormat(runToken)) {
+      const [runTokenError, resolved] = await tryCatch(resolveRunToken(runToken));
+      if (runTokenError || !resolved) {
+        return false;
+      }
+      return batchStreamGrants.spend(resolved.environment.id, batchFriendlyId);
+    }
+
     const [authError, authenticated] = await tryCatch(
       authenticateAuthorizationHeader(authorizationValue, {
         allowPublicKey: true,
+        clientIp: clientIpFromHeaders({ get: (name) => req.get(name) ?? null }),
       })
     );
 

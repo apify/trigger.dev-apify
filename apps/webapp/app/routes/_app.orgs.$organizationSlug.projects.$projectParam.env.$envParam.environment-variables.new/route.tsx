@@ -3,6 +3,14 @@ import {
   emptyEnvironmentVariableValuesEnabled,
   EMPTY_ENV_VALUES_DISABLED,
 } from "~/v3/environmentVariables/emptyValuesFlag.server";
+import { listViewSearch } from "~/v3/environmentVariables/environmentFilter";
+import {
+  NEW_VARIABLE_ENVIRONMENT_PARAM,
+  NEW_VARIABLE_FILL_KEY_PARAM,
+  NEW_VARIABLE_PICK_BRANCH_PARAM,
+  NEW_VARIABLE_SECRET_PARAM,
+  keyPanelViewSearch,
+} from "~/v3/environmentVariables/environmentVariableKey";
 import { parseEnvironmentVariableForm } from "~/v3/environmentVariables/forms";
 import {
   LockClosedIcon,
@@ -11,7 +19,14 @@ import {
   PlusIcon,
   XMarkIcon,
 } from "@heroicons/react/20/solid";
-import { Form, useActionData, useNavigate, useNavigation } from "@remix-run/react";
+import {
+  Form,
+  useActionData,
+  useLocation,
+  useNavigate,
+  useNavigation,
+  useParams,
+} from "@remix-run/react";
 import { json } from "@remix-run/server-runtime";
 import dotenv from "dotenv";
 import { useState } from "react";
@@ -39,22 +54,25 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "~/components/primitives/Tooltip";
-import { boundedIn, prisma } from "~/db.server";
+import { prisma } from "~/db.server";
 import { useEnvironment } from "~/hooks/useEnvironment";
 import { useList } from "~/hooks/useList";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
 import { useTypedMatchesData } from "~/hooks/useTypedMatchData";
-import { resolveOrgIdFromSlug } from "~/models/organization.server";
+import { resolveProjectAuthScope } from "~/services/projectAuthScope.server";
 import {
+  environmentVariableKeyRouteId,
   environmentVariablesRouteId,
-  type loader as environmentVariablesLoader,
-} from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.environment-variables/route";
+} from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.environment-variables/EnvironmentVariableControls";
+import { type loader as environmentVariableKeyLoader } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.environment-variables.key.$keyParam/route";
+import { type loader as environmentVariablesLoader } from "~/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.environment-variables/route";
 import { dashboardAction } from "~/services/routeBuilders/dashboardBuilder";
 import { cn } from "~/utils/cn";
 import {
   EnvironmentParamSchema,
   v3BillingPath,
+  v3EnvironmentVariableKeyPath,
   v3EnvironmentVariablesPath,
 } from "~/utils/pathBuilder";
 import { EnvironmentVariablesRepository } from "~/v3/environmentVariables/environmentVariablesRepository.server";
@@ -62,6 +80,7 @@ import {
   EnvironmentVariableKey,
   EnvironmentVariableValue,
 } from "~/v3/environmentVariables/repository";
+import { findTargetEnvironments } from "~/v3/environmentVariables/targetEnvironments.server";
 import { findUnauthorizedEnvironmentId } from "~/v3/writableEnvironments";
 import { pageMeta } from "~/utils/pageTitle";
 
@@ -109,19 +128,26 @@ const schema = z.object({
   }, Variable.array().nonempty("At least one variable is required")),
 });
 
+// The dialog also opens under the key panel's route, where the URL names the open key.
+const ParamsSchema = EnvironmentParamSchema.extend({
+  keyParam: z.string().optional(),
+});
+
 export const action = dashboardAction(
   {
-    params: EnvironmentParamSchema,
-    context: async (params) => {
-      const organizationId = await resolveOrgIdFromSlug(params.organizationSlug);
-      return organizationId ? { organizationId } : {};
-    },
+    params: ParamsSchema,
+    context: (params) => resolveProjectAuthScope(params.organizationSlug, params.projectParam),
     // Per-environment write:envvars is enforced in the handler — the target
     // environments come from the submission, not the route params.
   },
-  async ({ request, params, user, ability }) => {
+  async ({ request, params, user, ability, context }) => {
     const userId = user.id;
-    const { organizationSlug, projectParam, envParam } = params;
+    const { organizationSlug, projectParam, envParam, keyParam } = params;
+
+    const { projectId } = context;
+    if (!projectId) {
+      throw new Response("Not Found", { status: 404 });
+    }
 
     if (request.method.toUpperCase() !== "POST") {
       throw new Response("Method Not Allowed", { status: 405 });
@@ -137,10 +163,11 @@ export const action = dashboardAction(
     // Enforce env-tier write:envvars for every targeted environment, so a role
     // that can't write a deployed tier can't create vars there via a direct
     // POST (the disabled checkboxes are not the boundary).
-    const targetEnvironments = await prisma.runtimeEnvironment.findMany({
-      where: { id: { in: boundedIn(submission.value.environmentIds) } },
-      select: { type: true },
-    });
+    const targetEnvironments = await findTargetEnvironments(
+      prisma,
+      projectId,
+      submission.value.environmentIds
+    );
     const hasDeniedEnvironment = targetEnvironments.some(
       (env) => !ability.can("write", { type: "envvars", envType: env.type })
     );
@@ -156,17 +183,8 @@ export const action = dashboardAction(
       );
     }
 
-    const project = await prisma.project.findUnique({
-      where: {
-        slug: params.projectParam,
-        organization: {
-          members: {
-            some: {
-              userId,
-            },
-          },
-        },
-      },
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, organization: { members: { some: { userId } } } },
       select: {
         id: true,
         organization: { select: { featureFlags: true } },
@@ -178,16 +196,10 @@ export const action = dashboardAction(
 
     // The submitted `environmentIds` are user-supplied. Shared env types are
     // writable by any member; a DEV env only by its owner. See
-    // findUnauthorizedEnvironmentId.
-    const submittedEnvs = await prisma.runtimeEnvironment.findMany({
-      where: {
-        projectId: project.id,
-        id: { in: boundedIn(submission.value.environmentIds) },
-      },
-      select: { id: true, type: true, orgMember: { select: { userId: true } } },
-    });
+    // findUnauthorizedEnvironmentId. Archived environments were left out of
+    // targetEnvironments, so an archived id is refused here too.
     const unauthorizedEnvironmentId = findUnauthorizedEnvironmentId(
-      submittedEnvs,
+      targetEnvironments,
       submission.value.environmentIds,
       userId
     );
@@ -234,12 +246,12 @@ export const action = dashboardAction(
       return json(submission.reply({ fieldErrors }));
     }
 
+    // Back to the view the dialog was opened from: the list, or the key panel on it.
+    const slugs = [{ slug: organizationSlug }, { slug: projectParam }, { slug: envParam }] as const;
     return redirect(
-      v3EnvironmentVariablesPath(
-        { slug: organizationSlug },
-        { slug: projectParam },
-        { slug: envParam }
-      )
+      keyParam !== undefined
+        ? `${v3EnvironmentVariableKeyPath(...slugs, keyParam)}${keyPanelViewSearch(request.url)}`
+        : `${v3EnvironmentVariablesPath(...slugs)}${listViewSearch(request.url)}`
     );
   }
 );
@@ -249,12 +261,23 @@ export default function Page() {
   const parentData = useTypedMatchesData<typeof environmentVariablesLoader>({
     id: environmentVariablesRouteId,
   });
+  // The key panel this dialog sits on, when it was opened from one.
+  const keyPanelData = useTypedMatchesData<typeof environmentVariableKeyLoader>({
+    id: environmentVariableKeyRouteId,
+  });
   invariant(
     parentData,
     "Environment variables page loader data must be defined when rendering the create dialog"
   );
-  const { environments, hasStaging, writableEnvironmentIds, allowEmptyEnvironmentVariableValues } =
-    parentData;
+  const {
+    environments,
+    filter,
+    filterEnvironmentIds,
+    filterBranchEnvironmentIds,
+    hasStaging,
+    writableEnvironmentIds,
+    allowEmptyEnvironmentVariableValues,
+  } = parentData;
   // Creating a variable is a write, so gate the targets on write access.
   const writableEnvironmentIdSet = new Set(writableEnvironmentIds);
   const lastSubmission = useActionData();
@@ -263,8 +286,68 @@ export default function Page() {
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
-  const [selectedEnvironmentIds, setSelectedEnvironmentIds] = useState<Set<string>>(new Set());
-  const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(undefined);
+  const location = useLocation();
+  const { keyParam } = useParams();
+  const searchParams = new URLSearchParams(location.search);
+  // The view this dialog sits on: the list with its filter, search and page, or the key panel
+  // open on it.
+  const listPath =
+    keyParam !== undefined
+      ? `${v3EnvironmentVariableKeyPath(organization, project, environment, keyParam)}${keyPanelViewSearch(searchParams)}`
+      : `${v3EnvironmentVariablesPath(organization, project, environment)}${location.search}`;
+  // "Set" in the key panel asks for one environment, and the dialog starts on the panel's key
+  // there. "Add new" on the panel of a key that doesn't exist yet asks for the key alone.
+  const requestedEnvironment = environments.find(
+    (env) =>
+      env.id === searchParams.get(NEW_VARIABLE_ENVIRONMENT_PARAM) &&
+      writableEnvironmentIdSet.has(env.id)
+  );
+  const startsOnKey =
+    requestedEnvironment !== undefined || searchParams.has(NEW_VARIABLE_FILL_KEY_PARAM);
+  const initialKey = startsOnKey && keyParam !== undefined ? keyParam : "";
+  // "Add override" in the key panel: Preview with a branch still to pick, from the branches
+  // without their own value for the key.
+  const overrideBranches =
+    requestedEnvironment?.type === "PREVIEW" &&
+    requestedEnvironment.parentEnvironmentId === null &&
+    searchParams.has(NEW_VARIABLE_PICK_BRANCH_PARAM) &&
+    keyPanelData
+      ? keyPanelData.unsetBranches.filter((branch) => writableEnvironmentIdSet.has(branch.id))
+      : undefined;
+  // Opened once the dialog is: the dialog's own first focus would close it.
+  const [branchPickerOpen, setBranchPickerOpen] = useState(false);
+  // Start with the requested environment (its parent when it is a branch), or the environment
+  // the list is filtered to (never a branch).
+  const [selectedEnvironmentIds, setSelectedEnvironmentIds] = useState<Set<string>>(
+    () =>
+      new Set(
+        requestedEnvironment
+          ? [requestedEnvironment.parentEnvironmentId ?? requestedEnvironment.id]
+          : filter === "all"
+            ? []
+            : environments
+                .filter(
+                  (env) =>
+                    env.parentEnvironmentId === null &&
+                    filterEnvironmentIds.includes(env.id) &&
+                    writableEnvironmentIdSet.has(env.id)
+                )
+                .map((env) => env.id)
+      )
+  );
+  // And with the requested branch, or the preview branch the list is narrowed to when it is
+  // narrowed to exactly one.
+  const [selectedBranchId, setSelectedBranchId] = useState<string | undefined>(() => {
+    if (requestedEnvironment) {
+      return requestedEnvironment.parentEnvironmentId !== null
+        ? requestedEnvironment.id
+        : undefined;
+    }
+    const [onlyBranchId, ...others] = filterBranchEnvironmentIds;
+    return onlyBranchId && others.length === 0 && writableEnvironmentIdSet.has(onlyBranchId)
+      ? onlyBranchId
+      : undefined;
+  });
 
   // TODO: we only support branch-specific env vars for Preview environments.
   // This keeps setting consistent env vars across Dev/Staging/Prod easier.
@@ -276,6 +359,8 @@ export default function Page() {
   const previewIsSelected = selectedEnvironments.some((env) => env.type === "PREVIEW");
 
   const isLoading = navigation.state !== "idle" && navigation.formMethod === "post";
+  // An override is for a branch: without one picked it would save to the Preview base.
+  const needsBranch = overrideBranches !== undefined && previewIsSelected && !selectedBranchId;
 
   const [form, fields] = useForm<z.infer<typeof schema>>({
     id: "create-environment-variables",
@@ -286,7 +371,7 @@ export default function Page() {
     },
     shouldRevalidate: "onSubmit",
     defaultValue: {
-      variables: [{ key: "", value: "" }],
+      variables: [{ key: initialKey, value: "" }],
     },
   });
   const { environmentIds, variables } = fields;
@@ -296,6 +381,10 @@ export default function Page() {
     isChecked: boolean,
     environmentType?: string
   ) => {
+    // A branch only applies while Preview is ticked.
+    if (!isChecked && environmentType === "PREVIEW") {
+      setSelectedBranchId(undefined);
+    }
     setSelectedEnvironmentIds((prev) => {
       const newSet = new Set(prev);
 
@@ -337,17 +426,27 @@ export default function Page() {
       open={isOpen}
       onOpenChange={(o) => {
         if (!o) {
-          navigate(v3EnvironmentVariablesPath(organization, project, environment));
+          navigate(listPath);
         }
       }}
     >
-      <DialogContent className="p-0 pt-2.5 md:max-w-2xl lg:max-w-3xl">
+      <DialogContent
+        className="p-0 pt-2.5 md:max-w-2xl lg:max-w-3xl"
+        onOpenAutoFocus={
+          overrideBranches
+            ? (event) => {
+                event.preventDefault();
+                setBranchPickerOpen(true);
+              }
+            : undefined
+        }
+      >
         <DialogHeader className="px-4">New environment variables</DialogHeader>
         <Form method="post" {...getFormProps(form)}>
           <Fieldset className="max-h-[70vh] overflow-y-auto p-4 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
             <InputGroup fullWidth>
               <Label>Environments</Label>
-              {selectedBranchId ? (
+              {previewIsSelected && selectedBranchId ? (
                 <input type="hidden" name="environmentIds" value={selectedBranchId} />
               ) : (
                 Array.from(selectedEnvironmentIds).map((id) => (
@@ -454,8 +553,15 @@ export default function Page() {
                     variant="tertiary/medium"
                     value={selectedBranchId ?? "all"}
                     setValue={handleBranchChange}
-                    placeholder="All branches"
-                    items={[{ id: "all", branchName: "All branches" }, ...branchEnvironments]}
+                    items={
+                      overrideBranches ?? [
+                        { id: "all", branchName: "All branches" },
+                        ...branchEnvironments,
+                      ]
+                    }
+                    open={overrideBranches ? branchPickerOpen : undefined}
+                    setOpen={overrideBranches ? setBranchPickerOpen : undefined}
+                    placeholder={overrideBranches ? "Select a branch" : "All branches"}
                     className="w-fit min-w-52"
                     filter={{
                       keys: [
@@ -475,7 +581,7 @@ export default function Page() {
                       ))
                     }
                   </Select>
-                  {selectedBranchId !== "all" && selectedBranchId !== undefined && (
+                  {!overrideBranches && selectedBranchId !== undefined && (
                     <Button
                       variant="minimal/medium"
                       type="button"
@@ -492,7 +598,7 @@ export default function Page() {
               <Switch
                 name="isSecret"
                 variant="medium"
-                defaultChecked={false}
+                defaultChecked={searchParams.has(NEW_VARIABLE_SECRET_PARAM)}
                 value="true"
                 className="-ml-2 inline-flex w-fit"
                 label={<span className="text-text-bright">Secret value</span>}
@@ -515,6 +621,8 @@ export default function Page() {
                 </div>
               </FieldLayout>
               <VariableFields
+                initialKey={initialKey}
+                focusFirst={overrideBranches === undefined}
                 revealValues={revealAll}
                 formId={form.id}
                 form={form}
@@ -532,7 +640,7 @@ export default function Page() {
                 <Button
                   type="submit"
                   variant="primary/medium"
-                  disabled={isLoading}
+                  disabled={isLoading || needsBranch}
                   name="override"
                   value="false"
                 >
@@ -540,7 +648,7 @@ export default function Page() {
                 </Button>
                 <Button
                   variant="secondary/medium"
-                  disabled={isLoading}
+                  disabled={isLoading || needsBranch}
                   name="override"
                   value="true"
                 >
@@ -549,10 +657,7 @@ export default function Page() {
               </div>
             }
             cancelButton={
-              <LinkButton
-                to={v3EnvironmentVariablesPath(organization, project, environment)}
-                variant="tertiary/medium"
-              >
+              <LinkButton to={listPath} variant="tertiary/medium">
                 Cancel
               </LinkButton>
             }
@@ -568,11 +673,17 @@ function FieldLayout({ children }: { children: React.ReactNode }) {
 }
 
 function VariableFields({
+  initialKey,
+  focusFirst,
   revealValues,
   formId,
   variablesFields,
   form,
 }: {
+  /** The first row's key, when the dialog was opened for one. */
+  initialKey: string;
+  /** Focus the first row when the dialog opens. Off when another field takes focus. */
+  focusFirst: boolean;
   revealValues: boolean;
   formId?: string;
   variablesFields: FieldMetadata<Variable[]>;
@@ -584,7 +695,7 @@ function VariableFields({
     update,
     delete: remove,
     insertAfter,
-  } = useList<Variable>([{ key: "", value: "" }]);
+  } = useList<Variable>([{ key: initialKey, value: "" }]);
 
   const handlePaste = (index: number, e: React.ClipboardEvent<HTMLInputElement>) => {
     const clipboardData = e.clipboardData;
@@ -632,6 +743,7 @@ function VariableFields({
             }}
             showDeleteButton={items.length > 1}
             showValue={revealValues}
+            focus={index !== 0 || !focusFirst ? undefined : initialKey ? "value" : "key"}
             config={field}
           />
         );
@@ -666,6 +778,7 @@ function VariableField({
   onDelete,
   showDeleteButton,
   showValue,
+  focus,
   config,
 }: {
   formId?: string;
@@ -676,6 +789,8 @@ function VariableField({
   onDelete: () => void;
   showDeleteButton: boolean;
   showValue: boolean;
+  /** The input to focus when the dialog opens. */
+  focus?: "key" | "value";
   config: FieldMetadata<Variable>;
 }) {
   const fields = config.getFieldset();
@@ -691,7 +806,7 @@ function VariableField({
             placeholder="e.g. CLIENT_KEY"
             value={value.key}
             onChange={(e) => onChange({ ...value, key: e.currentTarget.value })}
-            autoFocus={index === 0}
+            autoFocus={focus === "key"}
             onPaste={onPaste}
             autoComplete="off"
           />
@@ -706,6 +821,7 @@ function VariableField({
               placeholder="Not set"
               value={value.value}
               onChange={(e) => onChange({ ...value, value: e.currentTarget.value })}
+              autoFocus={focus === "value"}
               autoComplete="off"
             />
             <FormError id={fields.value.errorId}>{fields.value.errors}</FormError>

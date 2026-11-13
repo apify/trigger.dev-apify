@@ -7,12 +7,20 @@ import express, { type RequestHandler } from "express";
 import morgan from "morgan";
 import { nanoid } from "nanoid";
 import path from "path";
+import { setSourceMapsSupport } from "node:module";
 import { pathToFileURL } from "node:url";
 import type { Server as IoServer } from "socket.io";
 import type { WebSocketServer } from "ws";
 import type { RateLimitMiddleware } from "~/services/apiRateLimit.server";
 import { type RunWithHttpContextFunction } from "~/services/httpAsyncStorage.server";
+import { createHostHeaderGuard } from "./app/utils/hostHeader";
 import { getRouterPath, pathHasPrefix, sanitizeHttpUrl } from "./app/utils/sanitizeHttpUrl";
+import { blockOtlpIngestRoutes, otlpIngestRoutesDisabled } from "./app/utils/otlpIngestRoutes";
+import {
+  createApiOnlyServiceMiddleware,
+  parseApiOnlyServiceMode,
+  servesStaticFiles,
+} from "./app/utils/apiOnlyService";
 import cluster from "node:cluster";
 import os from "node:os";
 
@@ -109,6 +117,9 @@ if (ENABLE_CLUSTER && cluster.isPrimary) {
 async function startServer() {
   const app = express();
 
+  // First, so no path-matched middleware ever sees a path different from the one Remix routes.
+  app.use(createHostHeaderGuard());
+
   if (process.env.DISABLE_COMPRESSION !== "1") {
     app.use(compression());
   }
@@ -117,6 +128,10 @@ async function startServer() {
   app.disable("x-powered-by");
 
   const MODE = process.env.NODE_ENV;
+
+  if (MODE === "development") {
+    setSourceMapsSupport(true, { nodeModules: false, generatedCode: true });
+  }
 
   // In development, Vite serves assets (and handles HMR) via middleware.
   // Only NODE_ENV=development boots Vite — scripts that run the built server
@@ -129,8 +144,22 @@ async function startServer() {
       : undefined;
 
   if (viteDevServer) {
+    Reflect.deleteProperty(Error, "prepareStackTrace");
+  }
+
+  const apiOnlyServiceMode = parseApiOnlyServiceMode(process.env.API_ONLY_SERVICE_MODE);
+  if (apiOnlyServiceMode) {
+    app.use(
+      createApiOnlyServiceMiddleware({
+        mode: apiOnlyServiceMode,
+        appOrigin: process.env.APP_ORIGIN,
+      })
+    );
+  }
+
+  if (viteDevServer) {
     app.use(viteDevServer.middlewares);
-  } else {
+  } else if (servesStaticFiles(apiOnlyServiceMode)) {
     // Vite fingerprints its assets so we can cache forever.
     app.use("/assets", express.static("build/client/assets", { immutable: true, maxAge: "1y" }));
     // Stale clients can request an old hashed asset; hard-404 instead of falling
@@ -191,9 +220,8 @@ async function startServer() {
     const otlpRateLimiter: RequestHandler = build.entry.module.otlpRateLimiter;
     const runWithHttpContext: RunWithHttpContextFunction = build.entry.module.runWithHttpContext;
     const tenantContextMiddleware: RequestHandler = build.entry.module.tenantContextMiddleware;
-    const dashboardAgentBodyCap: RequestHandler = build.entry.module.dashboardAgentBodyCap;
-    const webhookIngressIpRateLimiter: RequestHandler =
-      build.entry.module.webhookIngressIpRateLimiter;
+    const ingressBodyCap: RequestHandler = build.entry.module.ingressBodyCap;
+    const flushAuditLogs: () => Promise<void> = build.entry.module.flushAuditLogs;
 
     app.use((req, res, next) => {
       // helpful headers:
@@ -246,17 +274,20 @@ async function startServer() {
         });
       }
 
+      if (otlpIngestRoutesDisabled(process.env)) {
+        app.use(blockOtlpIngestRoutes);
+      }
+
       app.use(apiRateLimiter);
       app.use(deploymentRateLimiter);
       app.use(engineRateLimiter);
       app.use(otlpRateLimiter);
-      app.use(webhookIngressIpRateLimiter);
 
       app.use(tenantContextMiddleware);
 
-      // Before the Remix handler: the agent's chat body is refused while it streams, so a
+      // Before the Remix handler: capped bodies are refused while they stream, so a
       // route never buffers one that was already too large.
-      app.use(dashboardAgentBodyCap);
+      app.use(ingressBodyCap);
 
       app.all(
         "*",
@@ -307,6 +338,8 @@ async function startServer() {
         } else {
           console.log("Express server closed gracefully.");
         }
+        // The requests still running at the signal have finished: hand their audit events over.
+        void flushAuditLogs();
       });
       // Dev-only: release Vite's file watchers and HMR websocket
       viteDevServer?.close();

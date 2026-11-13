@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { containerTestWithIsolatedRedisNoClickhouse } from "@internal/testcontainers";
+import { containerTestWithIsolatedRedis } from "@internal/testcontainers";
 import {
   createRedisClient,
   createRedisClusterClient,
@@ -21,12 +21,13 @@ import {
 import type { Prisma, PrismaClient } from "@trigger.dev/database";
 import type { StoredWebhookRoutingTarget, WebhookDeliveryTargetResult } from "@trigger.dev/core/v3";
 import { WebhookEndpointId } from "@trigger.dev/core/v3/isomorphic";
-import { afterAll, beforeAll, beforeEach, expect } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, vi } from "vitest";
 import { WebhookEngine } from "./index.js";
 import { WebhookWaiterStore } from "./waiters/store.js";
 import { waiterShape } from "./waiters/match.js";
 import type {
   TriggerWebhookTaskCallback,
+  WebhookEngineMetricsHooks,
   TriggerWebhookTaskParams,
   WebhookWaiterLimits,
   WebhookWaiterOutput,
@@ -34,10 +35,10 @@ import type {
 } from "./types.js";
 
 /**
- * With WEBHOOK_WAITERS_REDIS_CLUSTER=1 every test here runs its waiter store on a local three-node
- * Redis Cluster (redis-server and redis-cli on PATH), the topology production uses, so a script
- * whose keys span slots fails with CROSSSLOT here instead of in production. A standalone Redis
- * can't detect that. Jobs and the front gate's job queue stay on the test's own Redis.
+ * With WEBHOOK_WAITERS_REDIS_CLUSTER=1 every test here runs the engine's whole Redis (the job queue,
+ * the front gate and the waiter store) on a local three-node Redis Cluster (redis-server and
+ * redis-cli on PATH), the topology production uses, so a script whose keys span slots fails with
+ * CROSSSLOT here instead of in production. A standalone Redis can't detect that.
  */
 const CLUSTER = process.env.WEBHOOK_WAITERS_REDIS_CLUSTER === "1";
 let clusterPorts: number[] = [];
@@ -157,7 +158,7 @@ function clusterNodes() {
   return clusterPorts.map((port) => ({ host: "127.0.0.1", port }));
 }
 
-/** A client on whichever Redis the engine's waiter store uses in this run. */
+/** A client on whichever Redis the engine uses in this run. */
 function waiterStoreClient(redisOptions: RedisOptions) {
   return CLUSTER
     ? createRedisClusterClient({ nodes: clusterNodes() })
@@ -255,7 +256,10 @@ function makeWaitpoints(options?: {
   completeBehaviour?: (
     ids: string[],
     call: number
-  ) => Array<{ id: string; ok: boolean; error?: string }> | "throw" | undefined;
+  ) =>
+    | Array<{ id: string; ok: boolean; error?: string; infrastructure?: boolean }>
+    | "throw"
+    | undefined;
 }) {
   const byId = new Map<string, FakeWaitpoint>();
   const byKey = new Map<string, string>();
@@ -339,23 +343,26 @@ function buildEngine(
     completionChunkSize?: number;
     exhaustedRecordDelayMs?: number;
     meter?: Meter;
+    metrics?: WebhookEngineMetricsHooks;
+    tenantConcurrency?: (environmentId: string) => Promise<number>;
   }
 ) {
   return new WebhookEngine({
     meter: over?.meter,
+    metrics: over?.metrics,
     prisma,
-    redis: redisOptions,
+    redis: CLUSTER ? { cluster: { nodes: clusterNodes() } } : redisOptions,
     worker: {
       concurrency: over?.concurrency ?? 1,
       pollIntervalMs: 50,
       disabled: over?.workerDisabled,
       exhaustedRecordDelayMs: over?.exhaustedRecordDelayMs,
+      retryBaseDelayMs: 20,
+      tenantConcurrency: over?.tenantConcurrency,
     },
-    endpointCache: { ttlMs: 0 },
     triggerTask: over?.triggerTask ?? makeTaskPort().triggerTask,
     resolveSigningSecret: async (key) => (key === SECRET_KEY ? SECRET : undefined),
     waiters: {
-      ...(CLUSTER ? { cluster: { nodes: clusterNodes() } } : {}),
       waitpoints,
       limits: over?.limits,
       urlSecret: "waiter-url-secret",
@@ -427,7 +434,7 @@ const MATCH = (orderId: string) => ({
   "event.type": "payment_intent.succeeded",
 });
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "listed waiters carry the match and filter they were created with",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma, []);
@@ -456,7 +463,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a matching delivery resumes the waiter with the event, and the endpoint's task still fires",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma, [
@@ -505,7 +512,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a form-encoded delivery resumes a waiter whose match reads its form fields",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -549,7 +556,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a delivery no waiter matches is UNMATCHED when waiters are live, and FILTERED when none are",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -559,9 +566,15 @@ containerTestWithIsolatedRedisNoClickhouse(
     try {
       const none = await engine.ingest(signed(endpoint.opaqueId, orderEvent("ord_x")));
       if (none.outcome !== "accepted") throw new Error(none.outcome);
-      const filtered = await prisma.webhookDelivery.findFirst({ where: { id: none.deliveryId } });
-      expect(filtered?.status).toBe("FILTERED");
-      expect(await engine.isDeliveryQueued(none.deliveryId)).toBeFalsy();
+      const filtered = await waitForDelivery(prisma, none.deliveryId);
+      expect(filtered.status).toBe("FILTERED");
+      expect(
+        await engine.isDeliveryQueued({
+          id: none.deliveryId,
+          environmentId: endpoint.runtimeEnvironmentId,
+          endpointId: endpoint.id,
+        })
+      ).toBeFalsy();
 
       const waiter = await createdWaiter(engine, { match: MATCH("ord_2") });
       const unmatched = await waitForDelivery(
@@ -581,9 +594,7 @@ containerTestWithIsolatedRedisNoClickhouse(
         signed(endpoint.opaqueId, orderEvent("ord_after_cancel"))
       );
       if (afterCancel.outcome !== "accepted") throw new Error(afterCancel.outcome);
-      expect(
-        (await prisma.webhookDelivery.findFirst({ where: { id: afterCancel.deliveryId } }))?.status
-      ).toBe("FILTERED");
+      expect((await waitForDelivery(prisma, afterCancel.deliveryId)).status).toBe("FILTERED");
 
       const live = await createdWaiter(engine, { match: MATCH("ord_2") });
       const wrongType = await waitForDelivery(
@@ -601,7 +612,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "several waiters on one key all resume from one delivery, sharing one packet; a filtered-out one keeps waiting",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -634,7 +645,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "concurrent deliveries matching one waiter claim it once",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -659,7 +670,72 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
+  "a front-gate promote only applies to the claim it was made for",
+  async ({ redisOptions }) => {
+    const client = waiterStoreClient(redisOptions);
+    const store = new WebhookWaiterStore(client, "", {
+      perEnvironment: 1000,
+      perEndpoint: 100,
+      shapes: 25,
+    });
+
+    try {
+      const first = await store.claimFrontGate("ep_gate", "evt_1", "whd_a", 3600);
+      expect(first.claimed).toBe(true);
+      expect(await store.peekFrontGate("ep_gate", "evt_1")).toEqual({
+        deliveryFriendlyId: "whd_a",
+        promoted: false,
+      });
+
+      await client.set(store.gateKey("ep_gate", "evt_1"), "c:whd_b", "EX", 3600);
+      await store.promoteFrontGate("ep_gate", "evt_1", "whd_a");
+      expect(await store.peekFrontGate("ep_gate", "evt_1")).toEqual({
+        deliveryFriendlyId: "whd_b",
+        promoted: false,
+      });
+
+      await store.promoteFrontGate("ep_gate", "evt_1", "whd_b");
+      expect(await store.peekFrontGate("ep_gate", "evt_1")).toEqual({
+        deliveryFriendlyId: "whd_b",
+        promoted: true,
+      });
+      expect(await client.ttl(store.gateKey("ep_gate", "evt_1"))).toBeGreaterThan(3000);
+      expect(await store.peekFrontGate("ep_gate", "evt_missing")).toBeUndefined();
+    } finally {
+      await client.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "a session append is held while its attempt's lease lives, taken over once it lapses, and skipped once committed",
+  async ({ redisOptions }) => {
+    const client = waiterStoreClient(redisOptions);
+    const store = new WebhookWaiterStore(client, "", {
+      perEnvironment: 1000,
+      perEndpoint: 100,
+      shapes: 25,
+    });
+
+    try {
+      expect(await store.claimSessionPart("ep_part", "whd_1:target", 3600, 300)).toBe("append");
+      expect(await store.claimSessionPart("ep_part", "whd_1:target", 3600, 300)).toBe("busy");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      expect(await store.claimSessionPart("ep_part", "whd_1:target", 3600, 300)).toBe("append");
+      await store.commitSessionPart("ep_part", "whd_1:target");
+      expect(await store.claimSessionPart("ep_part", "whd_1:target", 3600, 300)).toBe("done");
+
+      expect(await store.claimSessionPart("ep_part", "whd_2:target", 3600, 300)).toBe("append");
+      await store.releaseSessionPart("ep_part", "whd_2:target");
+      expect(await store.claimSessionPart("ep_part", "whd_2:target", 3600, 300)).toBe("append");
+    } finally {
+      await client.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
   "two deliveries that both read a waiter before either claims it: only the first claims it",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -694,7 +770,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a delivery that arrived before the waiter was created never resumes it, even from a backed-up queue",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -732,7 +808,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "an expired waiter is pruned: it isn't matched and its slot is free again",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -755,8 +831,8 @@ containerTestWithIsolatedRedisNoClickhouse(
 
       const result = await engine.ingest(signed(endpoint.opaqueId, orderEvent("ord_6")));
       if (result.outcome !== "accepted") throw new Error(result.outcome);
-      const delivery = await prisma.webhookDelivery.findFirst({ where: { id: result.deliveryId } });
-      expect(delivery?.status).toBe("FILTERED");
+      const delivery = await waitForDelivery(prisma, result.deliveryId);
+      expect(delivery.status).toBe("FILTERED");
 
       await createdWaiter(engine, { match: MATCH("ord_7") });
     } finally {
@@ -765,7 +841,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "every limit is enforced at create, and an over-limit create allocates no waitpoint",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -831,7 +907,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "cancel fails the wait and frees the slot; cancelling after a claim is too late and the run keeps the event",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -872,7 +948,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a create retried with the same idempotency key returns the same waiter",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -899,7 +975,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a crash after the claim, before completion, completes the claimed waiter on the retry",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -927,7 +1003,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a completion upload failure for one waiter retries only that waiter",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -966,7 +1042,42 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
+  "a waiter whose completion fails on our infrastructure keeps retrying past the attempt limit",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const waitpoints = makeWaitpoints({
+      completeBehaviour: (ids, call) =>
+        call <= 7
+          ? ids.map((id) => ({
+              id,
+              ok: false,
+              error: "Can't reach database server",
+              infrastructure: true,
+            }))
+          : undefined,
+    });
+    const engine = buildEngine(prisma, redisOptions, waitpoints.ports);
+
+    try {
+      const waiter = await createdWaiter(engine, { match: MATCH("ord_infra") });
+      const delivery = await waitForDelivery(
+        prisma,
+        await accepted(engine, signed(endpoint.opaqueId, orderEvent("ord_infra"))),
+        60_000
+      );
+
+      expect(delivery.status).toBe("SUCCEEDED");
+      expect(waitpoints.completeCalls.length).toBe(8);
+      expect(waitpoints.byId.get(waiter.id)?.status).toBe("COMPLETED");
+    } finally {
+      await engine.quit();
+    }
+  },
+  90_000
+);
+
+containerTestWithIsolatedRedis(
   "a register retried after a delivery claimed the waiter does not make it claimable again",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1011,7 +1122,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a URL-matched waiter completes only from its own URL, which never fans out to the endpoint's subscribers",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma, [
@@ -1061,7 +1172,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "more waiters on one value than a chunk resume across completion jobs, each exactly once",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma, [
@@ -1107,7 +1218,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a completion job that fails retries only its own unresolved waiters",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1156,7 +1267,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a waiter that never resumes is given up on after the last attempt and the delivery fails",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1210,7 +1321,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   150_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "the environment cap counts waiters across endpoints, and resumed, cancelled and expired ones free their slots",
   async ({ prisma, redisOptions }) => {
     const payments = await createEndpoint(prisma);
@@ -1270,7 +1381,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   30_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "limits passed with a create override the engine's, so each org gets its own caps",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1305,7 +1416,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a waiter cancelled the moment it registers leaves no environment slot behind",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1330,7 +1441,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a URL-matched waiter's filter still applies to deliveries on its URL",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1362,7 +1473,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a completion job whose resume call keeps throwing gives its chunk up and the delivery fails",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1400,7 +1511,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   150_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a completion job that throws on every attempt gives up only its chunk, and the delivery still settles",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1452,7 +1563,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   150_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "an exhausted chunk whose slot release fails once still frees every slot on the retry",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1514,7 +1625,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   150_000
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "waiter creates, claims and resumes are recorded",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1553,7 +1664,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a waiter can be created by an endpoint's declared id or its wh_ id, and a wh_ value only matches a wh_ id",
   async ({ prisma, redisOptions }) => {
     const payments = await createEndpoint(prisma);
@@ -1578,7 +1689,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "an idempotency key reused on another endpoint or match is refused, leaving the first waiter intact",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1617,7 +1728,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a cancel scoped to an endpoint only cancels that endpoint's waiters",
   async ({ prisma, redisOptions }) => {
     const payments = await createEndpoint(prisma);
@@ -1648,7 +1759,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a waiter matching a header still resumes when earlier headers fill the stored header budget",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1679,7 +1790,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "an idempotency key reused after its waiter completed is still checked against the original",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1719,7 +1830,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "headers that live waiters match on are stored even when together they pass the header budget",
   async ({ prisma, redisOptions }) => {
     const endpoint = await createEndpoint(prisma);
@@ -1748,7 +1859,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "an idempotency key can't adopt a waitpoint that isn't one of the endpoint's waiters",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1795,7 +1906,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a reused idempotency key with another filter is refused, since the waiter keeps its first filter",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1831,7 +1942,7 @@ containerTestWithIsolatedRedisNoClickhouse(
   }
 );
 
-containerTestWithIsolatedRedisNoClickhouse(
+containerTestWithIsolatedRedis(
   "a waitpoint made outside createWaiter with a waiter's key and tag still takes an environment slot",
   async ({ prisma, redisOptions }) => {
     await createEndpoint(prisma);
@@ -1859,6 +1970,194 @@ containerTestWithIsolatedRedisNoClickhouse(
       });
       expect(adopted).toMatchObject({ outcome: "limit", reason: "environment_limit" });
     } finally {
+      await engine.quit();
+    }
+  }
+);
+
+function recordingMetrics() {
+  const calls: Array<[string, ...unknown[]]> = [];
+  const hooks: WebhookEngineMetricsHooks = {
+    onWaiterCreated: (...args) => calls.push(["created", ...args]),
+    onWaiterRefused: (...args) => calls.push(["refused", ...args]),
+    onWaiterReleased: (...args) => calls.push(["released", ...args]),
+    onProcessing: (...args) => calls.push(["processing", ...args]),
+  };
+  return { hooks, calls, of: (name: string) => calls.filter((call) => call[0] === name) };
+}
+
+containerTestWithIsolatedRedis(
+  "metric hooks see a waiter created, its job processed and its slot released",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma);
+    const metrics = recordingMetrics();
+    const engine = buildEngine(prisma, redisOptions, makeWaitpoints().ports, {
+      metrics: metrics.hooks,
+    });
+
+    try {
+      await createdWaiter(engine, { match: MATCH("ord_metrics") });
+      const env = { environmentId: "env_test", projectId: "proj_test" };
+      await vi.waitFor(() =>
+        expect(metrics.of("created")).toEqual([["created", env, 1, 1_000_000]])
+      );
+
+      await waitForDelivery(
+        prisma,
+        await accepted(engine, signed(endpoint.opaqueId, orderEvent("ord_metrics")))
+      );
+      await vi.waitFor(() => expect(metrics.of("processing")).toHaveLength(2));
+      expect(metrics.of("processing")).toEqual([
+        ["processing", { environmentId: "env_test" }, 1, 100],
+        ["processing", { environmentId: "env_test" }, 0, 100],
+      ]);
+      await vi.waitFor(() =>
+        expect(metrics.of("released")).toEqual([
+          ["released", { ...env, organizationId: "org_test" }, 0],
+        ])
+      );
+      expect(metrics.of("refused")).toEqual([]);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis.for<{
+  reason: string;
+  limits?: Partial<WebhookWaiterLimits>;
+  engineLimits?: Partial<WebhookWaiterLimits>;
+  match: Record<string, string>;
+}>([
+  { reason: "environment_limit", limits: { perEnvironment: 1 }, match: MATCH("ord_b") },
+  { reason: "endpoint_limit", limits: { perEndpoint: 1 }, match: MATCH("ord_b") },
+  { reason: "shape_limit", engineLimits: { shapes: 1 }, match: { "event.type": "invoice.paid" } },
+])(
+  "metric hooks see a waiter refused at the $reason",
+  async ({ reason, limits, engineLimits, match }, { prisma, redisOptions }) => {
+    await createEndpoint(prisma);
+    const metrics = recordingMetrics();
+    const engine = buildEngine(prisma, redisOptions, makeWaitpoints().ports, {
+      metrics: metrics.hooks,
+      workerDisabled: true,
+      limits: engineLimits,
+    });
+    const env = { environmentId: "env_test", projectId: "proj_test" };
+
+    try {
+      await createdWaiter(engine, { match: MATCH("ord_a") });
+      const refused = await engine.createWaiter({ ...env, endpoint: "payments", match, limits });
+      expect(refused).toMatchObject({ outcome: "limit", reason });
+      expect(metrics.of("refused")).toEqual([["refused", env, reason]]);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "metric hooks see a waiter created on an existing waitpoint that had no slot yet",
+  async ({ prisma, redisOptions }) => {
+    await createEndpoint(prisma);
+    const waitpoints = makeWaitpoints();
+    const metrics = recordingMetrics();
+    const engine = buildEngine(prisma, redisOptions, waitpoints.ports, {
+      metrics: metrics.hooks,
+      workerDisabled: true,
+    });
+
+    try {
+      await waitpoints.ports.create({
+        environmentId: "env_test",
+        projectId: "proj_test",
+        idempotencyKey: "webhook-waiter:crashed",
+        timeoutAt: new Date(Date.now() + 60_000),
+        tags: ["webhook:payments"],
+      });
+      const waiter = await createdWaiter(engine, {
+        match: MATCH("ord_crashed"),
+        idempotencyKey: "crashed",
+      });
+      expect(waiter.isCached).toBe(true);
+      await vi.waitFor(() =>
+        expect(metrics.of("created")).toEqual([
+          ["created", { environmentId: "env_test", projectId: "proj_test" }, 1, 1_000_000],
+        ])
+      );
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis(
+  "without metric hooks finishing a job looks up no concurrency",
+  async ({ prisma, redisOptions }) => {
+    const endpoint = await createEndpoint(prisma, [
+      { type: "task", id: "orders", taskId: "orders" },
+    ]);
+    let lookups = 0;
+    let running!: () => void;
+    const started = new Promise<void>((resolve) => (running = resolve));
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => (finish = resolve));
+    const engine = buildEngine(prisma, redisOptions, makeWaitpoints().ports, {
+      tenantConcurrency: async () => {
+        lookups++;
+        return 100;
+      },
+      triggerTask: async () => {
+        running();
+        await finished;
+        return { success: true, runId: "run_lookup" };
+      },
+    });
+
+    try {
+      const id = await accepted(engine, signed(endpoint.opaqueId, orderEvent("ord_lookup")));
+      await started;
+      const whileRunning = lookups;
+      finish();
+      await waitForDelivery(prisma, id);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(lookups).toBe(whileRunning);
+    } finally {
+      await engine.quit();
+    }
+  }
+);
+
+containerTestWithIsolatedRedis.for([
+  {
+    name: "throwing",
+    hook: () => {
+      throw new Error("metrics down");
+    },
+  },
+  {
+    name: "rejecting",
+    hook: (async () => {
+      throw new Error("metrics down");
+    }) as () => void,
+  },
+])(
+  "a $name metric hook doesn't break creating a waiter",
+  async ({ hook }, { prisma, redisOptions }) => {
+    await createEndpoint(prisma);
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    const engine = buildEngine(prisma, redisOptions, makeWaitpoints().ports, {
+      workerDisabled: true,
+      metrics: { onWaiterCreated: hook },
+    });
+
+    try {
+      await createdWaiter(engine, { match: MATCH("ord_hook") });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
       await engine.quit();
     }
   }

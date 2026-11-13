@@ -1,4 +1,4 @@
-import { type PrismaClient } from "@trigger.dev/database";
+import { boundedIn, type PrismaClient } from "@trigger.dev/database";
 import { type Result, fromPromise, ok, okAsync, ResultAsync } from "neverthrow";
 import { env } from "~/env.server";
 import { logger } from "~/services/logger.server";
@@ -9,7 +9,6 @@ import type {
 } from "~/models/vercelIntegration.server";
 import { VercelIntegrationRepository } from "~/models/vercelIntegration.server";
 import { type GitHubAppInstallation } from "~/routes/resources.orgs.$organizationSlug.projects.$projectParam.env.$envParam.github";
-import { EnvironmentVariablesRepository } from "~/v3/environmentVariables/environmentVariablesRepository.server";
 import { isReservedForExternalSync } from "~/v3/environmentVariableRules.server";
 import type { VercelProjectIntegrationData } from "~/v3/vercel/vercelProjectIntegrationSchema";
 import { VercelProjectIntegrationDataSchema } from "~/v3/vercel/vercelProjectIntegrationSchema";
@@ -18,12 +17,15 @@ import { BasePresenter } from "./basePresenter.server";
 type VercelSettingsOptions = {
   projectId: string;
   organizationId: string;
+  /** False hides the integration exactly as when Vercel isn't configured. */
+  vercelAvailable?: boolean;
 };
 
 export type VercelSettingsResult = {
   enabled: boolean;
   hasOrgIntegration: boolean;
   authInvalid?: boolean;
+  disabled?: boolean;
   authError?: string;
   connectedProject?: {
     id: string;
@@ -61,6 +63,7 @@ export type VercelOnboardingData = {
   availableProjects: VercelAvailableProject[];
   hasProjectSelected: boolean;
   authInvalid?: boolean;
+  disabled?: boolean;
   authError?: string;
   existingVariables: Record<string, { environments: string[] }>; // Environment slugs (non-archived only)
   gitHubAppInstallations: GitHubAppInstallation[];
@@ -75,8 +78,9 @@ export class VercelSettingsPresenter extends BasePresenter {
   public async call({
     projectId,
     organizationId,
+    vercelAvailable = true,
   }: VercelSettingsOptions): Promise<Result<VercelSettingsResult, unknown>> {
-    const vercelIntegrationEnabled = OrgIntegrationRepository.isVercelSupported;
+    const vercelIntegrationEnabled = OrgIntegrationRepository.isVercelSupported && vercelAvailable;
 
     if (!vercelIntegrationEnabled) {
       return ok({
@@ -131,10 +135,12 @@ export class VercelSettingsPresenter extends BasePresenter {
     if (hasOrgIntegration) {
       const tokenResult = await VercelIntegrationRepository.validateVercelToken(orgIntegration);
       if (tokenResult.isErr() || !tokenResult.value.isValid) {
+        const disabled = tokenResult.isErr() && tokenResult.error.reason === "disabled";
         return ok({
           enabled: true,
           hasOrgIntegration: true,
-          authInvalid: true,
+          authInvalid: !disabled,
+          disabled,
           authError: tokenResult.isErr() ? tokenResult.error.message : "Vercel token is invalid",
           connectedProject: undefined,
           isGitHubConnected: false,
@@ -267,6 +273,7 @@ export class VercelSettingsPresenter extends BasePresenter {
           connectedProject,
         ]) => {
           const fetchVercelData = async (): Promise<{
+            disabled?: boolean;
             customEnvironments: VercelCustomEnvironment[];
             autoAssignCustomDomains: boolean | null;
             vercelManageAccessUrl?: string;
@@ -363,7 +370,12 @@ export class VercelSettingsPresenter extends BasePresenter {
               );
             }
 
+            const disabled = [customEnvsResult, autoAssignResult, triggerVersionResult].some(
+              (r) => r.isErr() && r.error.reason === "disabled"
+            );
+
             return {
+              disabled,
               customEnvironments: customEnvsResult.isOk() ? customEnvsResult.value : [],
               autoAssignCustomDomains: autoAssignResult.isOk() ? autoAssignResult.value : null,
               vercelManageAccessUrl,
@@ -377,26 +389,39 @@ export class VercelSettingsPresenter extends BasePresenter {
             cause: error,
           })).map(
             ({
+              disabled,
               customEnvironments,
               autoAssignCustomDomains,
               vercelManageAccessUrl,
               currentTriggerVersion,
               currentTriggerVersionFetchFailed,
             }) =>
-              ({
-                enabled: true,
-                hasOrgIntegration,
-                authInvalid: false,
-                connectedProject,
-                isGitHubConnected,
-                hasStagingEnvironment,
-                hasPreviewEnvironment,
-                customEnvironments,
-                autoAssignCustomDomains,
-                vercelManageAccessUrl,
-                currentTriggerVersion,
-                currentTriggerVersionFetchFailed,
-              }) as VercelSettingsResult
+              (disabled
+                ? {
+                    enabled: true,
+                    hasOrgIntegration,
+                    authInvalid: false,
+                    disabled: true,
+                    connectedProject: undefined,
+                    isGitHubConnected: false,
+                    hasStagingEnvironment: false,
+                    hasPreviewEnvironment: false,
+                    customEnvironments: [],
+                  }
+                : {
+                    enabled: true,
+                    hasOrgIntegration,
+                    authInvalid: false,
+                    connectedProject,
+                    isGitHubConnected,
+                    hasStagingEnvironment,
+                    hasPreviewEnvironment,
+                    customEnvironments,
+                    autoAssignCustomDomains,
+                    vercelManageAccessUrl,
+                    currentTriggerVersion,
+                    currentTriggerVersionFetchFailed,
+                  }) as VercelSettingsResult
           );
         }
       )
@@ -405,6 +430,37 @@ export class VercelSettingsPresenter extends BasePresenter {
         logger.error("Error in VercelSettingsPresenter.call", { error });
         return error;
       });
+  }
+
+  public async getExistingVariables(
+    projectId: string
+  ): Promise<VercelOnboardingData["existingVariables"]> {
+    const environments = await this._replica.runtimeEnvironment.findMany({
+      where: { projectId, archivedAt: null },
+      select: { id: true, slug: true, type: true },
+    });
+    const envIdToSlug = new Map(
+      environments.map((environment) => [
+        environment.id,
+        environment.slug || environment.type.toLowerCase(),
+      ])
+    );
+    if (!envIdToSlug.size) return {};
+    const values = await this._replica.environmentVariableValue.findMany({
+      where: {
+        variable: { projectId },
+        environmentId: { in: boundedIn([...envIdToSlug.keys()]) },
+      },
+      select: { variable: { select: { key: true } }, environmentId: true },
+    });
+    const existing = new Map<string, { environments: string[] }>();
+    for (const value of values) {
+      const slug = envIdToSlug.get(value.environmentId)!;
+      const entry = existing.get(value.variable.key);
+      if (entry) entry.environments.push(slug);
+      else existing.set(value.variable.key, { environments: [slug] });
+    }
+    return Object.fromEntries(existing);
   }
 
   /**
@@ -497,12 +553,14 @@ export class VercelSettingsPresenter extends BasePresenter {
 
         const tokenResult = await VercelIntegrationRepository.validateVercelToken(orgIntegration);
         if (tokenResult.isErr() || !tokenResult.value.isValid) {
+          const disabled = tokenResult.isErr() && tokenResult.error.reason === "disabled";
           return {
             customEnvironments: [],
             environmentVariables: [],
             availableProjects: [],
             hasProjectSelected: false,
-            authInvalid: true,
+            authInvalid: !disabled,
+            disabled,
             authError: tokenResult.isErr() ? tokenResult.error.message : "Vercel token is invalid",
             existingVariables: {},
             gitHubAppInstallations,
@@ -520,6 +578,7 @@ export class VercelSettingsPresenter extends BasePresenter {
             availableProjects: [],
             hasProjectSelected: false,
             authInvalid: clientResult.error.authInvalid,
+            disabled: clientResult.error.reason === "disabled",
             authError: clientResult.error.authInvalid ? clientResult.error.message : undefined,
             existingVariables: {},
             gitHubAppInstallations,
@@ -555,6 +614,7 @@ export class VercelSettingsPresenter extends BasePresenter {
             availableProjects: [],
             hasProjectSelected: false,
             authInvalid: availableProjectsResult.error.authInvalid,
+            disabled: availableProjectsResult.error.reason === "disabled",
             authError: availableProjectsResult.error.authInvalid
               ? availableProjectsResult.error.message
               : undefined,
@@ -607,6 +667,26 @@ export class VercelSettingsPresenter extends BasePresenter {
                   }>
                 ),
           ]);
+        const disabled =
+          (customEnvironmentsResult.isErr() &&
+            customEnvironmentsResult.error.reason === "disabled") ||
+          (projectEnvVarsResult.isErr() && projectEnvVarsResult.error.reason === "disabled") ||
+          (sharedEnvVarsResult.isErr() && sharedEnvVarsResult.error.reason === "disabled");
+
+        if (disabled) {
+          return {
+            customEnvironments: [],
+            environmentVariables: [],
+            availableProjects: availableProjectsResult.value,
+            hasProjectSelected: true,
+            disabled: true,
+            existingVariables: {},
+            gitHubAppInstallations,
+            isGitHubConnected,
+            isOnboardingComplete: false,
+          };
+        }
+
         const authInvalid =
           (customEnvironmentsResult.isErr() && customEnvironmentsResult.error.authInvalid) ||
           (projectEnvVarsResult.isErr() && projectEnvVarsResult.error.authInvalid) ||
@@ -684,36 +764,7 @@ export class VercelSettingsPresenter extends BasePresenter {
 
         const sortedEnvVars = [...mergedEnvVars].sort((a, b) => a.key.localeCompare(b.key));
 
-        const projectEnvs = await (this._replica as PrismaClient).runtimeEnvironment.findMany({
-          where: {
-            projectId,
-            archivedAt: null, // Filter out archived environments
-          },
-          select: {
-            id: true,
-            slug: true,
-            type: true,
-          },
-        });
-        const envIdToSlug = new Map(projectEnvs.map((e) => [e.id, e.slug]));
-        const activeEnvIds = new Set(projectEnvs.map((e) => e.id));
-
-        const envVarRepository = new EnvironmentVariablesRepository(this._replica as PrismaClient);
-        const existingVariables = await envVarRepository.getProject(projectId);
-        const existingVariablesRecord: Record<string, { environments: string[] }> = {};
-        for (const v of existingVariables) {
-          // Filter out archived environments and map to slugs
-          const activeEnvSlugs = v.values
-            .filter((val) => activeEnvIds.has(val.environment.id))
-            .map(
-              (val) => envIdToSlug.get(val.environment.id) || val.environment.type.toLowerCase()
-            );
-          if (activeEnvSlugs.length > 0) {
-            existingVariablesRecord[v.key] = {
-              environments: activeEnvSlugs,
-            };
-          }
-        }
+        const existingVariables = await this.getExistingVariables(projectId);
 
         const parsedIntegrationData = VercelProjectIntegrationDataSchema.safeParse(
           projectIntegration.integrationData
@@ -724,7 +775,7 @@ export class VercelSettingsPresenter extends BasePresenter {
           environmentVariables: sortedEnvVars,
           availableProjects: availableProjectsResult.value,
           hasProjectSelected: true,
-          existingVariables: existingVariablesRecord,
+          existingVariables,
           gitHubAppInstallations,
           isGitHubConnected,
           isOnboardingComplete: parsedIntegrationData.success

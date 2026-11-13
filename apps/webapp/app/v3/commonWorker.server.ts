@@ -12,10 +12,6 @@ import {
   runAttioWorkspaceSync,
 } from "~/services/attio.server";
 import { purgeDashboardAgentChatsForOrganization } from "~/services/dashboardAgentChatRetention.server";
-import {
-  rearmDashboardAgentWatchBatches,
-  sweepDashboardAgentWatches,
-} from "~/services/dashboardAgentWatchSweep.server";
 import { logger } from "~/services/logger.server";
 import {
   MembershipDevEnvironmentsSchema,
@@ -27,10 +23,31 @@ import { PerformDeploymentAlertsService } from "./services/alerts/performDeploym
 import { PerformTaskRunAlertsService } from "./services/alerts/performTaskRunAlerts.server";
 import { BatchTriggerV3Service } from "./services/batchTriggerV3.server";
 import { TimeoutDeploymentService } from "./services/timeoutDeployment.server";
+import { sweepExpiredBuildEnvVars } from "./services/sweepDeploymentBuildEnvVars.server";
+import {
+  personalAccessTokensUrl,
+  sweepExpiredAuthorizationCodes,
+} from "~/services/personalAccessToken.server";
+import {
+  personalAccessTokenExpiryEmailsSchedule,
+  sendPersonalAccessTokenExpiryEmails,
+} from "~/services/personalAccessTokenExpiryEmails.server";
 import { BulkActionService } from "./services/bulk/BulkActionV2.server";
 import { prisma } from "~/db.server";
 import { sweepPreviewAutoArchives } from "~/services/previewAutoArchive.server";
 import { controlPlaneResolver } from "./runOpsMigration/controlPlaneResolver.server";
+import { alertDeliveryRetryCap } from "./services/alerts/delivery/deliverAlertEvent.server";
+import { runAlertsHousekeeping } from "./services/alerts/engine/alertsTick.server";
+import { isAlertsConfigured } from "./services/alerts/alertsConfigured.server";
+import { runAlertPartitionMaintenance } from "./services/alerts/engine/alertPartitionMaintenance.server";
+import { alertPartitionDdlClient } from "./services/alerts/storage/alertPartitionClient.server";
+import { tracer } from "./tracer.server";
+import {
+  ORG_PROVISIONING_VISIBILITY_TIMEOUT_MS,
+  OrgProvisioningPayloadSchema,
+  runOrgProvisioningJob,
+} from "./services/orgProvisioningJobs.server";
+import { webhookEngine } from "./webhookEngine.server";
 
 function initializeWorker() {
   const redisOptions = {
@@ -45,20 +62,63 @@ function initializeWorker() {
 
   logger.debug(`👨‍🏭 Initializing common worker at host ${env.COMMON_WORKER_REDIS_HOST}`);
 
-  // Only schedule the agent watch cron where the agent is actually set up. Otherwise
-  // its sweeps hit a missing schema and drip a dead-letter entry every run.
-  const dashboardAgentConfigured =
-    env.DASHBOARD_AGENT_ENABLED === "1" || Boolean(env.DASHBOARD_AGENT_DATABASE_URL);
+  // Alerts live in the dashboard-agent-db schema but are their own feature, unrelated
+  // to whether the dashboard agent itself is enabled.
+  const alertsConfigured = isAlertsConfigured({
+    alertsEnabled: env.ALERTS_ENABLED,
+  });
+
+  // Undefined when the token expiry emails are off or no email transport is set.
+  const personalAccessTokenExpiryEmailsCron = personalAccessTokenExpiryEmailsSchedule({
+    enabled: env.PERSONAL_ACCESS_TOKEN_EXPIRY_EMAILS_ENABLED,
+    emailTransport: env.EMAIL_TRANSPORT,
+  });
 
   const worker = new RedisWorker({
     name: "common-worker",
     redisOptions,
     catalog: {
+      "webhooks.ensurePartitions": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 60_000 * 5,
+        ...(env.WEBHOOK_ENABLED === "1"
+          ? {
+              cron: env.WEBHOOK_PARTITION_ENSURE_SCHEDULE ?? "17 3 * * *",
+              jitterInMs: env.WEBHOOK_PARTITION_ENSURE_JITTER_MS ?? 5 * 60_000,
+            }
+          : {}),
+        retry: { maxAttempts: 1 },
+      },
       "previewBranches.autoArchiveSweep": {
         schema: CronSchema,
         cron: "* * * * *",
         jitterInMs: 10_000,
         visibilityTimeoutMs: 60_000,
+        retry: { maxAttempts: 3 },
+      },
+      "deployments.buildEnvVarsSweep": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 60_000 * 5,
+        ...(env.DEPLOYMENTS_BUILD_ENV_VARS_SWEEP_ENABLED
+          ? {
+              cron: env.DEPLOYMENTS_BUILD_ENV_VARS_SWEEP_SCHEDULE,
+              jitterInMs: env.DEPLOYMENTS_BUILD_ENV_VARS_SWEEP_JITTER_MS,
+            }
+          : {}),
+        retry: { maxAttempts: 3 },
+      },
+      "authorizationCodes.sweepExpired": {
+        schema: CronSchema,
+        cron: "*/30 * * * *",
+        jitterInMs: 60_000,
+        visibilityTimeoutMs: 60_000 * 5,
+        retry: { maxAttempts: 1 },
+      },
+      "personalAccessTokens.sendExpiryEmails": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 60_000 * 5,
+        ...personalAccessTokenExpiryEmailsCron,
+        // Each email is claimed before it's sent, so a retry can't send it twice.
         retry: { maxAttempts: 3 },
       },
       scheduleEmail: {
@@ -72,14 +132,15 @@ function initializeWorker() {
         schema: AttioWorkspaceSyncSchema,
         visibilityTimeoutMs: 30_000,
         retry: {
-          maxAttempts: 3,
+          // 2-4 min of backoff, so a short Attio outage or rate limit doesn't dead-letter the job.
+          maxAttempts: 8,
         },
       },
       "attio.syncUser": {
         schema: AttioUserSyncSchema,
         visibilityTimeoutMs: 30_000,
         retry: {
-          maxAttempts: 3,
+          maxAttempts: 8,
         },
       },
       "membership.provisionDevEnvironments": {
@@ -174,11 +235,33 @@ function initializeWorker() {
           maxAttempts: 1,
         },
       },
-      // The watch backstops: expiry, wake redelivery and dead batch chains.
+      // @deprecated, the legacy agent watch is gone; remove once the queue drains.
       "dashboardAgent.watchMaintenance": {
         schema: CronSchema,
-        visibilityTimeoutMs: 60_000 * 5,
-        ...(dashboardAgentConfigured ? { cron: "*/5 * * * *", jitterInMs: 30_000 } : {}),
+        visibilityTimeoutMs: 60_000,
+        retry: {
+          maxAttempts: 1,
+        },
+      },
+      "alerts.evaluateTick": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 60_000 * 2,
+        retry: {
+          maxAttempts: 1,
+        },
+      },
+      "alerts.housekeeping": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 60_000 * 2,
+        ...(alertsConfigured ? { cron: "*/5 * * * *", jitterInMs: 30_000 } : {}),
+        retry: {
+          maxAttempts: 1,
+        },
+      },
+      "alerts.partitionMaintenance": {
+        schema: CronSchema,
+        visibilityTimeoutMs: 300_000,
+        ...(alertsConfigured ? { cron: "17 * * * *" } : {}),
         retry: {
           maxAttempts: 1,
         },
@@ -193,6 +276,27 @@ function initializeWorker() {
           maxAttempts: 5,
         },
       },
+      "org.convergeRunsEnabled": {
+        schema: OrgProvisioningPayloadSchema,
+        visibilityTimeoutMs: ORG_PROVISIONING_VISIBILITY_TIMEOUT_MS,
+        retry: {
+          maxAttempts: 12,
+        },
+      },
+      "org.pushConcurrencyLimits": {
+        schema: OrgProvisioningPayloadSchema,
+        visibilityTimeoutMs: ORG_PROVISIONING_VISIBILITY_TIMEOUT_MS,
+        retry: {
+          maxAttempts: 12,
+        },
+      },
+      "org.provisionStagingEnvironments": {
+        schema: OrgProvisioningPayloadSchema,
+        visibilityTimeoutMs: ORG_PROVISIONING_VISIBILITY_TIMEOUT_MS,
+        retry: {
+          maxAttempts: 12,
+        },
+      },
     },
     concurrency: {
       workers: env.COMMON_WORKER_CONCURRENCY_WORKERS,
@@ -204,9 +308,29 @@ function initializeWorker() {
     shutdownTimeoutMs: env.COMMON_WORKER_SHUTDOWN_TIMEOUT_MS,
     logger: new Logger("CommonWorker", env.COMMON_WORKER_LOG_LEVEL),
     jobs: {
+      "webhooks.ensurePartitions": async () => {
+        await webhookEngine.ensurePartitions();
+      },
       "previewBranches.autoArchiveSweep": async () => {
         await sweepPreviewAutoArchives(prisma, (ids) => {
           for (const id of ids) controlPlaneResolver.invalidateEnvironment(id);
+        });
+      },
+      "deployments.buildEnvVarsSweep": async () => {
+        await sweepExpiredBuildEnvVars(prisma, {
+          windowDays: env.DEPLOYMENTS_REDEPLOY_WINDOW_DAYS,
+          batchSize: env.DEPLOYMENTS_BUILD_ENV_VARS_SWEEP_BATCH_SIZE,
+        });
+      },
+      "authorizationCodes.sweepExpired": async () => {
+        await sweepExpiredAuthorizationCodes(prisma);
+      },
+      "personalAccessTokens.sendExpiryEmails": async () => {
+        // A run queued before the job was turned off still arrives once. Skip it, or with no
+        // transport it would mark emails sent that only went to the log.
+        if (!personalAccessTokenExpiryEmailsCron) return;
+        await sendPersonalAccessTokenExpiryEmails(prisma, sendEmail, {
+          tokensUrl: personalAccessTokensUrl(),
         });
       },
       scheduleEmail: async ({ payload }) => {
@@ -258,29 +382,28 @@ function initializeWorker() {
       },
       // @deprecated, moved to the dashboard agent project; remove once the queue drains.
       "dashboardAgent.maintenance": async () => {},
-      "dashboardAgent.watchMaintenance": async () => {
-        // Each backstop runs independently; the first failure is rethrown at the end.
-        let failure: unknown;
-
-        try {
-          const watches = await sweepDashboardAgentWatches();
-          if (watches.overdue > 0 || watches.undelivered > 0) {
-            logger.debug("Dashboard agent watch sweep", watches);
+      "dashboardAgent.watchMaintenance": async () => {},
+      "alerts.evaluateTick": async () => {},
+      "alerts.housekeeping": async () => {
+        await runAlertsHousekeeping(
+          { now: new Date() },
+          {
+            db: prisma,
+            retryCap: alertDeliveryRetryCap(),
+            startSpan: (name, fn) => tracer.startActiveSpan(name, fn),
+            logger,
           }
-        } catch (error) {
-          failure ??= error;
-        }
-
-        try {
-          const batches = await rearmDashboardAgentWatchBatches();
-          if (batches.stale > 0) {
-            logger.debug("Dashboard agent watch batch re-arm", batches);
+        );
+      },
+      "alerts.partitionMaintenance": async () => {
+        await runAlertPartitionMaintenance(
+          { now: new Date() },
+          {
+            prisma,
+            ddlClient: alertPartitionDdlClient,
+            logger,
           }
-        } catch (error) {
-          failure ??= error;
-        }
-
-        if (failure) throw failure;
+        );
       },
       "dashboardAgent.purgeOrganization": async ({ payload }) => {
         const soft = await purgeDashboardAgentChatsForOrganization({
@@ -292,6 +415,15 @@ function initializeWorker() {
             softDeleted: soft,
           });
         }
+      },
+      "org.convergeRunsEnabled": async ({ payload }) => {
+        await runOrgProvisioningJob("org.convergeRunsEnabled", payload.organizationId);
+      },
+      "org.pushConcurrencyLimits": async ({ payload }) => {
+        await runOrgProvisioningJob("org.pushConcurrencyLimits", payload.organizationId);
+      },
+      "org.provisionStagingEnvironments": async ({ payload }) => {
+        await runOrgProvisioningJob("org.provisionStagingEnvironments", payload.organizationId);
       },
     },
   });

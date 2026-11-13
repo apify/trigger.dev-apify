@@ -1,10 +1,7 @@
 import type { CreateBackgroundWorkerRequestBody } from "@trigger.dev/core/v3";
+import type { DeploymentAccessController } from "@trigger.dev/plugins";
 import { logger, needsNodeRuntimeUpdate, tryCatch } from "@trigger.dev/core/v3";
-import {
-  Prisma,
-  type PrismaClientOrTransaction,
-  type WorkerDeployment,
-} from "@trigger.dev/database";
+import { type PrismaClientOrTransaction, type WorkerDeployment } from "@trigger.dev/database";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { type TaskMetadataCache } from "~/services/taskMetadataCache.server";
 import { taskMetadataCacheInstance } from "~/services/taskMetadataCacheInstance.server";
@@ -19,21 +16,34 @@ import {
 } from "./createBackgroundWorker.server";
 import { findOrCreateBackgroundWorker } from "./createDeploymentBackgroundWorkerV4/findOrCreateBackgroundWorker.server";
 import { TimeoutDeploymentService } from "./timeoutDeployment.server";
+import { checkDeployAccess, deniedMessage } from "../deploymentAccess.server";
 import { recordDeploymentFinished } from "./recordDeploymentFinished.server";
 import { env } from "~/env.server";
 import { webhookPrisma } from "~/db.server";
 import { DeploymentService } from "./deployment.server";
+import {
+  captureDeploymentIndex,
+  getDeploymentIndexStore,
+  type DeploymentIndexStore,
+} from "../deploymentIndex.server";
 
 export class CreateDeploymentBackgroundWorkerServiceV4 extends BaseService {
   private readonly _taskMetaCache: TaskMetadataCache;
+  private readonly _deploymentIndexStore: DeploymentIndexStore | undefined;
+  private readonly _deploymentAccess: DeploymentAccessController | null | undefined;
 
   constructor(
     prisma?: PrismaClientOrTransaction,
     replica?: PrismaClientOrTransaction,
-    taskMetaCache: TaskMetadataCache = taskMetadataCacheInstance
+    taskMetaCache: TaskMetadataCache = taskMetadataCacheInstance,
+    deploymentIndexStore: DeploymentIndexStore | undefined = getDeploymentIndexStore(),
+    // Tests inject the access controller; production loads the plugin.
+    deploymentAccess?: DeploymentAccessController | null
   ) {
     super(prisma, replica);
     this._taskMetaCache = taskMetaCache;
+    this._deploymentIndexStore = deploymentIndexStore;
+    this._deploymentAccess = deploymentAccess;
   }
 
   public async call(
@@ -122,6 +132,51 @@ export class CreateDeploymentBackgroundWorkerServiceV4 extends BaseService {
           projectId: environment.projectId,
         });
         return;
+      }
+
+      // The task count is only known here. A refusal fails the deployment the way other
+      // definitive validation failures do, so the CLI prints the reason at once.
+      const access = await checkDeployAccess(
+        {
+          stage: "register_worker",
+          organizationId: environment.organization.id,
+          projectId: environment.project.id,
+          environmentId: environment.id,
+          deploymentId: deployment.id,
+          taskCount: body.metadata.tasks.length,
+        },
+        { controller: this._deploymentAccess }
+      );
+      if (!access.allowed) {
+        const serviceError = new ServiceValidationError(deniedMessage(access));
+        await this.#failBackgroundWorkerDeployment(deployment, serviceError, environment);
+        throw serviceError;
+      }
+
+      const [indexError, indexReference] = await tryCatch(
+        captureDeploymentIndex(
+          environment,
+          deployment,
+          body,
+          this._deploymentIndexStore,
+          this._prisma
+        )
+      );
+
+      if (indexError) {
+        logger.error("Error storing deployment index", {
+          error: indexError,
+          deploymentId,
+          environmentId: environment.id,
+        });
+
+        const serviceError = new ServiceValidationError(
+          "Failed to store the deployment index, so this deployment failed. Deploy again to retry."
+        );
+
+        await this.#failBackgroundWorkerDeployment(deployment, serviceError, environment);
+
+        throw serviceError;
       }
 
       const [findOrCreateError, backgroundWorker] = await tryCatch(
@@ -289,6 +344,7 @@ export class CreateDeploymentBackgroundWorkerServiceV4 extends BaseService {
           type: backgroundWorker.engine === "V2" ? "MANAGED" : "V1",
           // runtime is already set when the deployment is created, we only need to set the version
           runtimeVersion: body.metadata.runtimeVersion,
+          ...indexReference,
         },
       });
 
@@ -361,7 +417,6 @@ export class CreateDeploymentBackgroundWorkerServiceV4 extends BaseService {
         status: "FAILED",
         failedAt,
         errorData,
-        buildEnvVars: Prisma.DbNull,
       },
     });
 

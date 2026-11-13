@@ -10,9 +10,11 @@ import { z } from "zod";
 import { prisma } from "~/db.server";
 import { generateJWTTokenForEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
+import { resolveAttemptVariables } from "~/services/environmentEncryption/attemptVariables.server";
 import { defaultMachine } from "~/services/platform.v3.server";
+import { devWorkerAuthorization } from "~/services/devWorkerAuthorization.server";
 import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
-import { resolveVariablesForEnvironment } from "~/v3/environmentVariables/environmentVariablesRepository.server";
+import type { EnvironmentVariable } from "~/v3/environmentVariables/repository";
 import { machinePresetFromName } from "~/v3/machinePresets.server";
 import { meteringClaims } from "~/v3/utils/meteringClaims.server";
 import { engine } from "~/v3/runEngine.server";
@@ -20,6 +22,7 @@ import { runStore } from "~/v3/runStore.server";
 
 const { action } = createActionApiRoute(
   {
+    authorization: devWorkerAuthorization,
     body: WorkerApiRunAttemptStartRequestBody,
     params: z.object({
       runFriendlyId: z.string(),
@@ -47,6 +50,9 @@ const { action } = createActionApiRoute(
         throw new Response("You don't have permissions for this run", { status: 401 });
       }
 
+      // Resolved before the attempt exists, so an unavailable key leaves the run startable.
+      const variables = await resolveAttemptVariables(authentication.environment);
+
       const engineResult = await engine.startRunAttempt({
         runId: RunId.toId(runFriendlyId),
         snapshotId: SnapshotId.toId(snapshotFriendlyId),
@@ -56,6 +62,7 @@ const { action } = createActionApiRoute(
       const defaultMachinePreset = machinePresetFromName(defaultMachine);
 
       const envVars = await getEnvVars(
+        variables,
         authentication.environment,
         engineResult.run.id,
         engineResult.execution.machine ?? defaultMachinePreset,
@@ -82,14 +89,13 @@ const { action } = createActionApiRoute(
 );
 
 async function getEnvVars(
+  variables: EnvironmentVariable[],
   environment: AuthenticatedEnvironment,
   runId: string,
   machinePreset: MachinePreset,
   metering: Record<string, string>,
   taskEventStore?: string
 ): Promise<Record<string, string>> {
-  const variables = await resolveVariablesForEnvironment(environment);
-
   const jwt = await generateJWTTokenForEnvironment(environment, {
     ...metering,
     run_id: runId,

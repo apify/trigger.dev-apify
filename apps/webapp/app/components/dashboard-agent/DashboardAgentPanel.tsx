@@ -1,13 +1,15 @@
 import type { UIMessage } from "@ai-sdk/react";
-import { useLocation } from "@remix-run/react";
+import { useFetcher, useLocation, useNavigate, useRevalidator } from "@remix-run/react";
 import { generateFriendlyId } from "@trigger.dev/core/v3/isomorphic";
 import { motion } from "framer-motion";
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { environmentFullTitle } from "~/components/environments/EnvironmentLabel";
 import { Spinner } from "~/components/primitives/Spinner";
 import { useToast } from "~/components/primitives/Toast";
 import { useAgentPageContext } from "~/hooks/useAgentPageContext";
 import { useDashboardAgentBaseUrl } from "~/hooks/useDashboardAgentBaseUrl";
 import { useEnvironment } from "~/hooks/useEnvironment";
+import { useFeatures } from "~/hooks/useFeatures";
 import { useOrganization } from "~/hooks/useOrganizations";
 import { useProject } from "~/hooks/useProject";
 import { useUser } from "~/hooks/useUser";
@@ -26,24 +28,22 @@ import {
 } from "./last-chat-storage";
 import { DashboardAgentDraft } from "./DashboardAgentDraft";
 import { DraftQuotaPoller } from "./DraftQuotaPoller";
+import { MonitoringPlanHostProvider, type MonitoringPlanHost } from "./MonitoringPlanBlock";
+import { useMonitoringPlanState } from "./useMonitoringPlanState";
 import {
   parseQuotaReachedResponse,
   shouldClearCapReached,
   type MessageQuota,
 } from "./message-quota";
-import { WatchCard } from "./WatchCard";
-import { watchDraftFor } from "./watch-card";
-import { NO_WATCH_CARD, watchCardReducer } from "./watch-card-state";
-import { forgetWatchActivity, rememberWatchActivity } from "./watch-activity";
 import type { TurnActivity } from "./DashboardAgentMessages";
 import { DashboardAgentHeader } from "./DashboardAgentHeader";
 import type { DashboardAgentChat as DashboardAgentChatListItem } from "./DashboardAgentHistory";
-import type { SuggestedPrompt, WatchSpec } from "@internal/dashboard-agent-contracts";
+import type { SuggestedPrompt } from "@internal/dashboard-agent-contracts";
 import { resolveOpenedChat, type OpenedChatResponse } from "./opened-chat";
 import type { AgentPageContext } from "./page-context-types";
 import { agentPageEntityId } from "./page-label";
 import { explicitPromptTarget } from "./explicit-prompt";
-import { escapeClosesPanel } from "./panel-escape";
+import { escapeClosesPanel, ownsEscape } from "./panel-escape";
 import {
   markChatListRead,
   nextVisibleChat,
@@ -52,8 +52,76 @@ import {
 } from "./unread-counts";
 import { AgentPanelColumn, type DashboardAgentMode, type DragHandleProps } from "./panel-layout";
 import { markerAfterActiveChat, markerAfterActivity } from "./thinking-marker";
-import { concurrencyLimitsPath } from "~/utils/pathBuilder";
+import {
+  concurrencyLimitsPath,
+  v3AlertCreatePath,
+  v3AlertPath,
+  v3EnvironmentPath,
+  v3ProjectAlertsPath,
+  v3ProjectLegacyAlertsPath,
+} from "~/utils/pathBuilder";
+import { afterReplace, LEGACY_ALERTS_ROUTE_ID } from "~/components/alerts/legacyAlertChannels";
 import { scopeMatchesPath, sessionPathFor } from "./agent-scope";
+import type { AgentOpenSource } from "./manual-setup-action";
+import { useCreationFlowState, type FlowAnswers } from "./alert-creation";
+import { useCreationSession } from "./alert-creation/useCreationSession";
+import { useCreationAgentSend } from "./alert-creation/useCreationAgentSend";
+import {
+  creationChatToReuse,
+  chatTurnClientData,
+  creationTurnClientData,
+  rescopeTurnClientData,
+  type CreationAgentChat,
+  type ToolResultPayload,
+} from "./alert-creation/draftPatch";
+import type { AlertChannel, CreationResult } from "./alert-creation/CreationFlow";
+import { CreationChatShell } from "~/components/alerts/CreationChatShell";
+import { alertChannelsResourcePath } from "~/components/alerts/alertChannelsResourcePath";
+import type { AlertCreatedMessage } from "~/components/alerts/alertCreatedCard";
+import { createAlertRequestBody, withKnownNotifiers } from "~/components/alerts/createAlertRequest";
+import { CreationTranscript } from "~/components/alerts/CreationTranscript";
+import { QueryAlertTranscript, queryWatchPrefill } from "~/components/alerts/QueryAlertTranscript";
+import { GroupAlertsTranscript } from "~/components/alerts/GroupAlertsTranscript";
+import {
+  EditAlertTranscript,
+  type EditAlertPrefill,
+} from "~/components/alerts/EditAlertTranscript";
+import {
+  alertName,
+  asArea,
+  searchParamsToAnswers,
+  prefillToAnswers,
+  isErrorGroupOnly,
+  type DraftPrefillParams,
+} from "./alert-creation/flow-state";
+import { useErrorGroupSource } from "~/components/alerts/useErrorGroupLookup";
+import {
+  clearSlackConnectResume,
+  readSlackConnectResume,
+} from "~/components/alerts/slackConnectResume";
+function createSearchKey(search: string): string {
+  const p = new URLSearchParams(search);
+  return [
+    p.get("create"),
+    p.get("area"),
+    p.get("capability"),
+    p.get("scope"),
+    p.get("scopeValue"),
+  ].join("|");
+}
+
+function draftFromSearch(search: string): FlowAnswers {
+  const params = new URLSearchParams(search);
+  const area = params.get("area") ?? undefined;
+  const capability = params.get("capability") ?? undefined;
+  const scope = params.get("scope") ?? undefined;
+  const scopeValue = params.get("scopeValue") ?? undefined;
+  const base =
+    area || capability || scope
+      ? searchParamsToAnswers({ area: asArea(area), capability, scope, scopeValue })
+      : {};
+  return { ...base, notifiers: [] };
+}
 
 function serializePageContext(pageContext: AgentPageContext): string | undefined {
   try {
@@ -74,14 +142,25 @@ type ActiveChat = {
   streaming?: boolean;
 };
 
+function expiryToIso(exp: string | undefined): string | undefined {
+  if (!exp || exp === "none") return undefined;
+  const EVENT_HOURS: Record<string, number> = { deploy: 168, incident: 720 };
+  const hoursMatch = exp.match(/^(\d+)h$/);
+  const hours = hoursMatch ? Number(hoursMatch[1]) : EVENT_HOURS[exp];
+  if (hours) return new Date(Date.now() + hours * 3600_000).toISOString();
+  return Number.isNaN(Date.parse(exp)) ? undefined : new Date(exp).toISOString();
+}
+
 // The server generates the chat id on the first send; the client never invents one.
 export function DashboardAgentPanel({
   onClose,
   requestedMessage,
+  createAlertPrefill,
+  editAlertRequest,
+  groupAlertsRequest,
   openChatRequest,
   newChatSeq,
   promotedPrompt,
-  watchRequest,
   onChatRead,
   onUnreadWorkChange,
   onTurnActivityChange,
@@ -89,7 +168,7 @@ export function DashboardAgentPanel({
   onModeChange,
   dragHandleProps,
   dragHandleClassName,
-  watchEnabled = false,
+  openSource,
 }: {
   onClose: () => void;
   mode?: DashboardAgentMode;
@@ -97,14 +176,17 @@ export function DashboardAgentPanel({
   /** Spread onto the header, which is the floating window's drag handle; already filtered by `FloatingAgentWindow`. */
   dragHandleProps?: DragHandleProps;
   dragHandleClassName?: string;
-  /** Withholds every watch affordance while the flag is off. Defaults false until sourced. */
-  watchEnabled?: boolean;
+  /** The contextual entry point this chat was opened from; drives the header's "Manual setup" action. */
+  openSource?: AgentOpenSource;
+  /** Prefill for in-place alert creation (from contextual pages). */
+  createAlertPrefill?: DraftPrefillParams;
+  editAlertRequest?: { prefill: EditAlertPrefill; seq: number };
+  groupAlertsRequest?: { members: { id: string; name: string }[]; seq: number };
   // Every `seq` below distinguishes repeat requests with identical contents.
   requestedMessage?: { text: string; seq: number };
   openChatRequest?: { chatId: string; seq: number };
   newChatSeq?: number;
   promotedPrompt?: SuggestedPrompt;
-  watchRequest?: { spec: WatchSpec; seq: number };
   onChatRead?: (chatId: string, options: { leaving: boolean }) => void;
   /** How many chats still hold work their owner hasn't seen. */
   onUnreadWorkChange?: (count: number) => void;
@@ -114,24 +196,28 @@ export function DashboardAgentPanel({
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
+  const { queueMetricsEnabled } = useFeatures();
   const user = useUser();
   const apiOrigin = useDashboardAgentBaseUrl();
   const location = useLocation();
+  const revalidator = useRevalidator();
+  const navigate = useNavigate();
   const pageContext = useAgentPageContext();
   const toast = useToast();
 
   const storageKey = lastChatStorageKey(organization.id);
 
   const panelRef = useRef<HTMLDivElement | null>(null);
-  // Declared before the chat plumbing: changing chat dispatches into it.
-  const [watchCard, dispatchWatchCard] = useReducer(watchCardReducer, NO_WATCH_CARD);
   const [chats, setChats] = useState<DashboardAgentChatListItem[]>([]);
   // Until the list has arrived, the page load's server count is the better answer.
   const [chatsLoaded, setChatsLoaded] = useState(false);
   const [active, setActive] = useState<ActiveChat | null>(null);
   // A message asked for while the hooks still held the previous project: it is sent once
   // they catch up rather than dropped.
-  const [pendingCreate, setPendingCreate] = useState<string | null>(null);
+  const [pendingCreate, setPendingCreate] = useState<{
+    text: string;
+    turnClientData?: DashboardAgentClientData;
+  } | null>(null);
   // A refused `create` over the cap: the draft shows the upgrade block instead of a raw
   // toast. Cleared only by a poll newer than `refusalGenRef` — see `handleQuotaChange` below.
   const [capReached, setCapReached] = useState<{ limit: number; planResolved: boolean } | null>(
@@ -219,11 +305,6 @@ export function DashboardAgentPanel({
           const read = justRead.current;
           justRead.current = new Set();
           const chats = data.chats ?? [];
-          // Reloaded after every turn and after a watch is created, so this is where the browser
-          // learns whether the wake feed is worth polling.
-          const pending = chats.some((chat) => chat.hasActiveWatch || chat.hasUnreadWake);
-          if (pending) rememberWatchActivity(organization.id);
-          else forgetWatchActivity(organization.id);
           const settled = settleReadChats(chats, read, visibleChatId.current);
           setChats(settled);
           setChatsLoaded(true);
@@ -232,7 +313,7 @@ export function DashboardAgentPanel({
           toast.error("We couldn't load your previous chats. Try again in a moment.");
         }
       }),
-    [actionPath, organization.id, toast, justRead, visibleChatId]
+    [actionPath, toast, justRead, visibleChatId]
   );
 
   // Bumped on each open so a slower earlier open can't overwrite a newer one.
@@ -243,20 +324,16 @@ export function DashboardAgentPanel({
     { text: string; seq: number; chatId: string } | undefined
   >(undefined);
 
-  // The one way the panel changes chat: it invalidates any in-flight open and abandons a
-  // half-configured watch card, which would otherwise be submitted against the new chat.
+  // The one way the panel changes chat: it invalidates any in-flight open.
   const claimChatSlot = useCallback(() => {
-    dispatchWatchCard({ type: "chat-changed" });
-    // A new attempt goes back to the server, which re-refuses if the cap still stands.
     setCapReached(null);
-    // A request belongs to the chat it was made in: the remounting chat has a fresh guard ref,
-    // so a kept request would be sent a second time.
     setSendRequest(undefined);
     return ++openChatRequestSeq.current;
   }, []);
 
   const openChat = useCallback(
-    async (id: string) => {
+    async (id: string, stayInCreation = false) => {
+      if (!stayInCreation) setCreationMode(false);
       const seq = claimChatSlot();
       setLoading(true);
       try {
@@ -266,22 +343,24 @@ export function DashboardAgentPanel({
           toast.error("We couldn't open that chat. Try again in a moment.");
           // Transient failure: keep the stored pointer so the chat can be reopened.
           if (seq === openChatRequestSeq.current) setActive(null);
-          return;
+          return false;
         }
         const data = res.ok ? ((await res.json()) as OpenedChatResponse) : undefined;
-        if (seq !== openChatRequestSeq.current) return;
+        if (seq !== openChatRequestSeq.current) return false;
         const opened = resolveOpenedChat(id, data);
         if (opened.kind === "gone") {
           // Deleted, or another org's: drop the pointer so it can't be restored again.
           setActive(null);
           forgetLastChat(storageKey);
-          return;
+          return false;
         }
         setActive({ ...opened, organizationId: organization.id });
+        return true;
       } catch (error) {
         console.error(`Dashboard agent: failed to open chat ${id}`, error);
         toast.error("We couldn't open that chat. Try again in a moment.");
         if (seq === openChatRequestSeq.current) setActive(null);
+        return false;
       } finally {
         if (seq === openChatRequestSeq.current) setLoading(false);
       }
@@ -290,11 +369,14 @@ export function DashboardAgentPanel({
   );
 
   const createChat = useCallback(
-    async (text: string) => {
+    async (
+      text: string,
+      turnClientData?: DashboardAgentClientData
+    ): Promise<string | undefined> => {
       // The browser has already moved on; the hooks have not. Creating here would file the
       // chat under the project the user just left, so it waits for them to catch up.
       if (!scopeMatchesPath(location.pathname, actionPath)) {
-        setPendingCreate(text);
+        setPendingCreate({ text, turnClientData });
         return;
       }
       setPendingCreate(null);
@@ -309,7 +391,7 @@ export function DashboardAgentPanel({
         const body = new FormData();
         body.set("intent", "create");
         body.set("message", JSON.stringify(userMessage));
-        body.set("clientData", JSON.stringify(clientData));
+        body.set("clientData", JSON.stringify(turnClientData ?? clientData));
         const res = await fetch(actionPath, { method: "POST", body });
         const data = (await res.json()) as {
           chatId?: string;
@@ -341,6 +423,7 @@ export function DashboardAgentPanel({
           pendingFirstMessage: data.headStarted ? undefined : text,
           streaming: data.headStarted,
         });
+        return data.chatId;
       } catch (error) {
         console.error("Dashboard agent: failed to create chat", error);
         toast.error("We couldn't start that chat. Try again in a moment.");
@@ -354,19 +437,26 @@ export function DashboardAgentPanel({
 
   useEffect(() => {
     if (pendingCreate === null || !scopeMatchesPath(location.pathname, actionPath)) return;
-    void createChat(pendingCreate);
-  }, [pendingCreate, location.pathname, actionPath, createChat]);
+    void createChat(
+      pendingCreate.text,
+      rescopeTurnClientData(clientData, pendingCreate.turnClientData)
+    );
+  }, [pendingCreate, location.pathname, actionPath, createChat, clientData]);
 
   const restored = useRef(false);
   useEffect(() => {
     if (restored.current) return;
     restored.current = true;
     void loadHistory();
-    const stored = readLastChat(storageKey);
-    if (stored && stored.path === location.pathname) {
-      void openChat(stored.chatId);
-    } else {
+    if (creationModeRef.current) {
       setLoading(false);
+    } else {
+      const stored = readLastChat(storageKey);
+      if (stored && stored.path === location.pathname) {
+        void openChat(stored.chatId);
+      } else {
+        setLoading(false);
+      }
     }
     // location is deliberately not a dep: this is a mount-time decision.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -411,7 +501,7 @@ export function DashboardAgentPanel({
     justRead.current.add(chatId);
 
     setChats((previous) => markChatListRead(previous, chatId));
-    // Read again on the way out: a wake can land while the chat is open.
+    // Read again on the way out: an answer can land while the chat is open.
     return () => {
       onChatRead?.(chatId, { leaving: true });
       visibleChatId.current = nextVisibleChat(chatId, { leaving: true });
@@ -426,9 +516,143 @@ export function DashboardAgentPanel({
     onUnreadWorkChange?.(unreadWorkCount(chats, active?.chatId));
   }, [chats, chatsLoaded, active?.chatId, onUnreadWorkChange]);
 
+  const [creationMode, setCreationMode] = useState(openSource === "alerts");
+  const [dismissedEditSeq, setDismissedEditSeq] = useState<number>();
+  const activeEdit =
+    editAlertRequest && editAlertRequest.seq !== dismissedEditSeq ? editAlertRequest : undefined;
+  const [dismissedGroupSeq, setDismissedGroupSeq] = useState<number>();
+  const activeGroup =
+    groupAlertsRequest && groupAlertsRequest.seq !== dismissedGroupSeq
+      ? groupAlertsRequest
+      : undefined;
+  const activeGroupRef = useRef(activeGroup);
+  activeGroupRef.current = activeGroup;
+  const [groupManual, setGroupManual] = useState(false);
+  const activeEditRef = useRef(activeEdit);
+  activeEditRef.current = activeEdit;
+  const inEditMode = Boolean(activeEdit) || Boolean(activeGroup);
+  const inCreationMode = creationMode && !inEditMode;
+  const creationModeRef = useRef(creationMode);
+  creationModeRef.current = creationMode;
+
+  const [slackResume, setSlackResume] = useState(() =>
+    openSource === "alerts" && new URLSearchParams(location.search).get("add") === "slack"
+      ? readSlackConnectResume(project.id, environment.id)
+      : undefined
+  );
+  const [creationDraft, setCreationDraft] = useState(() =>
+    slackResume
+      ? (({ manual: _manual, ...answers }) => ({
+          ...answers,
+          notifiers: answers.notifiers?.filter((id) => id !== "chat"),
+          expiry: undefined,
+        }))(slackResume)
+      : openSource === "alerts"
+        ? createAlertPrefill
+          ? prefillToAnswers(createAlertPrefill)
+          : draftFromSearch(location.search)
+        : undefined
+  );
+  const [queryWatch, setQueryWatch] = useState(() =>
+    openSource === "alerts" ? queryWatchPrefill(createAlertPrefill) : undefined
+  );
+  const [creationEntrySeq, setCreationEntrySeq] = useState(0);
+  const [queryWatchSeq, setQueryWatchSeq] = useState(0);
+  const queryWatchKey = `${creationEntrySeq}:${queryWatchSeq}`;
+  const [queryCreatedKey, setQueryCreatedKey] = useState<string>();
+  const queryCreatedSig = useRef<string>();
+  const setQueryCreatedSig = (sig: string) => {
+    queryCreatedSig.current = sig;
+  };
+  const [creationGeneration, setCreationGeneration] = useState(0);
+  const creationAgentChat = useRef<CreationAgentChat>({ seq: -1 });
+  const [manualMode, setManualMode] = useState(Boolean(slackResume?.manual));
+
+  const createParamKey = inCreationMode ? createSearchKey(location.search) : "";
+  const prevCreateParamKeyRef = useRef(createParamKey);
+  const prevPrefillRef = useRef(createAlertPrefill);
+
+  const prevOpenSourceRef = useRef(openSource);
+  if (prevOpenSourceRef.current !== openSource || prevPrefillRef.current !== createAlertPrefill) {
+    const sameCreatedQuery =
+      openSource === "alerts" &&
+      prevOpenSourceRef.current === openSource &&
+      queryCreatedSig.current !== undefined &&
+      queryCreatedSig.current === JSON.stringify(queryWatchPrefill(createAlertPrefill));
+    prevOpenSourceRef.current = openSource;
+    prevPrefillRef.current = createAlertPrefill;
+    if (sameCreatedQuery) {
+      // The created card stays; don't offer the same alert again.
+    } else if (openSource === "alerts") {
+      queryCreatedSig.current = undefined;
+      setCreationMode(true);
+      setManualMode(false);
+      const draft = createAlertPrefill
+        ? prefillToAnswers(createAlertPrefill)
+        : draftFromSearch(location.search);
+      setCreationDraft(draft);
+      setQueryWatch(queryWatchPrefill(createAlertPrefill));
+      prevCreateParamKeyRef.current = createSearchKey(location.search);
+      setCreationEntrySeq((s) => s + 1);
+      setCreationGeneration((g) => g + 1);
+      creationAgentChat.current = { seq: -1 };
+    } else {
+      queryCreatedSig.current = undefined;
+      setCreationMode(false);
+      setCreationDraft(undefined);
+      setQueryWatch(undefined);
+      prevCreateParamKeyRef.current = "";
+    }
+  } else if (
+    inCreationMode &&
+    !createAlertPrefill &&
+    createParamKey !== prevCreateParamKeyRef.current
+  ) {
+    prevCreateParamKeyRef.current = createParamKey;
+    setManualMode(false);
+    setCreationDraft(draftFromSearch(location.search));
+    setQueryWatch(undefined);
+    setCreationEntrySeq((s) => s + 1);
+    setCreationGeneration((g) => g + 1);
+    creationAgentChat.current = { seq: -1 };
+  }
+
+  const doCreateSession = useCallback(
+    async (signal: AbortSignal): Promise<string | undefined> => {
+      const body = new FormData();
+      body.set("intent", "create-session");
+      const res = await fetch(actionPath, { method: "POST", body, signal });
+      if (signal.aborted) return undefined;
+      const data = (await res.json()) as { chatId?: string };
+      return res.ok ? data.chatId : undefined;
+    },
+    [actionPath]
+  );
+  const doDiscardSession = useCallback(
+    (chatId: string) => {
+      const body = new FormData();
+      body.set("intent", "delete");
+      body.set("chatId", chatId);
+      void fetch(actionPath, { method: "POST", body }).catch(() => {});
+    },
+    [actionPath]
+  );
+  const creationSession = useCreationSession({
+    enabled: inCreationMode || Boolean(activeGroup),
+    createSession: doCreateSession,
+    discardSession: doDiscardSession,
+    generation: creationGeneration,
+  });
+  const creationEntrySeqRef = useRef(creationEntrySeq);
+  creationEntrySeqRef.current = creationEntrySeq;
+
   const handledRequestSeq = useRef<number | undefined>(undefined);
   useEffect(() => {
     if (!requestedMessage || handledRequestSeq.current === requestedMessage.seq) return;
+    if (creationModeRef.current) {
+      handledRequestSeq.current = requestedMessage.seq;
+      return;
+    }
     const target = explicitPromptTarget({
       chat: loading ? "opening" : active ? "open" : "none",
       turnInFlight: thinkingChatId !== null && thinkingChatId === active?.chatId,
@@ -448,115 +672,26 @@ export function DashboardAgentPanel({
     { chatId: string; messages: UIMessage[]; seq: number } | undefined
   >(undefined);
 
-  const handledWatchSeq = useRef<number | undefined>(undefined);
-  useEffect(() => {
-    if (!watchEnabled || !watchRequest || handledWatchSeq.current === watchRequest.seq) return;
-    handledWatchSeq.current = watchRequest.seq;
-    dispatchWatchCard({
-      type: "open",
-      draft: watchDraftFor(watchRequest.spec),
-      requestId: generateFriendlyId("wreq"),
-    });
-  }, [watchRequest, watchEnabled]);
-
-  // Nothing is posted or persisted until the card is submitted.
-  const openWatchCard = useCallback(
-    (spec: WatchSpec) => {
-      if (!watchEnabled) return;
-      dispatchWatchCard({
-        type: "open",
-        draft: watchDraftFor(spec),
-        requestId: generateFriendlyId("wreq"),
-      });
-    },
-    [watchEnabled]
-  );
-
-  const dismissWatchCard = () => dispatchWatchCard({ type: "dismissed" });
   const activeChatId = active?.chatId;
 
-  const submitWatch = useCallback(async () => {
-    const draft = watchCard.draft;
-    if (!draft) return;
-    // Held across retries, so a resubmit repairs the same pair of records.
-    const clientRequestId = watchCard.requestId ?? generateFriendlyId("wreq");
-    dispatchWatchCard({ type: "submitting", requestId: clientRequestId });
-    try {
-      const body = new FormData();
-      body.set("intent", "watch-create");
-      body.set("draft", JSON.stringify(draft));
-      body.set("clientRequestId", clientRequestId);
-      // A watch is chat-bound: with no chat open the server creates one.
-      if (activeChatId) body.set("chatId", activeChatId);
-
-      const res = await fetch(actionPath, { method: "POST", body });
-      const data = (await res.json()) as {
-        chatId?: string;
-        messages?: UIMessage[];
-        error?: string;
-      };
-      if (!res.ok || !data.chatId || !data.messages) {
-        dispatchWatchCard({
-          type: "failed",
-          error: data.error ?? "We couldn't start that watch. Try again in a moment.",
-        });
-        return;
-      }
-
-      const messages = data.messages;
-      if (activeChatId === data.chatId) {
-        setAppendedMessages((current) => ({
-          chatId: data.chatId!,
-          messages,
-          seq: (current?.seq ?? 0) + 1,
-        }));
-        dispatchWatchCard({ type: "submitted" });
-      } else {
-        claimChatSlot();
-        // No session: nothing is streaming and the records are the whole chat.
-        setActive({
-          chatId: data.chatId,
-          messages,
-          session: null,
-          organizationId: organization.id,
-        });
-      }
-      void loadHistory();
-    } catch (error) {
-      console.error("Dashboard agent: failed to create watch", error);
-      dispatchWatchCard({
-        type: "failed",
-        error: "We couldn't start that watch. Try again in a moment.",
-      });
-    }
-  }, [
-    watchCard.draft,
-    watchCard.requestId,
-    activeChatId,
-    actionPath,
-    organization.id,
-    claimChatSlot,
-    loadHistory,
-  ]);
-
-  const watchCardElement =
-    watchEnabled && watchCard.draft ? (
-      <WatchCard
-        draft={watchCard.draft}
-        onChange={(draft) => dispatchWatchCard({ type: "edit", draft })}
-        onSubmit={() => void submitWatch()}
-        onCancel={dismissWatchCard}
-        pending={watchCard.pending}
-        error={watchCard.error}
-      />
-    ) : null;
-
   const newChat = useCallback(() => {
+    setDismissedEditSeq(activeEditRef.current?.seq);
+    setDismissedGroupSeq(activeGroupRef.current?.seq);
+    setCreationMode(false);
     claimChatSlot();
     setLoading(false);
     setActive(null);
     forgetLastChat(storageKey);
   }, [claimChatSlot, storageKey]);
+
+  const restartCreation = useCallback(() => {
+    newChat();
+    setCreationMode(true);
+    setCreationDraft(draftFromSearch(location.search));
+    setQueryWatch(undefined);
+    setCreationEntrySeq((s) => s + 1);
+    setCreationGeneration((g) => g + 1);
+  }, [newChat, location.search]);
 
   // Released only by a read that proves capacity: an unknown quota keeps the block.
   // Only a poll newer than the latest refusal (`quota.pollIsFresh`) may lift it — see
@@ -605,54 +740,337 @@ export function DashboardAgentPanel({
     [actionPath, active?.chatId, newChat, loadHistory, toast]
   );
 
-  const cancelWatch = useCallback(
-    async (watchId: string) => {
-      const chatId = active?.chatId;
-      if (!chatId) return;
-      setChats((previous) =>
-        previous.map((chat) =>
-          chat.id === chatId
-            ? { ...chat, watches: (chat.watches ?? []).filter((watch) => watch.id !== watchId) }
-            : chat
-        )
-      );
+  // Titles are written when the first turn settles, so a new chat has none yet.
+  const activeChat = active ? chats.find((chat) => chat.id === active.chatId) : undefined;
+  const activeChatClientData = useMemo(
+    () => chatTurnClientData(clientData, activeChat?.kind),
+    [clientData, activeChat?.kind]
+  );
+
+  const plans = useMonitoringPlanState(active?.chatId);
+  const [wizardSlot, setWizardSlot] = useState<HTMLElement | null>(null);
+  const [planShown, setPlanShown] = useState(false);
+  const showPlan = useCallback(() => setPlanShown(true), []);
+
+  const channelsFetcher = useFetcher<{
+    channels: AlertChannel[];
+    canWrite?: boolean;
+    limits?: { used: number; limit: number };
+  }>();
+  const channelsFetchedRef = useRef(false);
+  const wantsChannels = inCreationMode || inEditMode || planShown;
+  useEffect(() => {
+    if (wantsChannels && !channelsFetchedRef.current) {
+      channelsFetchedRef.current = true;
+      channelsFetcher.load(alertChannelsResourcePath(project.id, false, environment.id));
+    }
+    if (!wantsChannels) {
+      channelsFetchedRef.current = false;
+    }
+  }, [wantsChannels, project.id, environment.id]); // eslint-disable-line -- fetcher is stable
+  const knownChannels = channelsFetcher.data?.channels;
+  const alertChannels: AlertChannel[] = knownChannels ?? [];
+  const channelLimits = channelsFetcher.data?.limits;
+
+  const submitReplace = useCallback(
+    async (answers: FlowAnswers, expiresAt: string | undefined) => {
+      const target = answers.replace!;
       const body = new FormData();
-      body.set("intent", "watch-cancel");
-      body.set("chatId", chatId);
-      body.set("watchId", watchId);
+      body.set("intent", "replace");
+      body.set("channelId", target.channelId);
+      body.set("alertType", target.alertType);
+      body.set("environmentIds", (answers.environments ?? []).join(","));
+      body.set("value", answers.condition ?? "0");
+      if (answers.windowMinutes) body.set("windowMinutes", String(answers.windowMinutes));
+      if (expiresAt) body.set("expiresAt", expiresAt);
+      if (answers.scope) body.set("scopeType", answers.scope);
+      if (answers.scopeValue) body.set("scopeValue", answers.scopeValue);
+      body.set("notifierChannelIds", (answers.notifiers ?? []).join(","));
       try {
-        const res = await fetch(actionPath, { method: "POST", body });
-        if (!res.ok) throw new Error(`Watch cancel failed (${res.status})`);
-        // Empty when the watch had already resolved: then nothing was written.
-        const data = (await res.json()) as { messages?: UIMessage[] };
-        if (data.messages?.length) {
-          const messages = data.messages;
+        const res = await fetch(
+          `${v3ProjectLegacyAlertsPath(organization, project, environment)}?_data=${encodeURIComponent(LEGACY_ALERTS_ROUTE_ID)}`,
+          { method: "POST", body }
+        );
+        const data = (await res.json()) as {
+          message?: string;
+          error?: string;
+          legacyRemaining?: boolean;
+        };
+        if (!res.ok || !data.message) {
+          toast.error(data.error ?? "Failed to replace the legacy alert. Try again.");
+          return false;
+        }
+        const alertsPath = v3ProjectAlertsPath(organization, project, environment);
+        toast.success(data.message, {
+          action: { label: "View alerts", action: { type: "link", path: alertsPath } },
+        });
+        afterReplace(data.legacyRemaining, alertsPath, navigate, () => revalidator.revalidate());
+        onClose();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [organization, project, environment, navigate, revalidator, toast, onClose]
+  );
+  const handleAlertCreated = useCallback(
+    async (
+      draft: FlowAnswers
+    ): Promise<{ ok: CreationResult; chatId?: string; release?: () => void }> => {
+      const answers = withKnownNotifiers(draft, knownChannels ?? []);
+      const seq = creationEntrySeqRef.current;
+      let release: (() => void) | undefined;
+      try {
+        const reused = creationChatToReuse(
+          creationAgentChat.current,
+          creationEntrySeq,
+          active?.chatId
+        );
+        const transcriptChatId = !answers.replace
+          ? (reused ?? (await creationSession.ensure()))
+          : undefined;
+        if (!reused && transcriptChatId && seq === creationEntrySeqRef.current) {
+          release = creationSession.keep();
+        }
+
+        const expiresAt = expiryToIso(answers.expiry);
+        if (answers.replace) {
+          return {
+            ok: await submitReplace(answers, expiresAt),
+            chatId: transcriptChatId,
+            release,
+          };
+        }
+
+        const resp = await fetch("/resources/alerts/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...createAlertRequestBody(
+              {
+                organizationId: organization.id,
+                projectId: project.id,
+                environmentId: environment.id,
+              },
+              answers
+            ),
+            transcriptChatId,
+          }),
+        });
+        if (!resp.ok) return { ok: false, release };
+        const data = (await resp.json()) as { alertId?: string; message?: AlertCreatedMessage };
+        revalidator.revalidate();
+        const message = data.message;
+        if (message && transcriptChatId) {
           setAppendedMessages((current) => ({
-            chatId,
-            messages,
+            chatId: transcriptChatId,
+            messages: [message as UIMessage],
             seq: (current?.seq ?? 0) + 1,
           }));
         }
-      } catch (error) {
-        console.error("Dashboard agent: failed to cancel watch", error);
-        toast.error("We couldn't stop that watch. Try again in a moment.");
+        if (!data.alertId) return { ok: true, chatId: transcriptChatId };
+        return {
+          ok: { alertId: data.alertId, block: message?.parts[1].data.blocks[0] },
+          chatId: transcriptChatId,
+        };
+      } catch {
+        return { ok: false, release };
       }
-      void loadHistory();
     },
-    [actionPath, active?.chatId, loadHistory, toast]
+    [
+      organization.id,
+      project.id,
+      environment.id,
+      active?.chatId,
+      creationEntrySeq,
+      creationSession,
+      revalidator,
+      submitReplace,
+      knownChannels,
+    ]
   );
 
-  // Titles are written when the first turn settles, so a new chat has none yet.
-  const activeChat = active ? chats.find((chat) => chat.id === active.chatId) : undefined;
-  const headerTitle = active ? (activeChat?.title ?? "Chat") : "New chat";
+  const ensureQueryChat = useCallback(async () => {
+    const seq = creationEntrySeqRef.current;
+    const reused = creationChatToReuse(creationAgentChat.current, creationEntrySeq, active?.chatId);
+    const chatId = reused ?? (await creationSession.ensure());
+    if (!chatId) return undefined;
+    const release =
+      !reused && seq === creationEntrySeqRef.current ? creationSession.keep() : undefined;
+    return { chatId, release };
+  }, [active?.chatId, creationEntrySeq, creationSession]);
 
-  // Not filtered to active: the wake banner needs watches that already fired.
-  const chatWatches = activeChat?.watches ?? [];
+  const creationFlow = useCreationFlowState(
+    async (answers: FlowAnswers) => {
+      const { ok, chatId, release } = await handleAlertCreated(answers);
+      if (ok) {
+        if (chatId) {
+          const body = new FormData();
+          body.set("intent", "rename");
+          body.set("chatId", chatId);
+          body.set("title", alertName(answers));
+          void fetch(actionPath, { method: "POST", body }).catch(() => {});
+        }
+      } else {
+        release?.();
+      }
+      return ok;
+    },
+    creationDraft,
+    creationEntrySeq
+  );
+
+  const { setExpiry } = creationFlow;
+  useEffect(() => {
+    if (!slackResume) return;
+    clearSlackConnectResume(project.id, environment.id);
+    if (slackResume.expiry) setExpiry(slackResume.expiry);
+    const params = new URLSearchParams(location.search);
+    params.delete("add");
+    params.delete("create");
+    navigate({ search: params.toString() }, { replace: true });
+  }, [slackResume, project.id, environment.id, setExpiry]); // eslint-disable-line react-hooks/exhaustive-deps -- once per resume
+
+  const queryCreated = queryCreatedKey === queryWatchKey;
+  const curatedTitle = creationFlow.created ? "Alert created" : "New alert";
+  const creationTitle = queryWatch ? (queryCreated ? "Alert created" : "New alert") : curatedTitle;
+  const headerTitle = activeGroup
+    ? "Group alerts"
+    : inEditMode
+      ? "Edit alert"
+      : inCreationMode
+        ? creationTitle
+        : active
+          ? (activeChat?.title ?? "Chat")
+          : "New chat";
+
+  const errorGroupSource = useErrorGroupSource(
+    `/resources${v3EnvironmentPath(organization, project, environment)}/alerts/error-groups`,
+    inCreationMode && isErrorGroupOnly(creationFlow.answers.what)
+  );
+  const creationAgentSend = useCreationAgentSend({
+    answers: creationFlow.answers,
+    onPatchApplied: creationFlow.patchAnswers,
+    resetKey: creationEntrySeq,
+    resolveErrorGroup: errorGroupSource.resolve,
+    onQueryWatch: (watch) => {
+      setQueryWatch(watch);
+      setQueryWatchSeq((s) => s + 1);
+    },
+  });
+
+  const { handleDraftPatches, handleTextReply, handleError } = creationAgentSend;
+  const creationCallbacks = useMemo(() => {
+    const current = () =>
+      creationAgentChat.current.seq === creationEntrySeqRef.current &&
+      creationAgentChat.current.chatId === activeChatId;
+    return {
+      onAlertDraftPatch: (results: ToolResultPayload[]) => {
+        if (current()) handleDraftPatches(results);
+      },
+      onCreationTextReply: (text: string) => {
+        if (current()) handleTextReply(text);
+      },
+      onTurnError: (message: string) => {
+        if (current()) handleError(message);
+      },
+    };
+  }, [activeChatId, handleDraftPatches, handleTextReply, handleError]);
+
+  const creationClientData = useMemo(
+    () => creationTurnClientData(clientData, creationFlow.answers),
+    [clientData, creationFlow.answers]
+  );
+  const creationSendSeq = useRef(0);
+  const sendCreationText = (text: string) => {
+    creationAgentSend.handleUserText(text);
+    const reuse = creationChatToReuse(creationAgentChat.current, creationEntrySeq, active?.chatId);
+    if (reuse) {
+      setSendRequest({ text, seq: ++creationSendSeq.current, chatId: reuse });
+      return;
+    }
+    const seq = creationEntrySeq;
+    const marked = creationAgentChat.current;
+    if (marked.seq === seq && marked.chatId && (loading || !active)) {
+      setSendRequest({ text, seq: ++creationSendSeq.current, chatId: marked.chatId });
+      return;
+    }
+    void (async () => {
+      const chatId = await creationSession.ensure().catch(() => undefined);
+      if (creationEntrySeqRef.current !== seq) return;
+      if (!chatId) {
+        toast.error("We couldn't start that chat. Try again in a moment.");
+        creationAgentSend.handleError("We couldn't start that chat. Try again in a moment.");
+        return;
+      }
+      const release = creationSession.keep();
+      creationAgentChat.current = { seq, chatId };
+      const opened = await openChat(chatId, true).catch(() => false);
+      if (!opened) release();
+      if (creationEntrySeqRef.current !== seq) return;
+      if (!opened) {
+        creationAgentChat.current = { seq: -1 };
+        creationAgentSend.handleError("We couldn't open that chat. Try again in a moment.");
+        return;
+      }
+      setSendRequest({ text, seq: ++creationSendSeq.current, chatId });
+    })();
+  };
+
+  const resolveGroupChatId = async () => {
+    if (active?.chatId) return { chatId: active.chatId };
+    const chatId = await creationSession.ensure();
+    return chatId ? { chatId, release: creationSession.keep() } : {};
+  };
+  const handleGroupCreated = async (
+    seq: number,
+    { chatId, message }: { chatId?: string; message?: unknown }
+  ) => {
+    setDismissedGroupSeq((dismissed) => Math.max(dismissed ?? seq, seq));
+    revalidator.revalidate();
+    if (!chatId || !message) return;
+    if (activeGroupRef.current?.seq === seq && chatId !== active?.chatId) await openChat(chatId);
+    setAppendedMessages((current) => ({
+      chatId,
+      messages: [message as UIMessage],
+      seq: (current?.seq ?? 0) + 1,
+    }));
+  };
+
+  const addChannelAccess = {
+    projectId: project.id,
+    environmentId: environment.id,
+    canWrite: channelsFetcher.data?.canWrite ?? false,
+    atLimit: channelLimits ? channelLimits.used >= channelLimits.limit : false,
+    onCreated: () =>
+      channelsFetcher.load(alertChannelsResourcePath(project.id, false, environment.id)),
+    connectReturnTo: `${v3AlertCreatePath(organization, project, environment)}&add=slack`,
+  };
+  const planHost: MonitoringPlanHost = {
+    ...plans,
+    markCreated: (ref, alertId, block) => {
+      plans.markCreated(ref, alertId, block);
+      revalidator.revalidate();
+    },
+    chatId: active?.chatId,
+    channels: channelsFetcher.data?.channels,
+    environmentTitle: environmentFullTitle(environment),
+    alertDetailPath: (id) => v3AlertPath(organization, project, environment, id),
+    addChannel: addChannelAccess,
+    queueMetricsEnabled,
+    onShown: showPlan,
+    sendText: (text) => {
+      if (active) setSendRequest({ text, seq: ++creationSendSeq.current, chatId: active.chatId });
+    },
+    wizardSlot,
+    setWizardSlot,
+  };
 
   /* oxlint-disable jsx-a11y/no-static-element-interactions -- Escape handling intentionally bubbles from focused controls inside the panel. */
   return (
     <div
       ref={panelRef}
+      data-agent-panel="visible"
       className="flex h-full flex-col bg-background-bright animate-in fade-in zoom-in-95 duration-150"
       // A React handler, not a global hotkey, so Esc stays scoped to the panel.
       onKeyDown={(event) => {
@@ -661,6 +1079,8 @@ export function DashboardAgentPanel({
             key: event.key,
             defaultPrevented: event.defaultPrevented,
             targetInsidePanel: panelRef.current?.contains(event.target as Node) ?? false,
+            targetInDialog: Boolean((event.target as Element).closest?.("[data-dialog]")),
+            targetExpanded: ownsEscape(event.target as Element),
           })
         )
           return;
@@ -673,7 +1093,6 @@ export function DashboardAgentPanel({
           title={headerTitle}
           chats={chats}
           currentChatId={active?.chatId ?? ""}
-          thinkingChatId={thinkingChatId}
           onOpenHistory={loadHistory}
           onSelectChat={switchChat}
           onDeleteChat={deleteChat}
@@ -685,48 +1104,131 @@ export function DashboardAgentPanel({
 
       {/* Always mounted, so the chat keeps its transport, session and transcript. */}
       <AgentPanelColumn fullscreen={mode === "fullscreen"}>
+        {activeEdit && !loading ? (
+          <CreationChatShell placement="docked" title="Edit alert">
+            <EditAlertTranscript
+              key={activeEdit.seq}
+              prefill={activeEdit.prefill}
+              onNewChat={newChat}
+              channels={alertChannels}
+              alertPath={v3AlertPath(
+                organization,
+                project,
+                environment,
+                activeEdit.prefill.alertId
+              )}
+              addChannel={addChannelAccess}
+            />
+          </CreationChatShell>
+        ) : null}
+        {activeGroup && !loading ? (
+          <CreationChatShell placement="docked" title="Group alerts">
+            <GroupAlertsTranscript
+              key={activeGroup.seq}
+              members={activeGroup.members}
+              channels={alertChannels}
+              addChannel={addChannelAccess}
+              manual={groupManual}
+              onManualChange={setGroupManual}
+              onNewChat={newChat}
+              onCreated={(created) => handleGroupCreated(activeGroup.seq, created)}
+              resolveChatId={resolveGroupChatId}
+            />
+          </CreationChatShell>
+        ) : null}
+        {inCreationMode ? (
+          <CreationChatShell placement="docked" title={creationTitle}>
+            {queryWatch ? (
+              <QueryAlertTranscript
+                key={queryWatchKey}
+                prefill={queryWatch}
+                chat={{ ensure: ensureQueryChat }}
+                onCreated={({ chatId, name }) => {
+                  setQueryCreatedKey(queryWatchKey);
+                  setQueryCreatedSig(JSON.stringify(queryWatch));
+                  revalidator.revalidate();
+                  if (chatId) {
+                    const body = new FormData();
+                    body.set("intent", "rename");
+                    body.set("chatId", chatId);
+                    body.set("title", name);
+                    void fetch(actionPath, { method: "POST", body }).catch(() => {});
+                  }
+                }}
+                environmentTitle={environmentFullTitle(environment)}
+                alertDetailPath={(id) => v3AlertPath(organization, project, environment, id)}
+                onNewChat={restartCreation}
+              />
+            ) : (
+              <CreationTranscript
+                key={creationEntrySeq}
+                queueMetricsEnabled={queueMetricsEnabled}
+                flow={creationFlow}
+                channels={alertChannels}
+                alertDetailPath={(id) => v3AlertPath(organization, project, environment, id)}
+                onFreeText={sendCreationText}
+                systemLines={creationAgentSend.systemLines}
+                agentStreaming={thinkingChatId !== null && thinkingChatId === active?.chatId}
+                manual={manualMode}
+                onManualChange={setManualMode}
+                onNewChat={restartCreation}
+                density="compact"
+                addChannel={{
+                  ...addChannelAccess,
+                  resumed: Boolean(slackResume) && creationEntrySeq === 0,
+                  onResumeConsumed: () => setSlackResume(undefined),
+                }}
+                errorGroupSource={errorGroupSource}
+                environmentTitle={environmentFullTitle(environment)}
+              />
+            )}
+          </CreationChatShell>
+        ) : null}
         {loading ? (
-          <div className="flex flex-1 items-center justify-center">
-            <Spinner className="size-5" />
-          </div>
+          inCreationMode ? null : (
+            <div className="flex flex-1 items-center justify-center">
+              <Spinner className="size-5" />
+            </div>
+          )
         ) : active ? (
-          <DashboardAgentChat
-            key={active.chatId}
-            chatId={active.chatId}
-            initialMessages={active.messages}
-            session={active.session}
-            pendingFirstMessage={active.pendingFirstMessage}
-            streaming={active.streaming}
-            sendRequest={
-              sendRequest && sendRequest.chatId === active.chatId ? sendRequest : undefined
-            }
-            clientData={clientData}
-            apiOrigin={apiOrigin}
-            actionPath={actionPath}
-            projectName={project.name}
-            environmentSlug={environment.slug}
-            entityId={entityId}
-            promotedPrompt={promotedPrompt}
-            watches={chatWatches}
-            pagePaths={pagePaths}
-            watchCard={watchCardElement}
-            appendedMessages={
-              appendedMessages?.chatId === active.chatId ? appendedMessages : undefined
-            }
-            onWatchIntent={openWatchCard}
-            onCancelWatch={cancelWatch}
-            // The generated chat name is written before the turn-complete chunk lands.
-            onTurnSettled={loadHistory}
-            onActivityChange={handleActivityChange}
-            onQuotaChange={handleQuotaChange}
-            refusalGenRef={refusalGenRef}
-            onNewChat={newChat}
-            showNewChat={active !== null}
-            watchEnabled={watchEnabled}
-          />
-        ) : (
+          <MonitoringPlanHostProvider value={planHost}>
+            <DashboardAgentChat
+              key={active.chatId}
+              chatId={active.chatId}
+              initialMessages={active.messages}
+              session={active.session}
+              pendingFirstMessage={active.pendingFirstMessage}
+              streaming={active.streaming}
+              sendRequest={
+                sendRequest && sendRequest.chatId === active.chatId ? sendRequest : undefined
+              }
+              clientData={inCreationMode ? creationClientData : activeChatClientData}
+              apiOrigin={apiOrigin}
+              actionPath={actionPath}
+              projectName={project.name}
+              environmentSlug={environment.slug}
+              entityId={entityId}
+              promotedPrompt={promotedPrompt}
+              pagePaths={pagePaths}
+              appendedMessages={
+                appendedMessages?.chatId === active.chatId ? appendedMessages : undefined
+              }
+              onTurnSettled={loadHistory}
+              onAlertDraftPatch={inCreationMode ? creationCallbacks.onAlertDraftPatch : undefined}
+              onCreationTextReply={
+                inCreationMode ? creationCallbacks.onCreationTextReply : undefined
+              }
+              onTurnError={inCreationMode ? creationCallbacks.onTurnError : undefined}
+              onActivityChange={handleActivityChange}
+              onQuotaChange={handleQuotaChange}
+              refusalGenRef={refusalGenRef}
+              onNewChat={newChat}
+              showNewChat={active !== null}
+              headless={inCreationMode || inEditMode}
+            />
+          </MonitoringPlanHostProvider>
+        ) : inCreationMode || inEditMode ? null : (
           <>
-            {/* Only while blocked: an idle draft's read could not act on anything. */}
             {capReached ? (
               <DraftQuotaPoller
                 actionPath={actionPath}
@@ -741,9 +1243,7 @@ export function DashboardAgentPanel({
               entityId={entityId}
               pageContext={pageContext}
               promotedPrompt={promotedPrompt}
-              watchCard={watchCardElement}
               capReached={capReached}
-              watchEnabled={watchEnabled}
             />
           </>
         )}

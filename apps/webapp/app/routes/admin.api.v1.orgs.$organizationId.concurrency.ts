@@ -1,11 +1,12 @@
+import { withAdminApi } from "~/services/adminApi.server";
 import type { ActionFunctionArgs } from "@remix-run/server-runtime";
 import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { prisma } from "~/db.server";
-import { requireAdminApiRequest } from "~/services/personalAccessToken.server";
+import { requireBillingServiceRequest } from "~/services/billingServiceAuth.server";
 import { controlPlaneResolver } from "~/v3/runOpsMigration/controlPlaneResolver.server";
-import { updateEnvConcurrencyLimits } from "~/v3/runQueue.server";
-import { concurrencySystem } from "~/v3/services/concurrencySystemInstance.server";
+import { setOrgConcurrencyLimits } from "~/v3/services/orgPlanProvisioning.server";
+import { enqueueOrgProvisioningJob } from "~/v3/services/orgProvisioningJobs.server";
 
 const ParamsSchema = z.object({
   organizationId: z.string(),
@@ -18,8 +19,8 @@ const RequestBodySchema = z.object({
   production: z.number().optional(),
 });
 
-export async function action({ request, params }: ActionFunctionArgs) {
-  await requireAdminApiRequest(request);
+async function handleAction({ request, params }: ActionFunctionArgs) {
+  await requireBillingServiceRequest(request);
 
   const { organizationId } = ParamsSchema.parse(params);
 
@@ -30,69 +31,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return json({ error: "At least one environment limit must be provided" }, { status: 400 });
   }
 
-  //update org
-  const organization = await prisma.organization.update({
-    where: {
-      id: organizationId,
-    },
-    data: {
-      maximumConcurrencyLimit: body.organization,
-    },
-  });
+  await setOrgConcurrencyLimits(organizationId, body, prisma);
 
-  //update environments
-  const environments = await prisma.runtimeEnvironment.findMany({
-    where: {
-      organizationId: organizationId,
-      project: {
-        version: "V3",
-      },
-    },
-  });
-
-  for (const environment of environments) {
-    let limit: number | undefined = undefined;
-    switch (environment.type) {
-      case "DEVELOPMENT": {
-        limit = body.development;
-        break;
-      }
-      case "PREVIEW":
-      case "STAGING": {
-        limit = body.staging;
-        break;
-      }
-      case "PRODUCTION": {
-        limit = body.production;
-        break;
-      }
-    }
-
-    if (!limit) continue;
-
-    const modifiedEnvironment = await prisma.runtimeEnvironment.update({
-      where: {
-        id: environment.id,
-      },
-      data: {
-        maximumConcurrencyLimit: limit,
-      },
-      include: {
-        project: true,
-      },
-    });
-
-    await updateEnvConcurrencyLimits({ ...modifiedEnvironment, organization });
-
-    // Percent-based queue overrides follow the environment limit automatically.
-    await concurrencySystem.queues.recalculatePercentLimits({
-      ...modifiedEnvironment,
-      organization,
-    });
-  }
-
-  // Org + every affected env's concurrency changed; one org invalidation covers them all.
   controlPlaneResolver.invalidateOrganization(organizationId);
 
-  return json({ success: true });
+  await enqueueOrgProvisioningJob("org.pushConcurrencyLimits", organizationId);
+
+  return json({ success: true, queued: true }, { status: 202 });
 }
+
+export const action = withAdminApi(handleAction);

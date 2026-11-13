@@ -1,6 +1,7 @@
 import {
   buildTraceChunkCursorPredicate,
   buildTraceChunkKeyPredicate,
+  buildTraceStartTimeSortKeyPredicate,
   sliceTraceChunk,
   toTaskEventSearchV2RowIfEligible,
   TRACE_CHUNK_ORDER_BY,
@@ -19,6 +20,7 @@ import {
 import type { Attributes, Counter, Histogram, Meter, Tracer } from "@internal/tracing";
 import { getMeter, startSpan, trace } from "@internal/tracing";
 
+import { tryCatch } from "@trigger.dev/core/utils";
 import { createJsonErrorObject } from "@trigger.dev/core/v3/errors";
 import { serializeTraceparent } from "@trigger.dev/core/v3/isomorphic";
 import type {
@@ -75,6 +77,7 @@ import type {
   TraceChunk,
   TraceChunkCursor,
   TraceChunkEvent,
+  TraceChunkScopeOptions,
   TraceDetailedSummary,
   TraceErrorEvents,
   TraceEventOptions,
@@ -94,6 +97,11 @@ export const DEFAULT_MAX_ERROR_MATCHES = 5000;
 const TRACE_CHUNK_ID_BATCH_SIZE = 1000;
 
 const TRACE_CHUNK_ID_LOOKUP_CONCURRENCY = 4;
+
+type AncestorWalk = {
+  outcome: "none" | "fast_path" | "skipped_closed" | "walked" | "failed";
+  hops: number;
+};
 
 // Rows read for one (start_time, span_id) key; matches the largest chunk page.
 export const DEFAULT_MAX_KEY_ROWS = 10_000;
@@ -143,6 +151,8 @@ export type ClickhouseEventRepositoryConfig = {
   maximumKeyRows?: number;
   maximumLiveReloadingSetting?: number;
   traceChunkSize?: number;
+  /** Server-side `max_execution_time` (seconds) for trace exports; overrides the client-level limit. */
+  exportMaxExecutionTime?: number;
   /**
    * Maximum age in milliseconds for start_time. If start_time is older than this threshold,
    * it will be clamped to the current time when creating events.
@@ -170,6 +180,7 @@ export type ClickhouseEventRepositoryConfig = {
   logsSearchDualWriteOrganizationIds?: ReadonlySet<string>;
   logsSearchDualWriteMaxConcurrency?: number;
   logsSearchDualWriteMaxPending?: number;
+  logsSearchInsertAsync?: boolean;
 };
 
 /**
@@ -357,7 +368,7 @@ export class ClickhouseEventRepository implements IEventRepository {
   }
 
   get maximumTraceViewCount() {
-    return this._config.maximumTraceViewCount ?? 250_000;
+    return this._config.maximumTraceViewCount ?? 150_000;
   }
 
   get maximumErrorMatches() {
@@ -643,7 +654,8 @@ export class ClickhouseEventRepository implements IEventRepository {
           this._logsSearchClickhouse.taskEventsSearch.insert,
           flushId,
           rows,
-          logger
+          logger,
+          this._config.logsSearchInsertAsync
         );
         const dropped = outcome.kind === "recovered" ? outcome.rowsDropped : 0;
         if (dropped > 0) {
@@ -1054,9 +1066,9 @@ export class ClickhouseEventRepository implements IEventRepository {
       status: "OK",
       attributes: {
         error: {
-          message: spanEvent.properties.exception.message,
-          name: spanEvent.properties.exception.type,
-          stackTrace: spanEvent.properties.exception.stacktrace,
+          message: spanEvent.properties.exception?.message,
+          name: spanEvent.properties.exception?.type,
+          stackTrace: spanEvent.properties.exception?.stacktrace,
         },
       },
       metadata: JSON.stringify(spanEvent.properties),
@@ -1686,7 +1698,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; anchorSpanId?: string; insertedAtEnd?: Date }
   ): Promise<TraceSummary | undefined> {
     const limit = this._config.maximumTraceSummaryViewCount;
     const records = await this.#fetchTraceSummaryRecords({
@@ -1702,14 +1714,25 @@ export class ClickhouseEventRepository implements IEventRepository {
       return;
     }
 
-    const summary = this.#buildTraceSummaryFromRecords(records);
+    const isTruncated = limit !== undefined && records.length >= limit;
+    const summary = this.#buildTraceSummaryFromRecords(records, {
+      rootSpanId: options?.anchorSpanId,
+    });
     if (!summary) {
+      // Every row in the window was read and the anchor isn't among them.
+      if (options?.anchorSpanId && records.length > 0 && !isTruncated) {
+        logger.warn("Trace summary rows don't include the anchor span", {
+          traceId,
+          spanId: options.anchorSpanId,
+          rowCount: records.length,
+        });
+      }
       return;
     }
 
     return {
       ...summary,
-      isTruncated: limit !== undefined && records.length >= limit,
+      isTruncated,
     };
   }
 
@@ -1720,7 +1743,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     anchorSpanId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<TraceSummary | undefined> {
     const { records, isTruncated, missingAnchor } = await this.#fetchTraceSubtreeRecords({
       environmentId,
@@ -1757,11 +1780,11 @@ export class ClickhouseEventRepository implements IEventRepository {
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
     cursor: TraceChunkCursor | undefined,
-    options?: { includeDebugLogs?: boolean; limit?: number; tailInsertedAtSinceMs?: number }
+    options?: TraceChunkScopeOptions & { limit?: number }
   ): Promise<TraceChunk | undefined> {
     const limit = options?.limit ?? this.maximumTraceChunkSize;
 
-    const { events, nextCursor, hasMore } = await this.#fetchTraceChunkRecords({
+    const { events, nextCursor, hasMore, droppedKeyRows } = await this.#fetchTraceChunkRecords({
       environmentId,
       traceId,
       startCreatedAt,
@@ -1775,35 +1798,8 @@ export class ClickhouseEventRepository implements IEventRepository {
       events: events.map((record) => this.#toTraceChunkEvent(record)),
       nextCursor,
       hasMore,
+      droppedKeyRows,
     };
-  }
-
-  async getTraceSpanCount(
-    storeTable: TaskEventStoreTable,
-    environmentId: string,
-    traceId: string,
-    startCreatedAt: Date,
-    endCreatedAt: Date | undefined,
-    options?: { includeDebugLogs?: boolean }
-  ): Promise<number | undefined> {
-    const queryBuilder = this.#createTraceSpanCountQueryBuilder();
-    this.#applyTraceScopeWhere(queryBuilder, {
-      environmentId,
-      traceId,
-      startCreatedAt,
-      endCreatedAt,
-      options,
-    });
-
-    const [queryError, records] = await queryBuilder.execute();
-
-    if (queryError) {
-      logger.error("getTraceSpanCount failed", { error: queryError, traceId });
-      return undefined;
-    }
-
-    const count = records?.[0]?.count;
-    return count === undefined ? undefined : Number(count);
   }
 
   #createTraceChunkQueryBuilder() {
@@ -1827,11 +1823,12 @@ export class ClickhouseEventRepository implements IEventRepository {
     endCreatedAt?: Date;
     cursor?: TraceChunkCursor;
     limit: number;
-    options?: { includeDebugLogs?: boolean; tailInsertedAtSinceMs?: number };
+    options?: TraceChunkScopeOptions;
   }): Promise<{
     events: TaskEventChunkV2Result[];
     nextCursor: TraceChunkCursor | null;
     hasMore: boolean;
+    droppedKeyRows: boolean;
   }> {
     const queryBuilder = this.#applyTraceChunkScope({
       environmentId,
@@ -1869,21 +1866,28 @@ export class ClickhouseEventRepository implements IEventRepository {
       groupBuilder.where(clause, params);
       groupBuilder.orderBy(TRACE_CHUNK_ORDER_BY);
       // The next cursor skips past this key, so rows beyond the cap are dropped.
-      groupBuilder.limit(this.maximumKeyRows);
+      groupBuilder.limit(this.maximumKeyRows + 1);
 
       const [groupError, groupRecords] = await groupBuilder.execute();
       if (groupError) {
         throw groupError;
       }
 
+      const rows = groupRecords ?? [];
       return {
-        events: groupRecords ?? [],
+        events: rows.slice(0, this.maximumKeyRows),
         nextCursor: slice.nextCursor,
         hasMore: slice.hasMore,
+        droppedKeyRows: rows.length > this.maximumKeyRows,
       };
     }
 
-    return { events: slice.events, nextCursor: slice.nextCursor, hasMore: slice.hasMore };
+    return {
+      events: slice.events,
+      nextCursor: slice.nextCursor,
+      hasMore: slice.hasMore,
+      droppedKeyRows: false,
+    };
   }
 
   #applyTraceChunkScope({
@@ -1897,7 +1901,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string;
     startCreatedAt: Date;
     endCreatedAt?: Date;
-    options?: { includeDebugLogs?: boolean; tailInsertedAtSinceMs?: number };
+    options?: TraceChunkScopeOptions;
   }) {
     const queryBuilder = this.#createTraceChunkQueryBuilder();
     this.#applyTraceScopeWhere(queryBuilder, {
@@ -1910,10 +1914,30 @@ export class ClickhouseEventRepository implements IEventRepository {
     return queryBuilder;
   }
 
-  #createTraceSpanCountQueryBuilder() {
-    return this._version === "v2"
-      ? this._clickhouse.taskEventsV2.traceSpanCountQueryBuilder()
-      : this._clickhouse.taskEvents.traceSpanCountQueryBuilder();
+  #whereStartTimeWindow(
+    queryBuilder: { where: (clause: string, params?: any) => unknown },
+    start: Date,
+    end: Date | undefined
+  ) {
+    const startNs = convertDateToNanoseconds(start).toString();
+    const endNs = end ? convertDateToNanoseconds(end).toString() : undefined;
+    queryBuilder.where("start_time >= {startCreatedAt: String}", { startCreatedAt: startNs });
+    if (endNs) {
+      queryBuilder.where("start_time <= {endCreatedAt: String}", { endCreatedAt: endNs });
+    }
+    const sortKey = buildTraceStartTimeSortKeyPredicate({ startNs, endNs });
+    queryBuilder.where(sortKey.clause, sortKey.params);
+  }
+
+  #whereInsertedAtEnd(
+    queryBuilder: { where: (clause: string, params?: any) => unknown },
+    end: Date | undefined
+  ) {
+    if (end) {
+      queryBuilder.where("inserted_at <= {insertedAtEnd: DateTime64(3)}", {
+        insertedAtEnd: convertDateToClickhouseDateTime(end),
+      });
+    }
   }
 
   #applyTraceScopeWhere(
@@ -1929,7 +1953,7 @@ export class ClickhouseEventRepository implements IEventRepository {
       traceId: string;
       startCreatedAt: Date;
       endCreatedAt?: Date;
-      options?: { includeDebugLogs?: boolean; tailInsertedAtSinceMs?: number };
+      options?: TraceChunkScopeOptions;
     }
   ) {
     queryBuilder.where("environment_id = {environmentId: String}", { environmentId });
@@ -1940,15 +1964,7 @@ export class ClickhouseEventRepository implements IEventRepository {
       ? new Date(endCreatedAt.getTime() + 60_000)
       : undefined;
 
-    queryBuilder.where("start_time >= {startCreatedAt: String}", {
-      startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-    });
-
-    if (endCreatedAtWithBuffer) {
-      queryBuilder.where("start_time <= {endCreatedAt: String}", {
-        endCreatedAt: convertDateToNanoseconds(endCreatedAtWithBuffer).toString(),
-      });
-    }
+    this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAtWithBuffer);
 
     if (this._version === "v2") {
       queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
@@ -1964,9 +1980,11 @@ export class ClickhouseEventRepository implements IEventRepository {
           ),
         });
       }
+
+      this.#whereInsertedAtEnd(queryBuilder, options?.insertedAtEnd);
     }
 
-    if (options?.includeDebugLogs === false) {
+    if (options?.includeDebugLogs !== true) {
       queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });
     }
   }
@@ -1993,7 +2011,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<TraceErrorEvents | undefined> {
     const scope = { environmentId, traceId, startCreatedAt, endCreatedAt, options };
     const maxMatches = this.maximumErrorMatches;
@@ -2085,7 +2103,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     startCreatedAt: Date,
     endCreatedAt: Date | undefined,
     spanId: string,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<TraceChunkEvent[] | undefined> {
     const rows = await this.#collectSpansUpwards(
       { environmentId, traceId, startCreatedAt, endCreatedAt, options },
@@ -2100,7 +2118,7 @@ export class ClickhouseEventRepository implements IEventRepository {
       traceId: string;
       startCreatedAt: Date;
       endCreatedAt?: Date;
-      options?: { includeDebugLogs?: boolean };
+      options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date };
     },
     seedSpanIds: string[]
   ): Promise<TaskEventChunkV2Result[]> {
@@ -2163,27 +2181,18 @@ export class ClickhouseEventRepository implements IEventRepository {
     anchorSpanId: string;
     startCreatedAt: Date;
     endCreatedAt?: Date;
-    options?: { includeDebugLogs?: boolean };
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date };
     limit?: number;
   }): Promise<{
     records: TaskEventSummaryV1Result[];
     isTruncated: boolean;
     missingAnchor: boolean;
   }> {
+    // No ancestors: a child run view's own run span carries the overrides they'd propagate.
     return this.#collectTraceSubtreeRecords({
+      traceId,
       anchorSpanId,
       maxRows,
-      // Ancestors are fetched by explicit spanIds and start before the anchor
-      // run's time window, so applying startCreatedAt would wrongly exclude them
-      // (and with it the cancellation/error overrides they propagate downward).
-      fetchAncestor: (batch) =>
-        this.#fetchTraceSummaryRecords({
-          environmentId,
-          traceId,
-          skipTimeWindow: true,
-          options,
-          ...batch,
-        }),
       fetchDescendant: (batch) =>
         this.#fetchTraceSummaryRecords({
           environmentId,
@@ -2210,27 +2219,30 @@ export class ClickhouseEventRepository implements IEventRepository {
     anchorSpanId: string;
     startCreatedAt: Date;
     endCreatedAt?: Date;
-    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date };
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date; ancestorInsertedAtStart?: Date };
     limit?: number;
   }): Promise<{
     records: TaskEventDetailedSummaryV1Result[];
     isTruncated: boolean;
     missingAnchor: boolean;
+    ancestorWalk: AncestorWalk;
   }> {
     return this.#collectTraceSubtreeRecords({
+      traceId,
       anchorSpanId,
       maxRows,
-      // Ancestors are fetched by explicit spanIds and start before the anchor
-      // run's time window, so applying startCreatedAt would wrongly exclude them
-      // (and with it the cancellation/error overrides they propagate downward).
+      // Ancestors start before the anchor run's window, so they skip it (and insertedAtEnd: a
+      // cancellation stored long after the anchor still applies). Only the trace root bounds them.
       fetchAncestor: (batch) =>
         this.#fetchTraceDetailedSummaryRecords({
           environmentId,
           traceId,
           skipTimeWindow: true,
+          insertedAtStart: options?.ancestorInsertedAtStart,
           options,
           ...batch,
         }),
+      isClosedSpan: (records, spanId) => this.#isClosedDetailedSpan(records, spanId),
       fetchDescendant: (batch) =>
         this.#fetchTraceDetailedSummaryRecords({
           environmentId,
@@ -2244,14 +2256,18 @@ export class ClickhouseEventRepository implements IEventRepository {
   }
 
   async #collectTraceSubtreeRecords<T extends { span_id: string; parent_span_id: string }>({
+    traceId,
     anchorSpanId,
     maxRows,
     fetchAncestor,
+    isClosedSpan,
     fetchDescendant,
   }: {
+    traceId: string;
     anchorSpanId: string;
     maxRows?: number;
-    fetchAncestor: (batch: { spanIds: string[]; limit?: number }) => Promise<T[] | undefined>;
+    fetchAncestor?: (batch: { spanIds: string[]; limit?: number }) => Promise<T[] | undefined>;
+    isClosedSpan?: (records: T[], spanId: string) => boolean;
     fetchDescendant: (batch: {
       spanIds?: string[];
       parentSpanIds?: string[];
@@ -2261,10 +2277,12 @@ export class ClickhouseEventRepository implements IEventRepository {
     records: T[];
     isTruncated: boolean;
     missingAnchor: boolean;
+    ancestorWalk: AncestorWalk;
   }> {
     const allRecords: T[] = [];
     const collectedSpanIds = new Set<string>();
     let isTruncated = false;
+    const ancestorWalk: AncestorWalk = { outcome: "none", hops: 0 };
 
     const anchorRecords = await fetchDescendant({
       spanIds: [anchorSpanId],
@@ -2272,7 +2290,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     });
 
     if (!anchorRecords || anchorRecords.length === 0) {
-      return { records: [], isTruncated: false, missingAnchor: true };
+      return { records: [], isTruncated: false, missingAnchor: true, ancestorWalk };
     }
 
     if (maxRows && anchorRecords.length >= maxRows) {
@@ -2282,8 +2300,16 @@ export class ClickhouseEventRepository implements IEventRepository {
     allRecords.push(...anchorRecords);
     collectedSpanIds.add(anchorSpanId);
 
-    let parentSpanId = this.#parentSpanIdFromRecords(anchorRecords, anchorSpanId);
-    while (parentSpanId) {
+    let parentSpanId = fetchAncestor
+      ? this.#parentSpanIdFromRecords(anchorRecords, anchorSpanId)
+      : undefined;
+
+    if (parentSpanId && isClosedSpan?.(anchorRecords, anchorSpanId)) {
+      ancestorWalk.outcome = "skipped_closed";
+      parentSpanId = undefined;
+    }
+
+    while (parentSpanId && fetchAncestor) {
       if (collectedSpanIds.has(parentSpanId)) {
         break;
       }
@@ -2293,10 +2319,24 @@ export class ClickhouseEventRepository implements IEventRepository {
         break;
       }
 
-      const parentRecords = await fetchAncestor({
-        spanIds: [parentSpanId],
-        limit: maxRows ? maxRows - allRecords.length : undefined,
-      });
+      ancestorWalk.outcome = "walked";
+      ancestorWalk.hops++;
+      const [ancestorError, parentRecords] = await tryCatch(
+        fetchAncestor({
+          spanIds: [parentSpanId],
+          limit: maxRows ? maxRows - allRecords.length : undefined,
+        })
+      );
+
+      if (ancestorError) {
+        logger.warn("Trace ancestor read failed, returning the subtree without its overrides", {
+          traceId,
+          spanId: parentSpanId,
+          error: ancestorError.message,
+        });
+        ancestorWalk.outcome = "failed";
+        break;
+      }
 
       if (!parentRecords || parentRecords.length === 0) {
         break;
@@ -2304,6 +2344,11 @@ export class ClickhouseEventRepository implements IEventRepository {
 
       allRecords.push(...parentRecords);
       collectedSpanIds.add(parentSpanId);
+
+      if (isClosedSpan?.(parentRecords, parentSpanId)) {
+        break;
+      }
+
       parentSpanId = this.#parentSpanIdFromRecords(parentRecords, parentSpanId);
     }
 
@@ -2350,6 +2395,7 @@ export class ClickhouseEventRepository implements IEventRepository {
       records: allRecords,
       isTruncated,
       missingAnchor: false,
+      ancestorWalk,
     };
   }
 
@@ -2382,7 +2428,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string;
     startCreatedAt?: Date;
     endCreatedAt?: Date;
-    options?: { includeDebugLogs?: boolean };
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date };
     spanIds?: string[];
     parentSpanIds?: string[];
     limit?: number;
@@ -2403,24 +2449,18 @@ export class ClickhouseEventRepository implements IEventRepository {
         ? new Date(endCreatedAt.getTime() + 60_000)
         : undefined;
 
-      queryBuilder.where("start_time >= {startCreatedAt: String}", {
-        startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-      });
-
-      if (endCreatedAtWithBuffer) {
-        queryBuilder.where("start_time <= {endCreatedAt: String}", {
-          endCreatedAt: convertDateToNanoseconds(endCreatedAtWithBuffer).toString(),
-        });
-      }
+      this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAtWithBuffer);
 
       if (this._version === "v2") {
         queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
           insertedAtStart: convertDateToClickhouseDateTime(startCreatedAtWithBuffer),
         });
+
+        this.#whereInsertedAtEnd(queryBuilder, options?.insertedAtEnd);
       }
     }
 
-    if (options?.includeDebugLogs === false) {
+    if (options?.includeDebugLogs !== true) {
       queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });
     }
 
@@ -2513,7 +2553,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
   ): Promise<SpanDetail | undefined> {
     const startCreatedAtWithBuffer = new Date(startCreatedAt.getTime() - 60_000);
 
@@ -2525,21 +2565,19 @@ export class ClickhouseEventRepository implements IEventRepository {
     queryBuilder.where("environment_id = {environmentId: String}", { environmentId });
     queryBuilder.where("trace_id = {traceId: String}", { traceId });
     queryBuilder.where("span_id = {spanId: String}", { spanId });
-    queryBuilder.where("start_time >= {startCreatedAt: String}", {
-      startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-    });
-
-    if (endCreatedAt) {
-      queryBuilder.where("start_time <= {endCreatedAt: String}", {
-        endCreatedAt: convertDateToNanoseconds(endCreatedAt).toString(),
-      });
-    }
+    this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAt);
 
     // For v2, add inserted_at filtering for partition pruning
     if (this._version === "v2") {
       queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
         insertedAtStart: convertDateToClickhouseDateTime(startCreatedAtWithBuffer),
       });
+
+      this.#whereInsertedAtEnd(queryBuilder, options?.insertedAtEnd);
+    }
+
+    if (options?.includeDebugLogs !== true) {
+      queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });
     }
 
     queryBuilder.orderBy("start_time ASC");
@@ -2741,7 +2779,7 @@ export class ClickhouseEventRepository implements IEventRepository {
         break;
       }
 
-      if (parentSpan.data.level === "TRACE" && !parentSpan.data.isPartial) {
+      if (this.#isClosedTraceSpan(parentSpan)) {
         overrideSpan = parentSpan;
         break;
       }
@@ -2754,6 +2792,20 @@ export class ClickhouseEventRepository implements IEventRepository {
     }
 
     return span;
+  }
+
+  // Overrides stop at the first closed TRACE span, so nothing above one can change its subtree.
+  #isClosedTraceSpan(span: SpanSummaryCommon): boolean {
+    return span.data.level === "TRACE" && !span.data.isPartial;
+  }
+
+  #isClosedDetailedSpan(records: TaskEventDetailedSummaryV1Result[], spanId: string): boolean {
+    const span = this.#mergeRecordsIntoSpanDetailedSummary(
+      spanId,
+      records.filter((record) => record.span_id === spanId),
+      new Map()
+    );
+    return span !== undefined && this.#isClosedTraceSpan(span);
   }
 
   #applyAncestorToSpan<TSpanSummary extends SpanSummaryCommon>(
@@ -2986,6 +3038,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     parentSpanIds,
     limit,
     skipTimeWindow,
+    insertedAtStart,
   }: {
     environmentId: string;
     traceId: string;
@@ -2996,6 +3049,8 @@ export class ClickhouseEventRepository implements IEventRepository {
     parentSpanIds?: string[];
     limit?: number;
     skipTimeWindow?: boolean;
+    // Lower inserted_at bound for reads that skip the time window.
+    insertedAtStart?: Date;
   }): Promise<TaskEventDetailedSummaryV1Result[] | undefined> {
     const queryBuilder = this.#createTraceDetailedSummaryQueryBuilder();
 
@@ -3009,30 +3064,22 @@ export class ClickhouseEventRepository implements IEventRepository {
 
       const startCreatedAtWithBuffer = new Date(startCreatedAt.getTime() - 1000);
 
-      queryBuilder.where("start_time >= {startCreatedAt: String}", {
-        startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-      });
-
-      if (endCreatedAt) {
-        queryBuilder.where("start_time <= {endCreatedAt: String}", {
-          endCreatedAt: convertDateToNanoseconds(endCreatedAt).toString(),
-        });
-      }
+      this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAt);
 
       if (this._version === "v2") {
         queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
           insertedAtStart: convertDateToClickhouseDateTime(startCreatedAtWithBuffer),
         });
 
-        if (options?.insertedAtEnd) {
-          queryBuilder.where("inserted_at <= {insertedAtEnd: DateTime64(3)}", {
-            insertedAtEnd: convertDateToClickhouseDateTime(options.insertedAtEnd),
-          });
-        }
+        this.#whereInsertedAtEnd(queryBuilder, options?.insertedAtEnd);
       }
+    } else if (insertedAtStart && this._version === "v2") {
+      queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
+        insertedAtStart: convertDateToClickhouseDateTime(insertedAtStart),
+      });
     }
 
-    if (options?.includeDebugLogs === false) {
+    if (options?.includeDebugLogs !== true) {
       queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });
     }
 
@@ -3175,7 +3222,7 @@ export class ClickhouseEventRepository implements IEventRepository {
     anchorSpanId: string,
     startCreatedAt: Date,
     endCreatedAt?: Date,
-    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date }
+    options?: { includeDebugLogs?: boolean; insertedAtEnd?: Date; ancestorInsertedAtStart?: Date }
   ): Promise<TraceDetailedSummary | undefined> {
     const limit = this._config.maximumTraceDetailedSummaryViewCount;
 
@@ -3190,29 +3237,38 @@ export class ClickhouseEventRepository implements IEventRepository {
       limit,
     });
 
-    if (fullRecords && this.#canReRootDetailedRecordsAtAnchor(fullRecords, anchorSpanId)) {
+    const fullIsTruncated = limit !== undefined && (fullRecords?.length ?? 0) >= limit;
+
+    if (
+      fullRecords &&
+      this.#canReRootDetailedRecordsAtAnchor(fullRecords, anchorSpanId, fullIsTruncated)
+    ) {
       const summary = this.#buildTraceDetailedSummaryFromRecords(
         traceId,
         fullRecords,
         anchorSpanId
       );
       if (summary) {
+        this.#recordAncestorWalk({ outcome: "fast_path", hops: 0 });
         return {
           ...summary,
-          isTruncated: limit !== undefined && fullRecords.length >= limit,
+          isTruncated: fullIsTruncated,
         };
       }
     }
 
-    const { records, isTruncated, missingAnchor } = await this.#fetchTraceDetailedSubtreeRecords({
-      environmentId,
-      traceId,
-      anchorSpanId,
-      startCreatedAt,
-      endCreatedAt,
-      options,
-      limit,
-    });
+    const { records, isTruncated, missingAnchor, ancestorWalk } =
+      await this.#fetchTraceDetailedSubtreeRecords({
+        environmentId,
+        traceId,
+        anchorSpanId,
+        startCreatedAt,
+        endCreatedAt,
+        options,
+        limit,
+      });
+
+    this.#recordAncestorWalk(ancestorWalk);
 
     if (missingAnchor) {
       return;
@@ -3229,12 +3285,19 @@ export class ClickhouseEventRepository implements IEventRepository {
     };
   }
 
-  // Only checks the direct parent — not the full ancestor chain. Safe in practice
-  // because ancestors have earlier start_time and usually land inside the cap
-  // when the anchor does; otherwise we fall back to the subtree walk.
+  #recordAncestorWalk(ancestorWalk: AncestorWalk) {
+    trace.getActiveSpan()?.setAttributes({
+      "trace.ancestor_walk": ancestorWalk.outcome,
+      "trace.ancestor_hops": ancestorWalk.hops,
+    });
+  }
+
+  // Ancestors only matter for overrides. They're in the read when the parent is (they start
+  // earlier, so usually land inside the cap), and aren't needed when the anchor is closed.
   #canReRootDetailedRecordsAtAnchor(
-    records: Array<{ span_id: string; parent_span_id: string }>,
-    anchorSpanId: string
+    records: TaskEventDetailedSummaryV1Result[],
+    anchorSpanId: string,
+    isTruncated: boolean
   ): boolean {
     const anchorRecord = records.find((record) => record.span_id === anchorSpanId);
     if (!anchorRecord) {
@@ -3246,7 +3309,12 @@ export class ClickhouseEventRepository implements IEventRepository {
       return true;
     }
 
-    return records.some((record) => record.span_id === parentSpanId);
+    if (records.some((record) => record.span_id === parentSpanId)) {
+      return true;
+    }
+
+    // A truncated read can miss subtree spans the walk would fetch.
+    return !isTruncated && this.#isClosedDetailedSpan(records, anchorSpanId);
   }
 
   async *streamTraceEvents(
@@ -3259,22 +3327,18 @@ export class ClickhouseEventRepository implements IEventRepository {
   ): AsyncIterable<StreamedTraceEvent> {
     const startCreatedAtWithBuffer = new Date(startCreatedAt.getTime() - 1000);
 
+    const exportSettings = this._config.exportMaxExecutionTime
+      ? { settings: { max_execution_time: this._config.exportMaxExecutionTime } }
+      : undefined;
+
     const queryBuilder =
       this._version === "v2"
-        ? this._clickhouse.taskEventsV2.traceEventsForExportQueryBuilder()
-        : this._clickhouse.taskEvents.traceEventsForExportQueryBuilder();
+        ? this._clickhouse.taskEventsV2.traceEventsForExportQueryBuilder(exportSettings)
+        : this._clickhouse.taskEvents.traceEventsForExportQueryBuilder(exportSettings);
 
     queryBuilder.where("environment_id = {environmentId: String}", { environmentId });
     queryBuilder.where("trace_id = {traceId: String}", { traceId });
-    queryBuilder.where("start_time >= {startCreatedAt: String}", {
-      startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-    });
-
-    if (endCreatedAt) {
-      queryBuilder.where("start_time <= {endCreatedAt: String}", {
-        endCreatedAt: convertDateToNanoseconds(endCreatedAt).toString(),
-      });
-    }
+    this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAt);
 
     if (this._version === "v2") {
       queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
@@ -3429,7 +3493,8 @@ export class ClickhouseEventRepository implements IEventRepository {
     traceId: string,
     runId: string,
     startCreatedAt: Date,
-    endCreatedAt?: Date
+    endCreatedAt?: Date,
+    options?: { insertedAtEnd?: Date }
   ): Promise<RunPreparedEvent[]> {
     const startCreatedAtWithBuffer = new Date(startCreatedAt.getTime() - 1000);
 
@@ -3441,21 +3506,15 @@ export class ClickhouseEventRepository implements IEventRepository {
     queryBuilder.where("environment_id = {environmentId: String}", { environmentId });
     queryBuilder.where("trace_id = {traceId: String}", { traceId });
     queryBuilder.where("run_id = {runId: String}", { runId });
-    queryBuilder.where("start_time >= {startCreatedAt: String}", {
-      startCreatedAt: convertDateToNanoseconds(startCreatedAtWithBuffer).toString(),
-    });
-
-    if (endCreatedAt) {
-      queryBuilder.where("start_time <= {endCreatedAt: String}", {
-        endCreatedAt: convertDateToNanoseconds(endCreatedAt).toString(),
-      });
-    }
+    this.#whereStartTimeWindow(queryBuilder, startCreatedAtWithBuffer, endCreatedAt);
 
     // For v2, add inserted_at filtering for partition pruning
     if (this._version === "v2") {
       queryBuilder.where("inserted_at >= {insertedAtStart: DateTime64(3)}", {
         insertedAtStart: convertDateToClickhouseDateTime(startCreatedAtWithBuffer),
       });
+
+      this.#whereInsertedAtEnd(queryBuilder, options?.insertedAtEnd);
     }
 
     queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });

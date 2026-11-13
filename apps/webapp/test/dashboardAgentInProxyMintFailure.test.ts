@@ -11,6 +11,7 @@ vi.mock("~/services/dashboardAgentDb.server", () => ({ dashboardAgentDb: {} }));
 vi.mock("@internal/dashboard-agent-db", async (importOriginal) => ({
   ...((await importOriginal()) as Record<string, unknown>),
   chatExists: async () => true,
+  getChatScope: async () => ({ kind: null, metadata: {} }),
 }));
 vi.mock("~/services/session.server", () => ({
   requireUser: async () => ({ id: "usr_real", admin: false, isImpersonating: false }),
@@ -18,8 +19,8 @@ vi.mock("~/services/session.server", () => ({
 vi.mock("~/v3/canAccessDashboardAgent.server", () => ({
   canAccessDashboardAgent: async () => true,
 }));
-vi.mock("~/v3/canUseDashboardAgentWatches.server", () => ({
-  canUseDashboardAgentWatches: async () => false,
+vi.mock("~/v3/canUseAlertsList.server", () => ({
+  canUseAlertsList: async () => false,
 }));
 vi.mock("~/models/project.server", () => ({
   findProjectWithOrgFlagsBySlug: async () => ({

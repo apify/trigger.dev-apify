@@ -1,12 +1,11 @@
 import type { SuggestedPrompt } from "@internal/dashboard-agent-contracts";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 import { AgentUpgradeBlock } from "./AgentUpgradeGate";
 import { DashboardAgentComposer } from "./DashboardAgentComposer";
 import { DashboardAgentContextBanner } from "./DashboardAgentContextBanner";
 import { DashboardAgentHero } from "./DashboardAgentHero";
 import { MESSAGE_QUOTA_REACHED_REASON } from "./message-quota";
 import type { AgentPageContext } from "./page-context-types";
-import { readDismissedPromptIds, resolveSuggestedPromptsBySlot } from "./suggested-prompts";
 
 // Chat ids are server-owned: the first send goes to the panel's `create` call, which
 // returns the id, and only then does `DashboardAgentChat` mount.
@@ -17,9 +16,8 @@ export function DashboardAgentDraft({
   entityId,
   pageContext,
   promotedPrompt,
-  watchCard,
   capReached,
-  watchEnabled = false,
+  autoFocus,
 }: {
   onSubmit: (text: string) => void;
   projectName: string;
@@ -27,27 +25,11 @@ export function DashboardAgentDraft({
   entityId?: string;
   pageContext?: AgentPageContext;
   promotedPrompt?: SuggestedPrompt;
-  watchCard?: React.ReactNode;
   capReached?: { limit: number; planResolved: boolean } | null;
-  /** Withholds the `watch` chip while watch functionality is behind its flag. */
-  watchEnabled?: boolean;
+  /** Off where several drafts share a page, e.g. the gallery. */
+  autoFocus?: boolean;
 }) {
   const [input, setInput] = useState("");
-
-  // Same resolution the hero's buttons use, so the placeholder matches the first button.
-  const [dismissedIds] = useState(readDismissedPromptIds);
-  const placeholderSuggestion = useMemo(
-    () =>
-      resolveSuggestedPromptsBySlot(
-        pageContext ?? { page: { kind: "other", path: "" }, signals: [] },
-        {
-          promoted: promotedPrompt,
-          dismissedIds,
-          watchEnabled,
-        }
-      )[0]?.prompt.prompt,
-    [pageContext, promotedPrompt, dismissedIds, watchEnabled]
-  );
 
   const submit = useCallback(
     (text: string) => {
@@ -67,11 +49,9 @@ export function DashboardAgentDraft({
       pageContext={pageContext}
       promoted={promotedPrompt}
       promptsDisabledReason={capReached ? MESSAGE_QUOTA_REACHED_REASON : undefined}
-      watchEnabled={watchEnabled}
       composer={
         capReached ? (
           <div className="flex w-full flex-col gap-3">
-            {watchCard}
             <AgentUpgradeBlock
               limit={capReached.limit}
               planResolved={capReached.planResolved}
@@ -86,7 +66,6 @@ export function DashboardAgentDraft({
           </div>
         ) : (
           <div className="flex w-full flex-col gap-3">
-            {watchCard}
             <DashboardAgentComposer
               layout="hero"
               value={input}
@@ -94,7 +73,7 @@ export function DashboardAgentDraft({
               onSubmit={() => submit(input)}
               onStop={() => {}}
               isStreaming={false}
-              placeholderSuggestion={watchCard ? undefined : placeholderSuggestion}
+              autoFocus={autoFocus}
               context={
                 <DashboardAgentContextBanner
                   projectName={projectName}

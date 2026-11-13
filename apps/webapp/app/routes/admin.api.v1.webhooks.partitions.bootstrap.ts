@@ -1,10 +1,11 @@
+import { withAdminApi } from "~/services/adminApi.server";
 import { bootstrapPartitions } from "@internal/webhook-engine";
 import { type ActionFunctionArgs, json } from "@remix-run/server-runtime";
 import { webhookPartitionPrisma } from "~/db.server";
 import { env } from "~/env.server";
 import { requireAdminApiRequest } from "~/services/personalAccessToken.server";
 
-export async function action({ request }: ActionFunctionArgs) {
+async function handleAction({ request }: ActionFunctionArgs) {
   await requireAdminApiRequest(request);
 
   if (request.method !== "POST") {
@@ -14,8 +15,9 @@ export async function action({ request }: ActionFunctionArgs) {
   const result = await bootstrapPartitions(webhookPartitionPrisma, {
     now: new Date(),
     lookaheadDays: env.WEBHOOK_PARTITION_LOOKAHEAD_DAYS,
-    retentionDays: env.WEBHOOK_PARTITION_RETENTION_DAYS,
   });
 
   return json({ success: true, ...result });
 }
+
+export const action = withAdminApi(handleAction);

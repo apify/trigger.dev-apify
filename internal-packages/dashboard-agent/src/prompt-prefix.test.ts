@@ -19,6 +19,13 @@ const snapshot: RepoSnapshot = {
   sha: "deadbeefdeadbeef",
 };
 
+describe("the system prompt style", () => {
+  it("forbids em dashes and uses none itself", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("Never use em dashes");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).not.toContain("\u2014");
+  });
+});
+
 /**
  * The whole point of the frozen tool key order: the webapp's warm first call and the
  * agent task's every-later call must hand Anthropic a byte-identical prefix, or they
@@ -26,25 +33,25 @@ const snapshot: RepoSnapshot = {
  */
 describe("the head-start and agent prefixes are the same prefix", () => {
   // The head-start step composes its prefix from the shared helpers; the agent run
-  // builds the real tool set. Both flag values, both modes, or the cache splits.
+  // builds the real tool set. Both modes, or the cache splits.
   for (const mode of ["assistant", "code"] as const) {
-    for (const watchEnabled of [false, true]) {
-      it(`matches in ${mode} mode with watches ${watchEnabled ? "on" : "off"}`, () => {
+    for (const alertsEnabled of [false, true]) {
+      it(`matches in ${mode} mode with alerts ${alertsEnabled ? "on" : "off"}`, () => {
         const ctx = {
           ...SCOPE,
-          watchEnabled,
+          alertsEnabled,
           ...(mode === "code" ? { repoSnapshot: snapshot } : {}),
         };
         const headStart = describePromptPrefix({
-          system: systemPromptFor(mode, { watchEnabled }),
-          tools: toolSchemasFor(mode, { watchEnabled }),
+          system: systemPromptFor(mode, { alertsEnabled }),
+          tools: toolSchemasFor(mode, { alertsEnabled }),
         });
         const agent = describePromptPrefix({
-          system: systemPromptFor(mode, { watchEnabled }),
+          system: systemPromptFor(mode, { alertsEnabled }),
           tools: buildDashboardAgentTools(ctx),
         });
 
-        expect(Object.keys(toolSchemasFor(mode, { watchEnabled }))).toEqual(
+        expect(Object.keys(toolSchemasFor(mode, { alertsEnabled }))).toEqual(
           Object.keys(buildDashboardAgentTools(ctx))
         );
         expect(agent.fingerprint).toBe(headStart.fingerprint);
@@ -107,6 +114,15 @@ describe("the head-start and agent prefixes are the same prefix", () => {
     );
   });
 
+  it("fails when the alert-creation section is missing from the prompt in creation scope", () => {
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("Building an alert from free text");
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain(
+      "exactly one update_alert_draft call carrying the minimal patch"
+    );
+    expect(DASHBOARD_AGENT_SYSTEM_PROMPT).toContain("In alert_creation scope never create");
+    expect(dashboardAgentToolSchemas.update_alert_draft).toBeDefined();
+  });
+
   // get_query_schema may not list the queue tables, so the prompt is where the model
   // learns they exist and how to aggregate them.
   it("carries the queue chart recipe", () => {
@@ -129,20 +145,25 @@ describe("the head-start and agent prefixes are the same prefix", () => {
  * ceiling in the same change, which is what makes the cost a decision instead of a
  * drift. The snapshot below is the itemised diff a reviewer reads.
  */
+// plan_monitoring: +1 tool (~2.5k chars, mostly the draft schema), +~660 prompt chars.
+// Plan scope line: +~140 prompt chars. Plan silence lines: +~230.
+// plan_decision: +1 tool (~320 chars), +~390 prompt chars with the failure-rate rule.
+// Direct create tool dropped: -1 tool (~3k chars).
+// update_alert_draft only in creation scope: -1 chat tool (~2.3k chars), +~55 prompt chars.
 const PREFIX_BUDGET = {
-  assistant: { chars: 86_250, estimatedTokens: 21_600, tools: 26, promptChars: 34_100 },
-  code: { chars: 93_450, estimatedTokens: 23_400, tools: 30, promptChars: 36_850 },
+  assistant: { chars: 81_250, estimatedTokens: 20_320, tools: 28, promptChars: 34_720 },
+  code: { chars: 88_210, estimatedTokens: 22_060, tools: 32, promptChars: 37_480 },
 } as const;
 
-// Measured with watches on: the biggest prefix a turn can hand the provider.
+// Measured with alerts on: the biggest prefix a turn can hand the provider.
 describe("the prefix stays inside its budget", () => {
   const assistant = describePromptPrefixParts({
-    system: systemPromptFor("assistant", { watchEnabled: true }),
-    tools: toolSchemasFor("assistant", { watchEnabled: true }),
+    system: systemPromptFor("assistant", { alertsEnabled: true }),
+    tools: toolSchemasFor("assistant", { alertsEnabled: true }),
   });
   const code = describePromptPrefixParts({
-    system: systemPromptFor("code", { watchEnabled: true }),
-    tools: toolSchemasFor("code", { watchEnabled: true }),
+    system: systemPromptFor("code", { alertsEnabled: true }),
+    tools: toolSchemasFor("code", { alertsEnabled: true }),
   });
 
   it("holds the assistant-mode ceilings", () => {

@@ -1,5 +1,5 @@
 /**
- * Changing an account's email address requires opening a link sent to the new
+ * Changing an account's email address requires confirming a link sent to the new
  * address. Until then the new address sits in `User.pendingEmail` and the live
  * `User.email` (which invites and logins key on) is untouched.
  *
@@ -13,6 +13,7 @@ import { generateJWT, validateJWT } from "@trigger.dev/core/v3/jwt";
 import { Ratelimit } from "@upstash/ratelimit";
 import { prisma } from "~/db.server";
 import { env } from "~/env.server";
+import { publicAppOrigin } from "~/services/adminOrigin.server";
 import { sendEmail } from "~/services/email.server";
 import { logger } from "~/services/logger.server";
 import { createRedisRateLimitClient, RateLimiter } from "~/services/rateLimiter.server";
@@ -73,6 +74,11 @@ async function verifyEmailChangeToken(
   return { userId: sub, email };
 }
 
+export async function previewEmailChange(token: string): Promise<{ email: string } | undefined> {
+  const claims = await verifyEmailChangeToken(env.SESSION_SECRET, token);
+  return claims ? { email: claims.email } : undefined;
+}
+
 type EmailChangeFailure = { ok: false; error: string; status: number };
 export type EmailChangeResult = { ok: true } | EmailChangeFailure;
 
@@ -94,7 +100,7 @@ async function checkEmailPolicy(
   email: string
 ): Promise<EmailChangeResult> {
   try {
-    assertEmailAllowed(email);
+    await assertEmailAllowed(email);
   } catch (error) {
     return failure(
       error instanceof Error ? error.message : "That email address isn't allowed.",
@@ -146,7 +152,7 @@ export async function requestEmailChange(
   await prisma.user.update({ where: { id: user.id }, data: { pendingEmail: email } });
 
   const token = await signEmailChangeToken(env.SESSION_SECRET, { userId: user.id, email });
-  const confirmLink = `${env.LOGIN_ORIGIN}${EMAIL_CHANGE_CONFIRM_PATH}?token=${encodeURIComponent(token)}`;
+  const confirmLink = `${publicAppOrigin()}${EMAIL_CHANGE_CONFIRM_PATH}?token=${encodeURIComponent(token)}`;
 
   try {
     await sendEmail({ email: "confirm-email-change", to: email, confirmLink });
@@ -201,8 +207,7 @@ export async function confirmEmailChange(token: string): Promise<ConfirmEmailCha
     return failure("This confirmation link is invalid or has expired.", 400);
   }
 
-  // Already applied: mail scanners fetch links before the recipient does, and
-  // people open them twice. Both must read as success, not as a dead link.
+  // Repeated confirmations read as success without sending another notice.
   if (normalizeEmail(user.email) === claims.email) {
     return { ok: true, userId: user.id, email: claims.email };
   }

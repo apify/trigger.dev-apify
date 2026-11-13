@@ -1,8 +1,12 @@
+import { classifyWaitpointCoordinator } from "../waitpointCoordinator/routing.js";
 import { parseNaturalLanguageDuration } from "@trigger.dev/core/v3/isomorphic";
 import type { TaskRunError } from "@trigger.dev/core/v3/schemas";
 import type { PrismaClientOrTransaction, TaskRunStatus } from "@trigger.dev/database";
 import { isExecuting } from "../statuses.js";
-import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
+import {
+  getLatestExecutionSnapshotOrFinishedRun,
+  type ExecutionSnapshotSystem,
+} from "./executionSnapshotSystem.js";
 import type { SystemResources } from "./systems.js";
 import {
   parseSnapshotRoute,
@@ -18,17 +22,20 @@ import { boundedIn } from "@trigger.dev/database";
 export type TtlSystemOptions = {
   resources: SystemResources;
   waitpointSystem: WaitpointSystem;
+  executionSnapshotSystem: ExecutionSnapshotSystem;
   finalizationGuardDelayMs?: number;
 };
 
 export class TtlSystem {
   private readonly $: SystemResources;
   private readonly waitpointSystem: WaitpointSystem;
+  private readonly executionSnapshotSystem: ExecutionSnapshotSystem;
   private readonly finalizationGuardDelayMs: number;
 
   constructor(private readonly options: TtlSystemOptions) {
     this.$ = options.resources;
     this.waitpointSystem = options.waitpointSystem;
+    this.executionSnapshotSystem = options.executionSnapshotSystem;
     this.finalizationGuardDelayMs = options.finalizationGuardDelayMs ?? 60_000;
   }
 
@@ -60,13 +67,20 @@ export class TtlSystem {
   }) {
     const prisma = tx ?? this.$.prisma;
     await this.$.runLock.lock("expireRun", [runId], async () => {
-      const snapshot = await getLatestExecutionSnapshot(
+      const { snapshot, finishedRun } = await getLatestExecutionSnapshotOrFinishedRun(
         prisma,
         runId,
         this.$.runStore,
-        undefined,
-        route ?? organizationId
+        route ?? organizationId,
+        { id: true }
       );
+      if (finishedRun) {
+        this.$.logger.debug("expireRun: snapshot state expired, run already finished", {
+          runId,
+          status: finishedRun.status,
+        });
+        return;
+      }
 
       //if we're executing then we won't expire the run
       if (isExecuting(snapshot.executionStatus)) {
@@ -114,6 +128,7 @@ export class TtlSystem {
           completedAt: new Date(),
           expiredAt: new Date(),
           snapshot: {
+            ...this.executionSnapshotSystem.nextSnapshotIdentity(snapshot, runId),
             engine: "V2",
             executionStatus: "FINISHED",
             description: "Run was expired because the TTL was reached",
@@ -152,11 +167,29 @@ export class TtlSystem {
         removeFromWorkerQueue: true,
       });
 
-      // Complete the waitpoint if it exists (runs without waiting parents have no waitpoint)
-      if (updatedRun.associatedWaitpoint) {
+      // Complete the associated RUN waitpoint (legacy row or store-derived) if the run has one.
+      const expiredWaitpointId =
+        updatedRun.associatedWaitpoint?.id ??
+        (this.waitpointSystem.isStoreRoutingWired &&
+        (await this.waitpointSystem.isStoreRoutingEnabled(snapshot.organizationId))
+          ? await this.waitpointSystem.resolveAssociatedRunWaitpointId({
+              runId,
+              organizationId: snapshot.organizationId,
+            })
+          : undefined);
+      if (expiredWaitpointId) {
         await this.waitpointSystem.completeWaitpoint({
-          id: updatedRun.associatedWaitpoint.id,
-          output: { value: JSON.stringify(error), isError: true },
+          id: expiredWaitpointId,
+          output: {
+            value:
+              classifyWaitpointCoordinator(expiredWaitpointId) === "store" &&
+              this.waitpointSystem.isStoreRoutingWired &&
+              (await this.waitpointSystem.isStoreRoutingEnabled(snapshot.organizationId))
+                ? this.waitpointSystem.serializeRunError(expiredWaitpointId, error)
+                : JSON.stringify(error),
+            isError: true,
+          },
+          organizationId: snapshot.organizationId,
         });
       }
 
@@ -378,14 +411,34 @@ export class TtlSystem {
         postgresOnlyRuns,
         async (run) => {
           try {
-            // Enqueue a finishWaitpoint worker job for resilient waitpoint completion
-            if (run.associatedWaitpoint) {
+            // Resolve the associated RUN waitpoint. A postgres-residency child of a redis-primary parent
+            // has a store waitpoint (mint keys on the parent), so a Postgres-only expiry can still owe a
+            // store completion — discovered by the shared helper, never a Postgres row lookup.
+            const batchWaitpointId =
+              run.associatedWaitpoint?.id ??
+              (this.waitpointSystem.isStoreRoutingWired &&
+              (await this.waitpointSystem.isStoreRoutingEnabled(run.organizationId ?? undefined))
+                ? await this.waitpointSystem.resolveAssociatedRunWaitpointId({
+                    runId: run.id,
+                    organizationId: run.organizationId ?? undefined,
+                  })
+                : undefined);
+            // Enqueue a finishWaitpoint worker job for resilient waitpoint completion (routes by id shape).
+            if (batchWaitpointId) {
               await this.$.worker.enqueue({
-                id: `finishWaitpoint.ttl.${run.associatedWaitpoint.id}`,
+                id: `finishWaitpoint.ttl.${batchWaitpointId}`,
                 job: "finishWaitpoint",
                 payload: {
-                  waitpointId: run.associatedWaitpoint.id,
-                  error: JSON.stringify(error),
+                  waitpointId: batchWaitpointId,
+                  organizationId: run.organizationId ?? undefined,
+                  error:
+                    classifyWaitpointCoordinator(batchWaitpointId) === "store" &&
+                    this.waitpointSystem.isStoreRoutingWired &&
+                    (await this.waitpointSystem.isStoreRoutingEnabled(
+                      run.organizationId ?? undefined
+                    ))
+                      ? this.waitpointSystem.serializeRunError(batchWaitpointId, error)
+                      : JSON.stringify(error),
                 },
               });
             }
@@ -419,7 +472,7 @@ export class TtlSystem {
              * a waiting parent and verifies the completion landed. Runs with no waitpoint
              * have nothing left to re-deliver, so release their guard now.
              */
-            if (!run.associatedWaitpoint) {
+            if (!batchWaitpointId) {
               await this.$.worker.ack(`ensureRunFinalized:${run.id}`);
             }
 

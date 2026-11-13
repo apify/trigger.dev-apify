@@ -36,7 +36,11 @@ import type {
   WaitpointColocationOptions,
 } from "./types.js";
 import { Logger } from "@trigger.dev/core/logger";
-import type { SnapshotReadContext, SnapshotRoute } from "./snapshotResidency.js";
+import {
+  snapshotResidencyFromMetadata,
+  type SnapshotReadContext,
+  type SnapshotRoute,
+} from "./snapshotResidency.js";
 import { isReadReplicaClient } from "./readReplicaClient.js";
 import { CONNECTED_RUNS_LIMIT } from "./PostgresRunStore.js";
 import { noopRoutingStoreMetrics, type RoutingStoreMetrics } from "./routingStoreMetrics.js";
@@ -95,6 +99,7 @@ export class RoutingRunStore implements RunStore {
   // duplicate id. Every merge in this class MUST use this order.
   readonly #precedence: readonly ShardKey[];
   // One entry per distinct database, in precedence order. A fan-out sum iterates this, never #shards.
+  readonly #waitpointKeyAliasShards: ReadonlyArray<{ key: ShardKey; aliasOf?: ShardKey }>;
   readonly #distinctStores: ReadonlyArray<{ key: ShardKey; store: RunStore }>;
   // The two id-less defaults. They differ by role on purpose: a route with no id lands on the
   // steady-state home, a waitpoint read with no id lands on the legacy store.
@@ -149,6 +154,8 @@ export class RoutingRunStore implements RunStore {
         );
       }
     }
+
+    this.#waitpointKeyAliasShards = shards;
 
     this.#shards = new Map<ShardKey, RunStore>([
       [NEW_SHARD, options.new],
@@ -377,12 +384,21 @@ export class RoutingRunStore implements RunStore {
     // store (runs, waitpoints, attempts, snapshots). Batches are the exception: `batchTriggerV3`
     // writes raw to the control plane while runEngine routes by id, so a batch is legitimately
     // dual-resident. Those callers pass `alarmOnDuplicate: false` so a batch on legacy + a gen-2
-    // shard is not mistaken for a violation.
+    // shard is not mistaken for a violation. A lookup with no id in its where returns a different
+    // row from each store, so only an id seen on two stores counts; a hit with no id can't be
+    // compared.
     if (hits.length > 1 && opts?.alarmOnDuplicate !== false) {
-      this.#reportDuplicateId(
-        String((hits[0]!.value as { id?: unknown })?.id ?? "unknown"),
-        hits.map((h) => h.key)
-      );
+      const keysById = new Map<string, ShardKey[]>();
+      for (const { key, value } of hits) {
+        const id = (value as { id?: unknown }).id;
+        if (typeof id !== "string") continue;
+        const keys = keysById.get(id);
+        if (keys) keys.push(key);
+        else keysById.set(id, [key]);
+      }
+      for (const [id, keys] of keysById) {
+        if (keys.length > 1) this.#reportDuplicateId(id, keys);
+      }
     }
     if (hits.length > 0) {
       // Highest authority wins: #precedence ascends, so take the last hit in that order.
@@ -512,6 +528,28 @@ export class RoutingRunStore implements RunStore {
   // failure between them rolls BOTH back. This is NOT a cross-DB transaction — the unit is co-resident
   // by construction (all writes target the one run on the one owning DB). Unclassifiable / absent id
   // falls back to NEW (the steady-state home), mirroring #routeOrNewForWrite.
+  getWaitpointKeyScope(ownerId?: string): string {
+    const key = this.#routeKeyOrDefault(ownerId);
+    this.#shardStore(key); // Reject an unconfigured owner before any key publication.
+    const canonical =
+      this.#waitpointKeyAliasShards.find((shard) => shard.key === key)?.aliasOf ?? key;
+    return canonical === NEW_SHARD || canonical === LEGACY_SHARD ? canonical : `shard:${canonical}`;
+  }
+
+  runInWaitpointKeyTransaction<R>(
+    ownerId: string | undefined,
+    organizationId: string,
+    acceptUntil: number,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
+  ): Promise<R> {
+    return this.#routeOrNew(ownerId).runInWaitpointKeyTransaction(
+      ownerId,
+      organizationId,
+      acceptUntil,
+      fn
+    );
+  }
+
   runInTransaction<R>(
     runId: string | undefined,
     fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
@@ -896,7 +934,12 @@ export class RoutingRunStore implements RunStore {
 
   async startAttempt<S extends Prisma.TaskRunSelect>(
     runId: string,
-    data: { attemptNumber: number; executedAt?: Date; isWarmStart: boolean },
+    data: {
+      attemptNumber: number;
+      executedAt?: Date;
+      isWarmStart: boolean;
+      annotations?: Prisma.InputJsonValue;
+    },
     args: { select: S },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
@@ -930,10 +973,14 @@ export class RoutingRunStore implements RunStore {
 
   async requeueRun<S extends Prisma.TaskRunSelect>(
     runId: string,
-    args: { select: S },
+    args: { select: S; workerQueue?: string },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
     return (await this.#routeForWrite(runId)).requeueRun(runId, args);
+  }
+
+  async markRunWaitpointsOnStore(runId: string): Promise<void> {
+    return (await this.#routeForWrite(runId)).markRunWaitpointsOnStore(runId);
   }
 
   async recordBulkActionMembership(
@@ -1239,7 +1286,8 @@ export class RoutingRunStore implements RunStore {
 
   // Snapshot reads route by OWNING run id (a SnapshotId is a cuid, NOT classifiable). The owning
   // store hydrates `completedWaitpoints` from its own client only, so a cross-DB completing token's
-  // OUTPUT is silently missing from the resume payload — re-resolve them across BOTH DBs.
+  // OUTPUT is silently missing from the resume payload — re-resolve them across BOTH DBs. A
+  // redis-primary snapshot has no Postgres join rows, so it skips the re-resolve (and its join query).
   async findLatestExecutionSnapshot(
     runId: string,
     client?: ReadClient,
@@ -1253,7 +1301,7 @@ export class RoutingRunStore implements RunStore {
       environmentId,
       organizationId
     );
-    if (snapshot) {
+    if (snapshot && !RoutingRunStore.#isRedisPrimary(snapshot.metadata)) {
       await this.#reresolveCompletedWaitpointsCrossDb(
         snapshot as Record<string, unknown>,
         owningStore,
@@ -1261,6 +1309,15 @@ export class RoutingRunStore implements RunStore {
       );
     }
     return snapshot;
+  }
+
+  // Unsupported metadata keeps the re-resolve rather than failing the read here.
+  static #isRedisPrimary(metadata: unknown): boolean {
+    try {
+      return snapshotResidencyFromMetadata(metadata) === "redis-primary";
+    } catch {
+      return false;
+    }
   }
 
   // Recover any cross-DB completed waitpoint MISSING from the owning store's hydration. The
@@ -1365,6 +1422,11 @@ export class RoutingRunStore implements RunStore {
     organizationId: string
   ): Promise<SnapshotRoute | undefined> {
     return this.#routeOrNew(runId).readSnapshotRoute(runId, organizationId);
+  }
+
+  // The pending unit lives with the run's owning store, the one runInTransaction opens on.
+  async settlePendingUnit(runId: string): Promise<void> {
+    return this.#routeOrNew(runId).settlePendingUnit(runId);
   }
 
   // The CompletedWaitpoint join co-locates with the snapshot, which co-locates with its run. When the
@@ -2148,6 +2210,10 @@ export class RoutingRunStore implements RunStore {
   // ---------------------------------------------------------------------------
   // BatchTaskRun (run-ops). Route by id-shape: run-ops id→NEW, cuid→LEGACY.
   // ---------------------------------------------------------------------------
+
+  async markBatchWaitpointOnStore(batchId: string, waitpointId: string): Promise<void> {
+    return (await this.#routeForWrite(batchId)).markBatchWaitpointOnStore(batchId, waitpointId);
+  }
 
   async createBatchTaskRun(
     data: CreateBatchTaskRunData,

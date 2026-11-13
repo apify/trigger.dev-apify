@@ -39,10 +39,11 @@ describe("public token API key routing", () => {
 
   it("uses server minting for additional keys", async () => {
     const key = "tr_prod_sk_0123456789abcdefghijklmn";
+    const expiresAt = Math.floor(Date.now() / 1000) + 3600;
     const token = await apiClientManager.runWithConfig({ baseURL: baseUrl, accessToken: key }, () =>
       auth.createPublicToken({
         scopes: { read: { runs: ["run_123"] } },
-        expirationTime: new Date("2030-01-01T00:00:00.000Z"),
+        expirationTime: new Date(expiresAt * 1000),
         realtime: { skipColumns: ["payload"] },
       })
     );
@@ -55,7 +56,7 @@ describe("public token API key routing", () => {
         authorization: `Bearer ${key}`,
         body: {
           scopes: ["read:runs:run_123"],
-          expirationTime: 1893456000,
+          expirationTime: expiresAt,
           realtime: { skipColumns: ["payload"] },
         },
       },
@@ -154,16 +155,21 @@ describe("public token API key routing", () => {
     ["no options at all", undefined],
     ["an empty scopes object", {}],
     ["a scope group with nothing selected", { read: {} }],
-  ])("rejects %s clearly for additional keys", async (_label, scopes) => {
+  ])("server-mints zero-permission tokens for additional keys with %s", async (_label, scopes) => {
     const key = "tr_prod_sk_0123456789abcdefghijklmn";
-    const promise = apiClientManager.runWithConfig({ baseURL: baseUrl, accessToken: key }, () =>
+    const token = await apiClientManager.runWithConfig({ baseURL: baseUrl, accessToken: key }, () =>
       auth.createPublicToken(scopes === undefined ? undefined : { scopes })
     );
 
-    await expect(promise).rejects.toThrow(
-      "requires at least one scope when using an additional API key"
-    );
-    expect(requests).toEqual([]);
+    expect(token).toBe("server-minted-token");
+    expect(requests).toEqual([
+      {
+        method: "POST",
+        url: "/api/v1/auth/public-tokens",
+        authorization: `Bearer ${key}`,
+        body: { scopes: [] },
+      },
+    ]);
   });
 
   it("explains how to recover when the server lacks the mint endpoint", async () => {

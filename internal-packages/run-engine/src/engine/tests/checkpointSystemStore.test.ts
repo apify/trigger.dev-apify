@@ -150,7 +150,14 @@ describe("CheckpointSystem store routing (single-DB passthrough)", () => {
     "checkpoint create routes the TaskRunCheckpoint write + SUSPENDED snapshot through the store",
     async ({ prisma, redisOptions }) => {
       const countingStore = new CountingPostgresRunStore({ prisma, readOnlyPrisma: prisma });
-      const engine = new RunEngine(createEngineOptions(redisOptions, prisma, countingStore));
+      let checkpointFlagCalls = 0;
+      const engine = new RunEngine({
+        ...createEngineOptions(redisOptions, prisma, countingStore),
+        waitpointStoreEnabled: async () => {
+          checkpointFlagCalls++;
+          return false;
+        },
+      });
 
       try {
         const { run, blockingSnapshotId } = await driveToCheckpointable(
@@ -161,6 +168,7 @@ describe("CheckpointSystem store routing (single-DB passthrough)", () => {
 
         const checkpointsBefore = countingStore.checkpointCreates;
         const snapshotsBefore = countingStore.snapshotCreates;
+        checkpointFlagCalls = 0;
 
         const checkpointResult = await engine.createCheckpoint({
           runId: run.id,
@@ -174,6 +182,10 @@ describe("CheckpointSystem store routing (single-DB passthrough)", () => {
         });
 
         expect(checkpointResult.ok).toBe(true);
+        // No store router is installed: a checkpoint must not resolve the waitpoint flag.
+        expect(checkpointFlagCalls).toBe(0);
+        // An unwired check must not create a Promise on the checkpoint path.
+        expect(engine.waitpointSystem.isStoreRoutingEnabled()).toBe(false);
 
         // (1) a TaskRunCheckpoint row exists for the run (joined via the SUSPENDED snapshot).
         const persistedCheckpoint = await prisma.taskRunCheckpoint.findFirst({
@@ -490,6 +502,128 @@ describe("CheckpointSystem checkpoint-family FK-drop app-integrity (both modes)"
       // Parity: no orphan TaskRunCheckpoint left on either DB after the owning env is deleted.
       expect(count17).toEqual(count14);
       expect(count14).toBe(0);
+    }
+  );
+});
+
+describe("CheckpointSystem location validation", () => {
+  // Catches: an unparseable location being stored and the run moved to WAITING_TO_RESUME.
+  containerTest(
+    "refuses a COMPUTE location its restore side can't parse, storing nothing",
+    async ({ prisma, redisOptions }) => {
+      const engine = new RunEngine(createEngineOptions(redisOptions, prisma));
+      const discarded: string[] = [];
+      engine.eventBus.on("incomingCheckpointDiscarded", ({ checkpoint }) => {
+        discarded.push(checkpoint.discardReason);
+      });
+
+      try {
+        const { run, blockingSnapshotId } = await driveToCheckpointable(
+          engine,
+          prisma,
+          "run_cploc1"
+        );
+
+        const result = await engine.createCheckpoint({
+          runId: run.id,
+          snapshotId: blockingSnapshotId,
+          checkpoint: { type: "COMPUTE", location: "foo://bar-123", reason: "TEST_CHECKPOINT" },
+        });
+
+        expect(result.ok).toBe(false);
+        expect(discarded).toEqual(["Invalid checkpoint location"]);
+        expect(await prisma.taskRunCheckpoint.count({ where: { location: "foo://bar-123" } })).toBe(
+          0
+        );
+
+        const latest = await getLatestExecutionSnapshot(prisma, run.id);
+        expect(latest.id).toBe(blockingSnapshotId);
+        expect(latest.executionStatus).toBe("EXECUTING_WITH_WAITPOINTS");
+
+        const taskRun = await prisma.taskRun.findUniqueOrThrow({ where: { id: run.id } });
+        expect(taskRun.status).toBe("EXECUTING");
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+
+  // Catches: validation refusing the real <node>/<snapshot> format, which would discard every compute suspend.
+  containerTest(
+    "stores a COMPUTE location in <node>/<snapshot> form",
+    async ({ prisma, redisOptions }) => {
+      const engine = new RunEngine(createEngineOptions(redisOptions, prisma));
+
+      try {
+        const { run, blockingSnapshotId } = await driveToCheckpointable(
+          engine,
+          prisma,
+          "run_cploc2"
+        );
+        const location = "node-a/0b6f0c8e-2d1a-4b7e-9f3c-5a8d2e1f4c7b";
+
+        const result = await engine.createCheckpoint({
+          runId: run.id,
+          snapshotId: blockingSnapshotId,
+          checkpoint: { type: "COMPUTE", location, reason: "TEST_CHECKPOINT" },
+        });
+
+        expect(result.ok).toBe(true);
+        const latest = await getLatestExecutionSnapshot(prisma, run.id);
+        expect(latest.executionStatus).toBe("SUSPENDED");
+        expect(latest.checkpoint?.location).toBe(location);
+      } finally {
+        await engine.quit();
+      }
+    }
+  );
+});
+
+describe("CheckpointSystem content digest", () => {
+  // Catches: the digest lost between the checkpoint's metadata and the dequeued restore.
+  containerTest(
+    "hands a stored checkpoint's digest back with the restore it is dequeued for",
+    async ({ prisma, redisOptions }) => {
+      const engine = new RunEngine(createEngineOptions(redisOptions, prisma));
+      const digest = `sha256:${"ab".repeat(32)}`;
+
+      try {
+        const { run, blockingSnapshotId, waitpointId } = await driveToCheckpointable(
+          engine,
+          prisma,
+          "run_cpdigest1"
+        );
+
+        const result = await engine.createCheckpoint({
+          runId: run.id,
+          snapshotId: blockingSnapshotId,
+          checkpoint: {
+            type: "KUBERNETES",
+            location: "registry.example.com/ns/image:tag",
+            reason: "TEST_CHECKPOINT",
+            digest,
+          },
+        });
+        expect(result.ok).toBe(true);
+
+        await engine.completeWaitpoint({ id: waitpointId });
+
+        const restored = await vi.waitFor(
+          async () => {
+            const [message] = await engine.dequeueFromWorkerQueue({
+              consumerId: "test_12345",
+              workerQueue: "main",
+            });
+            if (!message) throw new Error("Nothing dequeued yet");
+            return message;
+          },
+          { timeout: 10_000, interval: 100 }
+        );
+
+        expect(restored.checkpoint?.digest).toBe(digest);
+      } finally {
+        await engine.quit();
+      }
     }
   );
 });

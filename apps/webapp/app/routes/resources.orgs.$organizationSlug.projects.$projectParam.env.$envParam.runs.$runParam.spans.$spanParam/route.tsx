@@ -28,9 +28,6 @@ import { MachineLabelCombo } from "~/components/MachineLabelCombo";
 import { MachineTooltipInfo } from "~/components/MachineTooltipInfo";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { InvestigateButton } from "~/components/dashboard-agent/InvestigateButton";
-import { WatchButton } from "~/components/dashboard-agent/WatchButton";
-import { isFinalRunStatus } from "~/v3/taskStatus";
-import { runWatchRecommendation } from "~/components/dashboard-agent/watch-recommendations";
 import {
   failedRunPrompt,
   isFailedRunStatus,
@@ -105,10 +102,12 @@ import {
   type RunQueueWaiting,
 } from "~/presenters/v3/RunQueueMetricsPresenter.server";
 import { type Span, SpanPresenter, type SpanRun } from "~/presenters/v3/SpanPresenter.server";
-import { findProjectBySlug } from "~/models/project.server";
+import { type StartedSession } from "~/presenters/v3/startedSession.server";
+import { findProjectWithOrgFlagsBySlug } from "~/models/project.server";
 import { logger } from "~/services/logger.server";
 import { rbac } from "~/services/rbac.server";
-import { requireUserId } from "~/services/session.server";
+import { hasAdminDisplayAccess, requireUser } from "~/services/session.server";
+import { canUseAlertsList } from "~/v3/canUseAlertsList.server";
 import { cn } from "~/utils/cn";
 import { formatCurrencyAccurate } from "~/utils/numberFormatter";
 import {
@@ -135,11 +134,13 @@ import { RealtimeStreamViewer } from "../resources.orgs.$organizationSlug.projec
 import { CompleteWaitpointForm } from "../resources.orgs.$organizationSlug.projects.$projectParam.env.$envParam.waitpoints.$waitpointFriendlyId.complete/route";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
+  const user = await requireUser(request);
+  const userId = user.id;
+  const showAdminFields = hasAdminDisplayAccess(user);
   const { projectParam, organizationSlug, envParam, runParam, spanParam } =
     v3SpanParamsSchema.parse(params);
 
-  const project = await findProjectBySlug(organizationSlug, projectParam, userId);
+  const project = await findProjectWithOrgFlagsBySlug(organizationSlug, projectParam, userId);
   if (!project) throw new Response("Project not found", { status: 404 });
 
   const auth = await rbac.authenticateSession(request, {
@@ -162,6 +163,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       runFriendlyId: runParam,
       userId,
       linkedRunId,
+      showDebug: user.admin || user.isImpersonating,
     });
 
     if (!result) {
@@ -189,11 +191,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         envParam,
         run: result.run,
       });
+      const alertsEnabled = await canUseAlertsList({
+        orgFeatureFlags: (project.organization.featureFlags as Record<string, unknown>) ?? {},
+        userId,
+      });
       return typedjson({
         type: "run" as const,
-        run: result.run,
+        run: showAdminFields
+          ? result.run
+          : { ...result.run, workerCell: undefined, workerLane: undefined },
         queueMetrics,
         canWriteRuns,
+        alertsEnabled,
         loadedAt: Date.now(),
       });
     }
@@ -237,12 +246,23 @@ export function SpanView({
   spanOverrides,
   closePanel,
   linkedRunId,
+  refreshKey,
+  tabParam = "tab",
+  hideFocusOnRun = false,
+  headerAccessory,
 }: {
   runParam: string;
   spanId: string | undefined;
   spanOverrides?: SpanOverride;
   closePanel?: () => void;
   linkedRunId?: string;
+  /** Changing it reloads the span. */
+  refreshKey?: number;
+  /** The search param that holds the panel's tab, so a page can keep `tab` for its own tabs. */
+  tabParam?: string;
+  hideFocusOnRun?: boolean;
+  /** Shown in the panel header, before the close button. */
+  headerAccessory?: React.ReactNode;
 }) {
   const organization = useOrganization();
   const project = useProject();
@@ -256,7 +276,16 @@ export function SpanView({
       environment.slug
     }/runs/${runParam}/spans/${spanId}${linkedRunId ? `?linkedRunId=${linkedRunId}` : ""}`;
     load(url);
-  }, [organization.slug, project.slug, environment.slug, runParam, spanId, linkedRunId, load]);
+  }, [
+    organization.slug,
+    project.slug,
+    environment.slug,
+    runParam,
+    spanId,
+    linkedRunId,
+    load,
+    refreshKey,
+  ]);
 
   if (spanId === undefined) {
     return null;
@@ -291,9 +320,13 @@ export function SpanView({
           queueMetrics={fetcher.data.queueMetrics}
           loadedAt={fetcher.data.loadedAt}
           canWriteRuns={fetcher.data.canWriteRuns}
+          alertsEnabled={fetcher.data.alertsEnabled}
           runParam={runParam}
           spanId={spanId}
           closePanel={closePanel}
+          tabParam={tabParam}
+          hideFocusOnRun={hideFocusOnRun}
+          headerAccessory={headerAccessory}
         />
       );
     }
@@ -304,6 +337,8 @@ export function SpanView({
           spanOverrides={spanOverrides}
           runParam={runParam}
           closePanel={closePanel}
+          tabParam={tabParam}
+          headerAccessory={headerAccessory}
         />
       );
     }
@@ -315,17 +350,21 @@ function SpanBody({
   spanOverrides,
   runParam,
   closePanel,
+  tabParam,
+  headerAccessory,
 }: {
   span: Span;
   spanOverrides?: SpanOverride;
   runParam?: string;
   closePanel?: () => void;
+  tabParam: string;
+  headerAccessory?: React.ReactNode;
 }) {
   const _organization = useOrganization();
   const _project = useProject();
   const _environment = useEnvironment();
   const { value, replace: _replace } = useSearchParams();
-  let tab = value("tab");
+  let tab = value(tabParam);
 
   if (tab === "context") {
     tab = "overview";
@@ -359,15 +398,18 @@ function SpanBody({
               <SpanTitle {...span} size="large" hideAccessory overrideDimmed />
             </Header2>
           </div>
-          {runParam && closePanel && (
-            <Button
-              onClick={closePanel}
-              variant="minimal/small"
-              TrailingIcon={ExitIcon}
-              shortcut={{ key: "esc" }}
-              shortcutPosition="before-trailing-icon"
-              className="pl-1"
-            />
+          {panelHeaderActions(
+            headerAccessory,
+            runParam && closePanel && (
+              <Button
+                onClick={closePanel}
+                variant="minimal/small"
+                TrailingIcon={ExitIcon}
+                shortcut={{ key: "esc" }}
+                shortcutPosition="before-trailing-icon"
+                className="pl-1"
+              />
+            )
           )}
         </div>
       </div>
@@ -381,6 +423,18 @@ function SpanBody({
     </div>
   );
 }
+/** The header's right side: an optional accessory, then the close button. */
+function panelHeaderActions(accessory: React.ReactNode, closeButton: React.ReactNode) {
+  if (!accessory) return closeButton;
+
+  return (
+    <div className="flex items-center gap-1">
+      {accessory}
+      {closeButton}
+    </div>
+  );
+}
+
 function applySpanOverrides(span: Span, spanOverrides?: SpanOverride): Span {
   if (!spanOverrides) {
     return span;
@@ -418,24 +472,32 @@ function RunBody({
   queueMetrics,
   loadedAt,
   canWriteRuns,
+  alertsEnabled,
   runParam,
   spanId,
   closePanel,
+  tabParam,
+  hideFocusOnRun,
+  headerAccessory,
 }: {
   run: SpanRun;
   queueMetrics: RunQueueMetrics | null;
   loadedAt: number;
   canWriteRuns: boolean;
+  alertsEnabled: boolean;
   runParam: string;
   spanId: string;
   closePanel?: () => void;
+  tabParam: string;
+  hideFocusOnRun: boolean;
+  headerAccessory?: React.ReactNode;
 }) {
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
   const isAdmin = useHasAdminAccess();
   const { value, replace } = useSearchParams();
-  const tab = value("tab");
+  const tab = value(tabParam);
   const resetFetcher = useTypedFetcher<typeof resetIdempotencyKeyAction>();
 
   const queuePath = queueMetrics?.queueFriendlyId
@@ -485,15 +547,18 @@ function RunBody({
             </span>
           </Header2>
         </div>
-        {runParam && closePanel && (
-          <Button
-            onClick={closePanel}
-            variant="minimal/small"
-            TrailingIcon={ExitIcon}
-            shortcut={{ key: "esc" }}
-            shortcutPosition="before-trailing-icon"
-            className="pl-1"
-          />
+        {panelHeaderActions(
+          headerAccessory,
+          runParam && closePanel && (
+            <Button
+              onClick={closePanel}
+              variant="minimal/small"
+              TrailingIcon={ExitIcon}
+              shortcut={{ key: "esc" }}
+              shortcutPosition="before-trailing-icon"
+              className="pl-1"
+            />
+          )
         )}
       </div>
       <div className="h-fit overflow-x-auto px-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
@@ -502,7 +567,7 @@ function RunBody({
             isActive={!tab || tab === "overview"}
             layoutId="span-run"
             onClick={() => {
-              replace({ tab: "overview" });
+              replace({ [tabParam]: "overview" });
             }}
             shortcut={{ key: "o" }}
           >
@@ -512,7 +577,7 @@ function RunBody({
             isActive={tab === "detail"}
             layoutId="span-run"
             onClick={() => {
-              replace({ tab: "detail" });
+              replace({ [tabParam]: "detail" });
             }}
             shortcut={{ key: "d" }}
           >
@@ -522,7 +587,7 @@ function RunBody({
             isActive={tab === "context"}
             layoutId="span-run"
             onClick={() => {
-              replace({ tab: "context" });
+              replace({ [tabParam]: "context" });
             }}
             shortcut={{ key: "x" }}
           >
@@ -533,7 +598,7 @@ function RunBody({
             isActive={tab === "metadata"}
             layoutId="span-run"
             onClick={() => {
-              replace({ tab: "metadata" });
+              replace({ [tabParam]: "metadata" });
             }}
             shortcut={{ key: "m" }}
           >
@@ -1181,6 +1246,14 @@ function RunBody({
                       <Property.Value>{run.workerQueue}</Property.Value>
                     </Property.Item>
                     <Property.Item>
+                      <Property.Label>Worker cell</Property.Label>
+                      <Property.Value>{run.workerCell ?? "–"}</Property.Value>
+                    </Property.Item>
+                    <Property.Item>
+                      <Property.Label>Worker lane</Property.Label>
+                      <Property.Value>{run.workerLane ?? "–"}</Property.Value>
+                    </Property.Item>
+                    <Property.Item>
                       <Property.Label>Trace ID</Property.Label>
                       <Property.Value>{run.traceId}</Property.Value>
                     </Property.Item>
@@ -1234,12 +1307,6 @@ function RunBody({
                   runFriendlyId={run.friendlyId}
                 />
               ) : null}
-              {/* The universal `Watch…` entry (§2.1), pre-filled with this run's
-                  recommendation: tell me when it finishes. Only while the run can
-                  still change — a finished run has nothing left to wait for. */}
-              {isFinalRunStatus(run.status) ? null : (
-                <WatchButton spec={runWatchRecommendation(run.friendlyId)} className="self-start" />
-              )}
               <RunTimeline run={run} />
 
               {/* Offer Investigate for runs that are actively in progress. Failed runs get
@@ -1277,7 +1344,7 @@ function RunBody({
       </div>
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-grid-dimmed px-2 py-2">
         <div className="flex items-center gap-4">
-          {run.friendlyId !== runParam && (
+          {run.friendlyId !== runParam && !hideFocusOnRun && (
             <LinkButton
               to={v3RunSpanPath(
                 organization,
@@ -1602,6 +1669,45 @@ function TraceExportMenuItems({ runParam }: { runParam: string }) {
   );
 }
 
+function StartedSessionProperty({ session }: { session: StartedSession }) {
+  const organization = useOrganization();
+  const project = useProject();
+  const environment = useEnvironment();
+
+  const id = <CopyableText value={session.externalId} copyValue={session.externalId} asChild />;
+  const status = <SessionStatusCombo status={session.status} />;
+
+  return (
+    <Property.Item>
+      <Property.Label>Started session</Property.Label>
+      <Property.Value>
+        {session.isCurrent ? (
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-0">
+            {id}
+            {status}
+          </span>
+        ) : (
+          <SimpleTooltip
+            button={
+              <TextLink
+                to={v3SessionPath(organization, project, environment, {
+                  friendlyId: session.friendlyId,
+                })}
+                className="group flex flex-wrap items-center gap-x-2 gap-y-0"
+              >
+                {id}
+                {status}
+              </TextLink>
+            }
+            content="Jump to session"
+            disableHoverableContent
+          />
+        )}
+      </Property.Value>
+    </Property.Item>
+  );
+}
+
 function SpanEntity({ span }: { span: Span }) {
   const isAdmin = useHasAdminAccess();
 
@@ -1647,6 +1753,7 @@ function SpanEntity({ span }: { span: Span }) {
           </div>
         )}
         <Property.Table>
+          {span.startedSession && <StartedSessionProperty session={span.startedSession} />}
           <Property.Item>
             <Property.Label className="flex items-center justify-between">
               <span>Message</span>

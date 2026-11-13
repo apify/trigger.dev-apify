@@ -24,6 +24,7 @@ export const ROUTES_BY_GIVEN_RUN_ID: readonly string[] = [
   "recordRetryOutcome",
   "requeueRun",
   "recordBulkActionMembership",
+  "markRunWaitpointsOnStore",
   "cancelRun",
   "failRunPermanently",
   "finalizeRun",
@@ -45,7 +46,19 @@ export const GIVEN_RUN_ID_ROUTE = "#routeForWrite(runId)";
 
 export const PLACEMENT_SITES: readonly PlacementSite[] = [
   {
+    method: "runInWaitpointKeyTransaction",
+    basis: "owner-id",
+    missMode: "loud",
+    routes: ["#routeOrNew(ownerId)"],
+  },
+  {
     method: "runInTransaction",
+    basis: "own-id",
+    missMode: "loud",
+    routes: ["#routeOrNew(runId)"],
+  },
+  {
+    method: "settlePendingUnit",
     basis: "own-id",
     missMode: "loud",
     routes: ["#routeOrNew(runId)"],
@@ -123,6 +136,12 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
     why: "Routes by the owning run id when the filter names one; otherwise sums across every store, so a delete cannot quietly skip a shard.",
   },
   {
+    method: "markBatchWaitpointOnStore",
+    basis: "own-id",
+    missMode: "loud",
+    routes: ["#routeForWrite(batchId)"],
+  },
+  {
     method: "createBatchTaskRun",
     basis: "own-id",
     missMode: "silent",
@@ -197,6 +216,7 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
 
 /** Listed so the union covers the interface: a `getOrCreateThing` must not pass as a read. */
 export const READ_ONLY_METHODS: readonly string[] = [
+  "getWaitpointKeyScope",
   "findRun",
   "findRunOrThrow",
   "findRunOnPrimary",

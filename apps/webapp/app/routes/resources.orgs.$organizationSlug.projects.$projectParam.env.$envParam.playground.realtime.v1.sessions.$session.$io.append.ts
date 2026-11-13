@@ -7,17 +7,17 @@ import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { logger } from "~/services/logger.server";
 import { S2RealtimeStreams } from "~/services/realtime/s2realtimeStreams.server";
+import { completeSessionStreamWaitpoints } from "~/services/realtime/sessionChannelAppend.server";
 import { ensureRunForSession } from "~/services/realtime/sessionRunManager.server";
 import {
   canonicalSessionAddressingKey,
   resolveSessionByIdOrExternalId,
 } from "~/services/realtime/sessions.server";
 import { getRealtimeStreamInstance } from "~/services/realtime/v1StreamsGlobal.server";
-import { drainSessionStreamWaitpoints } from "~/services/sessionStreamWaitpointCache.server";
 import { requireUserId } from "~/services/session.server";
 import { EnvironmentParamSchema } from "~/utils/pathBuilder";
-import { engine } from "~/v3/runEngine.server";
 import { ServiceValidationError } from "~/v3/services/common.server";
+import { stripClientIngressFields } from "~/services/realtime/sanitizeSessionInput.server";
 
 const ParamsSchema = z.object({
   session: z.string(),
@@ -106,7 +106,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   const addressingKey = canonicalSessionAddressingKey(session, sessionParam);
 
-  const part = await request.text();
+  const body = await request.text();
+  const part = io === "in" ? stripClientIngressFields(body) : body;
   const partId = request.headers.get("X-Part-Id") ?? nanoid(7);
 
   const [appendError, appendSeq] = await tryCatch(
@@ -122,39 +123,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   // Drain any waitpoints registered for this channel — same as the
   // public append. Best-effort; failure doesn't fail the append.
-  const [drainError, waitpointIds] = await tryCatch(
-    drainSessionStreamWaitpoints(environment.id, addressingKey, io)
-  );
-  if (drainError) {
-    logger.error("Failed to drain session stream waitpoints (playground)", {
-      addressingKey,
-      io,
-      error: drainError,
-    });
-  } else if (waitpointIds && waitpointIds.length > 0) {
-    await Promise.all(
-      waitpointIds.map(async (waitpointId) => {
-        const [completeError] = await tryCatch(
-          engine.completeWaitpoint({
-            id: waitpointId,
-            output: {
-              value: part,
-              type: "application/json",
-              isError: false,
-            },
-          })
-        );
-        if (completeError) {
-          logger.error("Failed to complete session stream waitpoint (playground)", {
-            addressingKey,
-            io,
-            waitpointId,
-            error: completeError,
-          });
-        }
-      })
-    );
-  }
+  await completeSessionStreamWaitpoints(environment, addressingKey, io, part, {
+    origin: "playground",
+  });
 
   return json({ ok: true, seq: appendSeq ?? undefined }, { status: 200 });
 }

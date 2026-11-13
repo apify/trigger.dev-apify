@@ -99,6 +99,8 @@ vi.mock("~/services/realtime/sessionRunManager.server", () => ({
 // Waitpoint completion downstream: orthogonal. Record the engine call; canned packet.
 vi.mock("~/v3/runEngine.server", () => ({
   engine: {
+    // Existing legacy-route fixture remains on its disabled waitpoint path.
+    waitpointSystem: { isWaitpointStoreEnabled: async () => false },
     completeWaitpoint: vi.fn(async (args: any) => {
       H.engine.calls.push(args);
       return { id: args.id };
@@ -147,7 +149,13 @@ async function seedTenant(prisma: PrismaClient, suffix: string) {
       shortcode: `short_${suffix}`,
     },
   });
-  return { organization, project, environment };
+  // The completion routes read environment.organization.id (to route the continuation by org), so the
+  // authenticated environment must carry the nested organization, as AuthenticatedEnvironment does.
+  return {
+    organization,
+    project,
+    environment: { ...environment, organization: { id: organization.id } },
+  };
 }
 
 function buildCreateRunInput(p: {

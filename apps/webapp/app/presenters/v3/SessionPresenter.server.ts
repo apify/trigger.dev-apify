@@ -6,6 +6,7 @@ import {
   DASHBOARD_TRANSCRIPT_PAGE,
   readSessionTranscriptSeed,
 } from "~/services/realtime/transcriptSeed.server";
+import { findSessionRunsPage } from "~/services/realtime/sessionRunPage.server";
 import { resolveSessionByIdOrExternalId } from "~/services/realtime/sessions.server";
 import { LEGACY_PLAYGROUND_TAG } from "~/services/sessionsRepository/sessionsRepository.server";
 import { runStore } from "~/v3/runStore.server";
@@ -21,6 +22,8 @@ export class SessionPresenter {
     sessionParam: string;
     projectExternalRef: string;
     environmentSlug: string;
+    /** Off when the page opens on the Trace tab: the Conversation tab fetches it when shown. */
+    readTranscript: boolean;
   }) {
     return startActiveSpan("SessionPresenter.call", (span) => this.#call(args, span), {
       attributes: {
@@ -37,12 +40,14 @@ export class SessionPresenter {
       sessionParam,
       projectExternalRef,
       environmentSlug,
+      readTranscript,
     }: {
       userId: string;
       environmentId: string;
       sessionParam: string;
       projectExternalRef: string;
       environmentSlug: string;
+      readTranscript: boolean;
     },
     rootSpan: Span
   ) {
@@ -68,17 +73,7 @@ export class SessionPresenter {
     // 50 covers the vast majority of sessions; longer histories link out
     // to the runs page via tag filter.
     const sessionRuns = await startActiveSpan("SessionPresenter.findSessionRuns", async (span) => {
-      const rows = await this.replica.sessionRun.findMany({
-        where: { sessionId: session.id },
-        orderBy: { triggeredAt: "desc" },
-        take: 50,
-        select: {
-          id: true,
-          runId: true,
-          reason: true,
-          triggeredAt: true,
-        },
-      });
+      const rows = await findSessionRunsPage(this.replica, { sessionId: session.id, take: 50 });
       span.setAttribute("sessionRuns.count", rows.length);
       return rows;
     });
@@ -123,14 +118,16 @@ export class SessionPresenter {
     // sessions that use `hydrateMessages` have no object to read and fall back
     // to seq=0 SSE (which, post-trim, shows only the most recent turn —
     // accepted, those customers have their own DB-backed dashboards).
-    const transcriptSeed = await startActiveSpan("SessionPresenter.readTranscript", () =>
-      readSessionTranscriptSeed({
-        session,
-        projectRef: projectExternalRef,
-        envSlug: environmentSlug,
-        limit: DASHBOARD_TRANSCRIPT_PAGE,
-      })
-    );
+    const transcriptSeed = readTranscript
+      ? await startActiveSpan("SessionPresenter.readTranscript", () =>
+          readSessionTranscriptSeed({
+            session,
+            projectRef: projectExternalRef,
+            envSlug: environmentSlug,
+            limit: DASHBOARD_TRANSCRIPT_PAGE,
+          })
+        )
+      : undefined;
 
     return {
       id: session.id,

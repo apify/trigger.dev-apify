@@ -1,5 +1,152 @@
 # internal-platform
 
+## 4.8.5
+
+## 4.8.4
+
+### Patch Changes
+
+- Self-hosted supervisors that run tasks in microVMs can now have a finished run's suspend snapshots deleted from shared storage, instead of leaving them behind. The server-only checkpoint client gains a `deleteSnapshots` call for this. ([`95f4cbbad`](https://github.com/triggerdotdev/trigger.dev/commit/95f4cbbad711ea245778d05a2e9951331a325f82))
+- Browser realtime subscriptions now resume reliably after the tab is hidden and shown again. This comes from upgrading `@electric-sql/client` to 1.3.0, which also lets apps that depend on 1.3.0 share a single copy with the SDK. ([`3900d8906`](https://github.com/triggerdotdev/trigger.dev/commit/3900d8906e3a307acf4879a70ab0cbac5d1f8cb8))
+- Add opt-in AWS session tags with `awsCredentialProvider({ sessionTags: true })` for task-level IAM restrictions and attribute-based permissions. Tags come from the verified run identity. Update the role trust policy to allow `sts:TagSession` before enabling them; existing integrations remain untagged. ([`c8ae1ffb5`](https://github.com/triggerdotdev/trigger.dev/commit/c8ae1ffb588895a0ffb8c0dbdcaa1d6e19671edc))
+- Use run credentials for run results, rescheduling, schedules, and environment-variable operations inside tasks. Run credentials remain limited to the current environment: shared schedules cannot be changed, and parent environment variables cannot be written. ([`cd58c750b`](https://github.com/triggerdotdev/trigger.dev/commit/cd58c750b878d39e16acde163b751de2e7491ac0))
+- Deploy from GitHub Actions using Trusted publishing and GitHub OIDC without storing a Trigger.dev API key. These deployments run entirely on the build server and do not grant the CLI access to environment variables. ([`9aafe6989`](https://github.com/triggerdotdev/trigger.dev/commit/9aafe6989af028bc7c9dc96f9d2f1c027ec3323c))
+- Use GitHub Actions trusted publishing with `preview archive` and `promote`, without storing API keys. Preview deploys for closed or merged pull requests now archive their branch. `preview archive` also supports Preview environment API keys through `TRIGGER_ACCESS_TOKEN`. ([`d9172638a`](https://github.com/triggerdotdev/trigger.dev/commit/d9172638a9679c1f698a1b04b35d2cc7abae5fa3))
+
+  Failed Preview archive operations now exit with an error for API-key and personal-token authentication too, including automatic cleanup during deploys. CI cleanup jobs that previously passed despite an archive failure will now fail. Concurrent cleanup jobs succeed when another job has already archived the same branch generation.
+
+- Fix logs and spans with large numeric object keys failing to ingest and dropping the rest of their batch. ([`99a626aa3`](https://github.com/triggerdotdev/trigger.dev/commit/99a626aa3b215b55f5fbfa1dddcfe34ae231e932))
+
+## 4.8.3
+
+### Patch Changes
+
+- CLI and MCP logins are now bound to the machine that started them. Approving a login in your browser sends you back to the CLI automatically, or, when the browser is on another machine, shows a code to paste into the terminal (or pass with `trigger.dev login --code`). Older CLI versions will need to upgrade to log in. ([`1a36c23fb`](https://github.com/triggerdotdev/trigger.dev/commit/1a36c23fb1f4bee60eb7e3ed7a62836ba4a11bb9))
+- Add private-beta OIDC authentication for deployed Cloud tasks, with an AWS credential provider and environment-specific setup instructions. Install `@aws-sdk/client-sts` to use `@trigger.dev/sdk/oidc/aws`, upgrade your deployment CLI, and redeploy. Contact us to enable access for your organization. ([`65352bc90`](https://github.com/triggerdotdev/trigger.dev/commit/65352bc90aff3788f466569997f2f6a24229ff5a))
+- Deprecates the legacy Bun runtime. `runtime: "bun"` (and its explicit spelling `"bun-legacy"`), which deploys Bun 1.3.3 with Node.js 20 alongside it, now prints a deprecation warning, and deploys that use it will be rejected from January 5, 2027. Switch to `runtime: "bun-1.4"` (Bun 1.4.4 on an image with no Node.js binary) and redeploy. ([`5f8171cab`](https://github.com/triggerdotdev/trigger.dev/commit/5f8171cab0e5d2b02e6446455b6569ba7c031a3b))
+- Fix parent and root metadata updates being lost after one update could not be applied. Only that update is now skipped, and the rest are written. Metadata keys that name only the root, such as `$.` or `$..`, are now ignored on a run's own metadata instead of throwing, and rejected for parent and root metadata, which fails the whole request. ([`53441fd20`](https://github.com/triggerdotdev/trigger.dev/commit/53441fd20292f8b01dbf67f72069873ec07c25da))
+
+## 4.8.2
+
+### Patch Changes
+
+- Run metadata operations now reject JSON-path keys that use escaped dots to reach `__proto__`, `constructor` or `prototype`. ([`dce5048a8`](https://github.com/triggerdotdev/trigger.dev/commit/dce5048a8e4ac35e72f85b4534239dec6a013211))
+- Deployed tasks now keep a valid short-lived run token for their whole run: the token is refreshed during long runs and before a run resumes from a checkpoint. A warm-started task no longer keeps the previous run's token when the next run has none, and run credentials are left out of runner debug logs. ([`aa9de9d94`](https://github.com/triggerdotdev/trigger.dev/commit/aa9de9d9483b54edd09792c25c7d1a97694604af))
+- Use short-lived run tokens for supported SDK operations inside deployed tasks when available, retaining environment-key compatibility for unsupported operations and missing or expired tokens. Explicit credentials still take precedence. Public-token helpers use server-side minting with run tokens rather than signing locally. ([`5a1c14239`](https://github.com/triggerdotdev/trigger.dev/commit/5a1c14239bcedf85570c8392835bda07482e222e))
+
+  Project and organization queries, and branch overrides targeting another PREVIEW or DEVELOPMENT environment, keep using compatibility credentials. Branch headers do not change credential selection in STAGING or PRODUCTION. Chat subscriptions reread implicit credentials for each connection.
+
+- Upgrade `socket.io-client` to 4.8.4 so projects using the SDK and CLI install `ws` 8.21 instead of 8.17.1, which has published advisories (GHSA-96hv-2xvq-fx4p, GHSA-58qx-3vcg-4xpx). The old pin blocked upgrading `ws` without a package manager override. ([`2df9860b4`](https://github.com/triggerdotdev/trigger.dev/commit/2df9860b4c736da3ba3b8dd61b8f08a4d9b03521))
+- `runs.subscribeToRun` now ends after the run completes. The `for await` loop exits right after the update with the final status, and the subscription stops its connection, so a script that subscribes to a run exits on its own. Pass `stopOnCompletion: false` to keep the subscription open after completion. ([`485ab83aa`](https://github.com/triggerdotdev/trigger.dev/commit/485ab83aaf55057af9da8944570285f05880eaaf))
+- Add `SupervisorHttpClient.releaseRun`, which gives back a dequeued run the worker never started so the platform requeues it at once instead of after the pending execution timeout. ([`ba51e5573`](https://github.com/triggerdotdev/trigger.dev/commit/ba51e557325260170f2a399fc19028747aca50a2))
+- The supervisor keeps its run notification subscriptions across reconnects to the webapp, and reconnects when the webapp turns its handshake away, so cancellations and resolved waits keep reaching running tasks after a webapp restart or deploy. ([`a9e69ab7d`](https://github.com/triggerdotdev/trigger.dev/commit/a9e69ab7d4d5c5374802616699ea826d2c4b9135))
+- Adds the `bun-1.4` runtime. `runtime: "bun-1.4"` deploys on Bun 1.4.4 in a Bun-only image with no Node.js binary, and the run controller itself runs under Bun. `runtime: "bun"` is unchanged (Bun 1.3 with Node.js alongside it); `bun-legacy` is accepted as an explicit spelling of the same runtime. On Bun 1.4 the worker no longer crashes at startup on the `--no-warnings=ExperimentalWarning` flag. ([`a8a87850b`](https://github.com/triggerdotdev/trigger.dev/commit/a8a87850bdaa57b6e40c0dcdbdf8b5bf59a39113))
+- Asymmetric webhook sources can now verify ECDSA P-384 signatures (`algorithm: "ecdsa-p384"`, SHA-384) and providers that sign a SHA-256 digest of the signing string (`prehash: "sha256"`). ECDSA signatures are accepted in DER or raw `r||s` form. ([`4ed2e3780`](https://github.com/triggerdotdev/trigger.dev/commit/4ed2e3780c3bbe92c6a69e0f2356f3839bbf776b))
+
+## 4.8.1
+
+## 4.8.0
+
+### Minor Changes
+
+- Add hosted webhooks: declare an endpoint once with `webhooks.endpoint.define({ id, source })` and Trigger.dev hosts its URL, verifies every request, and routes each event to the endpoint's subscribers. Subscribe tasks with `webhook({ endpoint, filter, onEvent })`, each with its own type-safe filter, and pause a run until a matching webhook arrives with `webhooks.waiter.create()` and `webhooks.waiter.wait()`. ([`d6955ee9f`](https://github.com/triggerdotdev/trigger.dev/commit/d6955ee9f31b0b1a3af55bb8fbbc77ba68bcb3f7))
+
+  ```ts
+  export const stripe = webhooks.endpoint.define({
+    id: "stripe",
+    source: webhooks.stripe(),
+  });
+
+  export const fulfill = webhook({
+    id: "fulfill",
+    endpoint: stripe,
+    filter: "event.type == 'checkout.session.completed'",
+    onEvent: async ({ event }) => {},
+  });
+
+  const waiter = await webhooks.waiter.create(stripe, {
+    match: { "event.data.object.metadata.orderId": order.id },
+  });
+  const { event } = await webhooks.waiter.wait(waiter).unwrap();
+  ```
+
+  Sources cover presets (`webhooks.stripe()`, `webhooks.github()`, `webhooks.svix()`, `webhooks.discord()`, and others), named providers (`webhooks.clerk()`, `webhooks.shopify()`, and more) and `webhooks.custom<T>(config)`, and most carry a setup prompt an AI coding agent can follow to register the endpoint. Retries are deduplicated on the provider's own event or delivery id where it sends one. Filters, keys and waiter `match` paths share the `event.`, `header.` and `webhook.` namespaces, and filters accept `== null` / `!= null` presence checks and `event any (...)` over a payload that is an array of events. `webhook()` takes `task()` options such as `queue`, `machine` and `retry`. The HTTP API lists endpoints and deliveries, replays deliveries, and creates and cancels waiters, and both it and the MCP server can read an endpoint's setup prompt and generate or store its signing secret.
+
+### Patch Changes
+
+- Realtime streams now reconnect and resume when the stream backend reports a failed read mid-stream, instead of ending early as if the stream had finished. This affects `runs.subscribeToRun` with streams, `useRealtimeRunWithStreams`, and chat streams. ([`23730b034`](https://github.com/triggerdotdev/trigger.dev/commit/23730b0344342a96731d52dbdc60626565519e26))
+- HMAC webhook verifier configs accept `additionalSignatureHeaders`: more headers that can carry a signature, matched as alternatives to `signatureHeader`. Providers that send a second signature during a secret rotation (Hookdeck's `x-hookdeck-signature-2`) keep verifying through the rotation. ([`08d1ddbd3`](https://github.com/triggerdotdev/trigger.dev/commit/08d1ddbd3531d47ee4fb7f684f07987e2e59ec7e))
+- The `generate_webhook_secret` and `set_webhook_secret` MCP tools take an optional `previousSecretTtlSeconds` to keep accepting a webhook endpoint's old signing secret while the provider switches to the new one (up to 7 days), and report when the old secret stops working. ([`98adb6662`](https://github.com/triggerdotdev/trigger.dev/commit/98adb6662562dbfa99f7c026ddb544c4486e03f6))
+- Add `webhooks.hookdeck()`, a source for deliveries relayed through a Hookdeck connection. It verifies the `x-hookdeck-signature` header with the project's signing secret, keeps verifying while the secret is being rolled (Hookdeck sends the previous secret's signature in `x-hookdeck-signature-2`), and deduplicates retries on `x-hookdeck-eventid`. The event is the original provider's payload, so pass its type: `webhooks.hookdeck<Stripe.Event>()`. If the Hookdeck project's header prefix was changed, pass it as `webhooks.hookdeck({ headerPrefix })` so retries keep deduplicating. ([`51b39fbc6`](https://github.com/triggerdotdev/trigger.dev/commit/51b39fbc6ff0eeeda78fd292d974e7aaa747a086))
+
+## 4.7.6
+
+### Patch Changes
+
+- Fix `timestamp` and other `Date` fields being logged as `{}` in structured log lines. ([`7a5a1f144`](https://github.com/triggerdotdev/trigger.dev/commit/7a5a1f144c98c808fb423bc0736bac7733ab3029))
+
+## 4.7.5
+
+### Patch Changes
+
+- Manage custom metric dashboards from code. `query.dashboards` lists, creates, updates and deletes custom dashboards and their widgets, and every widget query is checked when it is saved. The MCP server adds `create_dashboard` and `set_dashboard_widgets`, so your AI assistant can build a dashboard for you. ([`252624c92`](https://github.com/triggerdotdev/trigger.dev/commit/252624c92077a8326e9b68f7b6713beca173d8b1))
+
+  ```ts
+  import { query } from "@trigger.dev/sdk";
+
+  await query.dashboards.create({
+    title: "Email tasks",
+    widgets: [
+      {
+        title: "Total runs",
+        query: "SELECT count() AS total FROM runs",
+        display: { type: "bignumber", column: "total", aggregation: "sum" },
+      },
+    ],
+  });
+  ```
+
+- `trigger deploy` and `trigger promote` now say which environment they're targeting, and accept `--prod` as a shorthand for `--env prod`. When `TRIGGER_ACCESS_TOKEN` holds an environment API key and you don't pass `--env`, they now use that key's environment instead of assuming prod. Passing an `--env` that doesn't match the key is now an error, where before the deploy went to the key's environment. ([`70ea83d38`](https://github.com/triggerdotdev/trigger.dev/commit/70ea83d38fc6a5ddff6c83e8285d2df72f40a9d8))
+
+  Preview deploys now detect the branch on CI providers that check out a detached HEAD, such as GitLab, Bitbucket, CircleCI, Buildkite, Travis CI, Jenkins and Azure Pipelines, instead of creating a branch called `HEAD`. Test links printed after a preview deploy now open the preview branch you deployed instead of staging.
+
+  The MCP `deploy` tool no longer defaults to prod, so your AI assistant has to choose the environment.
+
+- Redact span content before it leaves the worker. `telemetry.spanProcessors` in `trigger.config.ts` runs your own span processors ahead of every export, to Trigger.dev and to your own exporters, so you can redact or drop span content before it reaches the run trace. `chat.agent` also takes a `telemetry` option to stop recording the user's message and `clientData` on its spans. ([`32b36b143`](https://github.com/triggerdotdev/trigger.dev/commit/32b36b1433dddb4f9d2cbd4c0320b146c7d6c858))
+
+  ```ts
+  export default defineConfig({
+    telemetry: { spanProcessors: [new MyRedactingSpanProcessor()] },
+  });
+
+  chat.agent({
+    id: "my-chat",
+    telemetry: { recordUserMessage: false, recordClientData: false },
+    run: async ({ messages, signal, streamText }) =>
+      streamText({ model, messages, abortSignal: signal }),
+  });
+  ```
+
+- Fix run subscriptions crashing Node with `Controller is already closed` after you `break` out of the loop, and stop polling once you do. `ApiClient` subscribe methods also accept a custom `fetchClient`. ([`9f4295bff`](https://github.com/triggerdotdev/trigger.dev/commit/9f4295bff186f430b0e21e652683aad7970f5307))
+
+## 4.7.4
+
+### Patch Changes
+
+- Override a concurrency limit's `perKey` for a single `concurrencyKey`: `concurrencyLimits.override(name, { concurrencyKey, perKey, ttl })` caps that one key under that one limit for a while (7 days by default, 30 at most), `reset(name, { concurrencyKey })` clears it, and `retrieve(name, { concurrencyKey })` shows the key's bound and when the override expires. ([`c49fd05f4`](https://github.com/triggerdotdev/trigger.dev/commit/c49fd05f44119ec2a036afaabaad8f9e148a3db6))
+- Self-hosted instances can require custom deploy base images per runtime via the new `DEPLOY_BASE_IMAGES` and `DEPLOY_BUILD_BASE_IMAGES` webapp settings. The CLI builds on the images the instance specifies, and older CLIs are rejected with an upgrade message. ([#5005](https://github.com/triggerdotdev/trigger.dev/pull/5005))
+- `runs.replay()` now takes options, so you can replay a run with a different payload, metadata, tags, queue, machine, version, delay and other trigger options. Anything you leave out comes from the original run, as before, and the payload is serialized like `trigger()`, so values like `Date` and `BigInt` keep their types. ([`ff2aa236e`](https://github.com/triggerdotdev/trigger.dev/commit/ff2aa236eb986b938e8e04cec3898b24aed4ec3f))
+
+  ```ts
+  import { runs } from "@trigger.dev/sdk";
+
+  await runs.replay("run_1234", {
+    payload: { userId: "user_456" },
+    tags: ["replayed"],
+    delay: "10m",
+  });
+  ```
+
 ## 4.7.3
 
 ## 4.7.2

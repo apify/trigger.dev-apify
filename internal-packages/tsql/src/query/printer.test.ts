@@ -578,6 +578,14 @@ describe("ClickHousePrinter", () => {
       );
     });
 
+    it("should infer a numeric type for round()", () => {
+      const { columns } = printQuery(
+        "SELECT round(count() / 3, 1) AS r FROM runs",
+        createJsonContext()
+      );
+      expect(columns).toContainEqual(expect.objectContaining({ name: "r", type: "Float64" }));
+    });
+
     it("should cast JSON subfield to String with multiple fields and underscore aliases", () => {
       const ctx = createJsonContext();
       const { sql, columns } = printQuery(
@@ -1503,6 +1511,21 @@ describe("ClickHousePrinter", () => {
 
       expect(sql).toContain("in(id,");
       expect(sql).toContain("SELECT run_id FROM");
+    });
+  });
+
+  describe("WITH clauses", () => {
+    it("should print a column CTE as an expression alias", () => {
+      const { sql } = printQuery("WITH 1 AS x SELECT x");
+
+      expect(sql).toBe("WITH 1 AS x SELECT x LIMIT 10000");
+    });
+
+    it("should let a column CTE be selected alongside a table", () => {
+      const { sql } = printQuery("WITH 1 AS x SELECT id, x FROM task_runs WHERE x = 1");
+
+      expect(sql).toMatch(/^WITH 1 AS x SELECT id, x FROM /);
+      expect(sql).toContain("equals(x, 1)");
     });
   });
 
@@ -3000,6 +3023,25 @@ describe("Unknown column blocking", () => {
       }).toThrow(QueryError);
     });
 
+    it("should resolve WITH expression aliases against the table schema", () => {
+      const schema = createSchemaRegistry([runsSchema]);
+      const ctx = createPrinterContext({
+        schema,
+        enforcedWhereClause: {
+          organization_id: { op: "eq", value: "org_test" },
+          project_id: { op: "eq", value: "proj_test" },
+          environment_id: { op: "eq", value: "env_test" },
+        },
+      });
+
+      expect(() => {
+        printQuery("WITH created_at AS x SELECT x FROM runs", ctx);
+      }).toThrow(QueryError);
+      expect(printQuery("WITH created AS x SELECT x FROM runs", ctx).sql).toMatch(
+        /^WITH created_at AS x SELECT x FROM /
+      );
+    });
+
     it("should suggest TSQL column name when user types ClickHouse column name", () => {
       // The schema exposes 'created' but the internal ClickHouse column is 'created_at'
       // When user types 'created_at', we should suggest 'created'
@@ -3302,6 +3344,13 @@ describe("Internal-only column blocking", () => {
       }).toThrow(QueryError);
       expect(() => {
         printQuery("SELECT id, organization_id FROM hidden_tenant_runs", ctx);
+      }).toThrow(/not available for querying/i);
+    });
+
+    it("should throw error when a WITH alias reads a hidden tenant column", () => {
+      const ctx = createHiddenTenantContext();
+      expect(() => {
+        printQuery("WITH organization_id AS x SELECT id, x FROM hidden_tenant_runs", ctx);
       }).toThrow(/not available for querying/i);
     });
 
@@ -4297,5 +4346,74 @@ describe("compound mergeGroupKey validation", () => {
       "SELECT queue, concurrency_key, deltaSumTimestampMerge(started_delta) AS started FROM metrics_by_key GROUP BY queue, concurrency_key"
     );
     expect(bothGrouped.sql).toContain("GROUP BY queue_name, concurrency_key");
+  });
+});
+
+describe("Generated column names", () => {
+  const runsWithDerivedColumns: TableSchema = {
+    ...taskRunsSchema,
+    columns: {
+      ...taskRunsSchema.columns,
+      task: { name: "task", clickhouseName: "task_identifier", ...column("String") },
+      execution_duration: {
+        name: "execution_duration",
+        ...column("Nullable(Int64)"),
+        expression: "dateDiff('millisecond', started_at, completed_at)",
+      },
+      output: { name: "output", ...column("JSON"), textColumn: "output_text" },
+    },
+  };
+
+  function printWithDerivedColumns(query: string) {
+    return printQuery(
+      query,
+      createTestContext({
+        schema: createSchemaRegistry([runsWithDerivedColumns, taskEventsSchema]),
+      })
+    );
+  }
+
+  it.each([
+    ["a function call", "SELECT id, lower(status) FROM task_runs AS lower"],
+    ["a function call in another case", "SELECT id, LOWER(status) FROM task_runs AS Lower"],
+    ["a nested function call", "SELECT id, coalesce(lower(status)) FROM task_runs AS coalesce"],
+    ["an arithmetic expression", "SELECT id, duration_ms + 1 FROM task_runs AS plus"],
+    ["a virtual column", "SELECT id, execution_duration FROM task_runs AS execution_duration"],
+    ["a renamed column", "SELECT id, task FROM task_runs AS task"],
+    ["a text column", "SELECT id, output FROM task_runs AS output"],
+    ["SELECT *", "SELECT * FROM task_runs AS execution_duration"],
+    [
+      "a joined table",
+      "SELECT r.id, lower(e.event_type) FROM task_runs AS r JOIN task_events AS lower ON r.id = lower.run_id",
+    ],
+    [
+      "an IN subquery",
+      "SELECT id FROM task_runs WHERE id IN (SELECT lower(id) FROM task_runs AS lower)",
+    ],
+  ])("should reject a generated name from %s that matches a table alias", (_, query) => {
+    expect(() => printWithDerivedColumns(query)).toThrow(QueryError);
+    expect(() => printWithDerivedColumns(query)).toThrow(/conflicts with the table alias/);
+  });
+
+  it("should keep generated names that differ from every table alias", () => {
+    const { sql } = printWithDerivedColumns(
+      "SELECT id, lower(status), duration_ms + 1, execution_duration, task, output FROM task_runs AS r"
+    );
+    expect(sql).toContain("lower(status) AS lower");
+    expect(sql).toContain("AS plus");
+    expect(sql).toContain("AS execution_duration");
+    expect(sql).toContain("task_identifier AS task");
+    expect(sql).toContain("output_text AS output");
+  });
+
+  it("should allow an aggregate whose generated name matches the table alias", () => {
+    const { sql } = printQuery("SELECT count() FROM task_runs AS count");
+    expect(sql).toContain("count() AS count");
+  });
+
+  it("should allow a generated name that matches a table alias in another scope", () => {
+    expect(() =>
+      printQuery("SELECT lower FROM (SELECT lower(status) FROM task_runs) AS lower")
+    ).not.toThrow();
   });
 });

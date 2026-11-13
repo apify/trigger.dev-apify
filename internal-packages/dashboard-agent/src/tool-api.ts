@@ -795,7 +795,7 @@ export function buildApiTools(args: {
           );
           if (queryError) {
             return {
-              error: `The chart query failed: ${queryError}. Fix the query — column names are snake_case — and render the chart again.`,
+              error: `The chart query failed: ${queryError}. Fix the query - column names are snake_case - and render the chart again.`,
             };
           }
         }

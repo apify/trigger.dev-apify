@@ -166,6 +166,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     // page stays exactly as before: nothing beyond the activation check runs, and populated
     // projects and development pay none of these reads.
     let deploymentOnboarding: DeploymentOnboardingData | undefined;
+    let githubConnectAvailable = true;
     if (items.length === 0 && environment.type !== "DEVELOPMENT") {
       const ui = await resolveDeploymentOnboardingUi({
         request,
@@ -179,6 +180,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         environmentType: environment.type,
         url: new URL(request.url),
       });
+      githubConnectAvailable = ui.githubConnectAvailable;
       if (ui.showGitHubOnboarding) {
         const repoProject = await prisma.project.findFirst({
           where: { id: project.id },
@@ -215,6 +217,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       usefulLinksPreference,
       projectInitializedAt: initialized?.initializedAt ?? null,
       deploymentOnboarding,
+      githubConnectAvailable,
       devOnboardingEnhanced,
       ...(deploymentOnboarding?.showGitHubOnboarding
         ? { onboardingPollIntervalMs: env.DEPLOYMENTS_AUTORELOAD_POLL_INTERVAL_MS }
@@ -305,15 +308,18 @@ export default function Page() {
     usefulLinksPreference,
     projectInitializedAt,
     deploymentOnboarding,
+    githubConnectAvailable,
     devOnboardingEnhanced,
     onboardingPollIntervalMs,
   } = useTypedLoaderData<typeof loader>();
   const { value, values } = useSearchParams();
 
-  // Live-reload on WORKER_CREATED.
+  // Live-reload on WORKER_CREATED. The stream sends nothing on connect, so reload once
+  // after each reconnect to pick up workers created while it was down.
   const revalidator = useRevalidator();
   const streamedEvents = useEventSource(v3TasksStreamingPath(organization, project, environment), {
     event: "message",
+    onReconnect: () => revalidator.revalidate(),
   });
   useEffect(() => {
     if (streamedEvents !== null) {
@@ -494,7 +500,10 @@ export default function Page() {
                 </MainCenteredContainer>
               ) : (
                 <MainCenteredContainer className="max-w-prose">
-                  <HasNoTasksDeployed environment={environment} />
+                  <HasNoTasksDeployed
+                    environment={environment}
+                    githubConnectAvailable={githubConnectAvailable}
+                  />
                 </MainCenteredContainer>
               )}
             </div>

@@ -7,7 +7,8 @@ import { RunId } from "@trigger.dev/core/v3/isomorphic";
 import { z } from "zod";
 import { prisma } from "~/db.server";
 import { logger } from "~/services/logger.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
+import { keyedWaitpointBudgetResponse } from "~/services/routeBuilders/keyedWaitpointBudget.server";
 import { resolveIdempotencyKeyTTL } from "~/utils/idempotencyKeys.server";
 import { engine } from "~/v3/runEngine.server";
 import { runStore } from "~/v3/runStore.server";
@@ -19,6 +20,11 @@ const { action } = createActionApiRoute(
       runFriendlyId: z.string(),
     }),
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: (params) =>
+        everyResource([{ type: "runs", id: params.runFriendlyId }, { type: "waitpoints" }]),
+    },
   },
   async ({ authentication, body, params }): Promise<TypedResponse<WaitForDurationResponseBody>> => {
     const { runFriendlyId } = params;
@@ -48,17 +54,33 @@ const { action } = createActionApiRoute(
         runId: run.id,
         projectId: authentication.environment.project.id,
         environmentId: authentication.environment.id,
+        // The blocking run's org, so a store DATETIME mint can be considered (dark until the org opts in).
+        organizationId: authentication.environment.organization.id,
         completedAfter: body.date,
         idempotencyKey: body.idempotencyKey,
         idempotencyKeyExpiresAt: idempotencyKeyExpiresAt,
       });
 
-      const _waitResult = await engine.blockRunWithWaitpoint({
+      // A store-format DATETIME waitpoint needs the caller-owned block-operation identity; undefined for a
+      // legacy waitpoint, which ignores it (the dark default).
+      const blockOperation = (await engine.waitpointSystem.isWaitpointStoreEnabled(
+        authentication.environment.organization.id
+      ))
+        ? await engine.waitpointSystem.buildStoreBlockOperation({
+            runId: run.id,
+            waitpointId: waitpoint.id,
+            organizationId: authentication.environment.organization.id,
+          })
+        : undefined;
+
+      const blockInput: Parameters<typeof engine.blockRunWithWaitpoint>[0] = {
         runId: run.id,
         waitpoints: waitpoint.id,
         projectId: authentication.environment.project.id,
         organizationId: authentication.environment.organization.id,
-      });
+      };
+      if (blockOperation !== undefined) blockInput.blockOperation = blockOperation;
+      const _waitResult = await engine.blockRunWithWaitpoint(blockInput);
 
       return json({
         waitUntil: body.date,
@@ -67,6 +89,11 @@ const { action } = createActionApiRoute(
         },
       });
     } catch (error) {
+      // Expected under load and retryable, so it is not reported as an error.
+      const busy = keyedWaitpointBudgetResponse(error, {
+        environmentId: authentication.environment.id,
+      });
+      if (busy) throw busy;
       logger.error("Failed to wait for duration dev", {
         environmentId: authentication.environment.id,
         error,

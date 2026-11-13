@@ -1,4 +1,4 @@
-import { CheckIcon, XMarkIcon } from "@heroicons/react/20/solid";
+import { CheckIcon, CreditCardIcon, XMarkIcon } from "@heroicons/react/20/solid";
 import { ArrowDownCircleIcon, ArrowUpCircleIcon } from "@heroicons/react/24/outline";
 import { Form, useLocation, useNavigation } from "@remix-run/react";
 import { uiComponent } from "@team-plain/ui-components";
@@ -15,7 +15,7 @@ import React, { useEffect, useState } from "react";
 import { z } from "zod";
 import { DefinitionTip } from "~/components/DefinitionTooltip";
 import { Feedback } from "~/components/Feedback";
-import { Button } from "~/components/primitives/Buttons";
+import { Button, LinkButton } from "~/components/primitives/Buttons";
 import { CheckboxWithLabel } from "~/components/primitives/Checkbox";
 import { DateTime } from "~/components/primitives/DateTime";
 import {
@@ -35,9 +35,12 @@ import { redirectWithErrorMessage } from "~/models/message.server";
 import { resolveOrgIdFromSlug } from "~/models/organization.server";
 import { logger } from "~/services/logger.server";
 import { applyPromoCode, bustPromoCreditsCache, setPlan } from "~/services/platform.v3.server";
+import { routeFreePlanToCardStep } from "~/services/freeCardStep.server";
 import { clearPromoCodeCookie, getPromoCodeFromCookie } from "~/services/promoCode.server";
 import { dashboardAction } from "~/services/routeBuilders/dashboardBuilder";
 import { engine } from "~/v3/runEngine.server";
+import { freeCardStepPath } from "~/components/billing/freeCardStepPath";
+import { freePlanButtonLabel } from "~/components/billing/freePlanLabel";
 import { cn } from "~/utils/cn";
 import { sendToPlain } from "~/utils/plain.server";
 import { formatCurrency } from "~/utils/numberFormatter";
@@ -187,9 +190,12 @@ export const action = dashboardAction(
       },
     });
 
-    return result;
+    if (form.type !== "free") return result;
+    return routeFreePlanToCardStep(result, organization);
   }
 );
+
+const HIPAA_ADD_ON_PRICE = "$500/month";
 
 const pricingDefinitions = {
   usage: {
@@ -277,6 +283,8 @@ type PricingPlansProps = {
   organizationSlug: string;
   hasPromotedPlan: boolean;
   periodEnd: Date;
+  /** A Free org whose deploys wait on a verified card: its column asks for the card. */
+  awaitsCardVerification?: boolean;
 };
 
 export function PricingPlans({
@@ -286,6 +294,7 @@ export function PricingPlans({
   organizationSlug,
   hasPromotedPlan,
   periodEnd,
+  awaitsCardVerification = false,
 }: PricingPlansProps) {
   return (
     <div className="flex w-full flex-col">
@@ -295,6 +304,7 @@ export function PricingPlans({
           subscription={subscription}
           organizationSlug={organizationSlug}
           periodEnd={periodEnd}
+          awaitsCardVerification={awaitsCardVerification}
         />
         <TierHobby
           plan={plans.hobby}
@@ -347,11 +357,13 @@ export function TierFree({
   subscription,
   organizationSlug,
   periodEnd,
+  awaitsCardVerification = false,
 }: {
   plan: FreePlanDefinition;
   subscription?: SubscriptionResult;
   organizationSlug: string;
   periodEnd: Date;
+  awaitsCardVerification?: boolean;
 }) {
   const location = useLocation();
   const navigation = useNavigation();
@@ -362,10 +374,11 @@ export function TierFree({
   // Randomised once per mount so list position doesn't bias which reasons get picked.
   const [shuffledReasons] = useState(() => shuffleArray(DOWNGRADE_REASONS));
 
+  // Keyed on the plan, not the object: the billing page revalidates while a change is applying.
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setIsDialogOpen(false);
-  }, [subscription]);
+  }, [subscription?.plan?.code, subscription?.canceledAt]);
 
   return (
     <TierContainer>
@@ -442,6 +455,17 @@ export function TierFree({
             </Form>
           </DialogContent>
         </Dialog>
+      ) : awaitsCardVerification && subscription?.plan?.type === "free" ? (
+        <div className="my-6">
+          <LinkButton
+            variant="primary/large"
+            fullWidth
+            LeadingIcon={CreditCardIcon}
+            to={freeCardStepPath({ slug: organizationSlug }, "billing")}
+          >
+            Verify card
+          </LinkButton>
+        </div>
       ) : (
         <Form action={formAction} method="post" id="subscribe-verified" className="my-6">
           <input type="hidden" name="type" value="free" />
@@ -461,13 +485,7 @@ export function TierFree({
               isLoading && navigation.formData?.get("planCode") === null ? Spinner : undefined
             }
           >
-            {subscription?.plan === undefined
-              ? "Select plan"
-              : subscription.plan.type === "free"
-                ? "Current plan"
-                : subscription.canceledAt !== undefined
-                  ? "Current plan"
-                  : "Select plan"}
+            {freePlanButtonLabel(subscription)}
           </Button>
         </Form>
       )}
@@ -522,10 +540,11 @@ export function TierHobby({
   const isLoading = navigation.formAction === formAction;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
+  // Keyed on the plan, not the object: the billing page revalidates while a change is applying.
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setIsDialogOpen(false);
-  }, [subscription]);
+  }, [subscription?.plan?.code, subscription?.canceledAt]);
 
   return (
     <TierContainer isHighlighted={isHighlighted}>
@@ -633,7 +652,7 @@ export function TierHobby({
         <SupportLevel limits={plan.limits} />
         <Alerts limits={plan.limits} />
         <RealtimeConcurrency limits={plan.limits} />
-        <HIPAAAddOn>
+        <HIPAAAddOn price={HIPAA_ADD_ON_PRICE}>
           <Feedback
             defaultValue="hipaa"
             button={
@@ -663,10 +682,11 @@ export function TierPro({
   const isLoading = navigation.formAction === formAction;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
+  // Keyed on the plan, not the object: the billing page revalidates while a change is applying.
   useEffect(() => {
     // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setIsDialogOpen(false);
-  }, [subscription]);
+  }, [subscription?.plan?.code, subscription?.canceledAt]);
 
   return (
     <TierContainer>
@@ -786,7 +806,7 @@ export function TierPro({
         <RealtimeConcurrency limits={plan.limits}>
           {pricingDefinitions.additionalRealtimeConnections.content}
         </RealtimeConcurrency>
-        <HIPAAAddOn>
+        <HIPAAAddOn price={HIPAA_ADD_ON_PRICE}>
           <Feedback
             defaultValue="hipaa"
             button={
@@ -1177,9 +1197,11 @@ function QueryPeriod({ limits }: { limits: Limits }) {
 }
 
 function HIPAAAddOn({
+  price,
   children,
   checkedColor = "primary",
 }: {
+  price?: string;
   children?: React.ReactNode;
   checkedColor?: "primary" | "bright";
 }) {
@@ -1195,7 +1217,13 @@ function HIPAAAddOn({
           </DefinitionTip>{" "}
           add-on
         </div>
-        {children && <span className="text-xs text-text-dimmed">{children}</span>}
+        {(price || children) && (
+          <span className="text-xs text-text-dimmed">
+            {price}
+            {price && children && " · "}
+            {children}
+          </span>
+        )}
       </div>
     </FeatureItem>
   );

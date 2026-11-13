@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@aws-sdk/client-ecr": "^3.839.0",
-    "@internal/compute": "workspace:*",
     "@kubernetes/client-node": "^1.0.0",
     "@trigger.dev/core": "workspace:*",
     "dockerode": "^4.0.6",
@@ -25,11 +24,12 @@
     "prom-client": "^15.1.0",
     "socket.io": "4.8.3",
     "std-env": "^3.8.0",
+    "undici": "^7.30.1",
     "zod": "4.5.4"
   },
   "devDependencies": {
     "@internal/testcontainers": "workspace:*",
     "@types/dockerode": "^3.3.33",
-    "socket.io-client": "4.7.5"
+    "socket.io-client": "4.8.4"
   }
 }

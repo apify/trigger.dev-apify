@@ -433,24 +433,28 @@ describe("KeyProducer", () => {
     );
   });
 
-  it("produces ckVtime keys from a CK variant queue name", () => {
+  it("queueConcurrencyKeyLimitKey puts the key after its own part, so no key value can collide", () => {
     const keyProducer = new RunQueueFullKeyProducer();
-    const q = "{org:o1}:proj:p1:env:e1:queue:task/my-task:ck:tenant-a";
-    expect(keyProducer.ckVtimeKeyFromQueue(q)).toBe(
-      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtime"
+    const env = {
+      id: "e1234",
+      type: "DEVELOPMENT" as const,
+      project: { id: "p1234" },
+      organization: { id: "o1234" },
+    };
+    const base = keyProducer.queueKey(env, "task/my-task");
+    const variant = keyProducer.queueKey(env, "task/my-task", "tenant-a");
+    expect(keyProducer.queueConcurrencyKeyLimitKey(env, "task/my-task", "tenant-a")).toBe(
+      `${base}:ckLimit:tenant-a`
     );
-    expect(keyProducer.ckVtimeFloorKeyFromQueue(q)).toBe(
-      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtimeFloor"
+    expect(keyProducer.queueConcurrencyKeyLimitKeyFromQueue(variant)).toBe(
+      `${base}:ckLimit:tenant-a`
     );
-    expect(keyProducer.ckVtimeIdleKeyFromQueue(q)).toBe(
-      "{org:o1}:proj:p1:env:e1:queue:task/my-task:ckVtimeIdle"
+    const colonKey = keyProducer.queueKey(env, "task/my-task", "a:ck:b");
+    expect(keyProducer.queueConcurrencyKeyLimitKeyFromQueue(colonKey)).toBe(
+      `${base}:ckLimit:a:ck:b`
     );
-    // ck wildcard and base-queue inputs normalise the same way
-    expect(keyProducer.ckVtimeKeyFromQueue(q.replace(":ck:tenant-a", ":ck:*"))).toBe(
-      keyProducer.ckVtimeKeyFromQueue(q)
-    );
-    expect(keyProducer.ckVtimeIdleKeyFromQueue(q.replace(":ck:tenant-a", ":ck:*"))).toBe(
-      keyProducer.ckVtimeIdleKeyFromQueue(q)
+    expect(keyProducer.queueConcurrencyKeyLimitKey(env, "task/my-task", "a")).not.toBe(
+      keyProducer.queueKey(env, "task/my-task", "a:ckLimit")
     );
   });
 });

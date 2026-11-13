@@ -12,10 +12,9 @@ import {
 } from "drizzle-orm/pg-core";
 import { dashboardAgentSchema } from "./schema-base.js";
 
-// drizzle-kit reads this file, so the watch tables are re-exported here: the
-// generated SQL and the public surface stay exactly as they were.
 export * from "./schema-base.js";
-export * from "./watch-schema.js";
+
+export type ChatKind = "alert_creation";
 
 /**
  * Scoped to org + user. `organizationId` and `userId` are main-DB ids with no FK:
@@ -60,6 +59,8 @@ export const chats = dashboardAgentSchema.table(
      * user while they act as `userId`. Null for a chat the owner started.
      */
     createdByUserId: text("created_by_user_id"),
+    /** Null for a plain chat. */
+    kind: text("kind").$type<ChatKind>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

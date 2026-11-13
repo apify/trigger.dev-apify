@@ -11,6 +11,7 @@ import {
   CheckpointInput,
   ExecutionResult,
 } from "../../schemas/runEngine.js";
+import { RunTokenHeartbeatReport } from "../runTokenRefresh.js";
 
 export const WorkerApiHeartbeatRequestBody = z.object({
   cpu: z.object({
@@ -42,8 +43,14 @@ export const WorkerApiSuspendRunRequestBody = discriminatedUnion("success", [
 ]);
 export type WorkerApiSuspendRunRequestBody = z.infer<typeof WorkerApiSuspendRunRequestBody>;
 
+/**
+ * `discarded` is the platform's final answer that it did not store the checkpoint. It rides on
+ * `ok: true` so that a caller unaware of it still treats the suspend as delivered.
+ */
 export const WorkerApiSuspendRunResponseBody = z.object({
   ok: z.literal(true),
+  environmentId: z.string().optional(),
+  discarded: z.object({ error: z.string() }).optional(),
 });
 export type WorkerApiSuspendRunResponseBody = z.infer<typeof WorkerApiSuspendRunResponseBody>;
 
@@ -53,7 +60,8 @@ export type WorkerApiContinueRunExecutionRequestBody = z.infer<
 >;
 
 export const WorkerApiRunRestoreOutcomeRequestBody = z.object({
-  outcome: z.enum(["requeue", "fail"]),
+  // `fallback` requeues a run that has not started onto the worker queue the platform falls back to.
+  outcome: z.enum(["requeue", "fail", "fallback"]),
   reason: z.string().max(256),
   // Matches the cap the engine applies to a run error's message.
   message: z
@@ -71,6 +79,18 @@ export const WorkerApiRunRestoreOutcomeResponseBody = z.object({
 export type WorkerApiRunRestoreOutcomeResponseBody = z.infer<
   typeof WorkerApiRunRestoreOutcomeResponseBody
 >;
+
+export const WorkerApiRunReleaseRequestBody = z.object({
+  reason: z.string().min(1).max(256),
+});
+export type WorkerApiRunReleaseRequestBody = z.infer<typeof WorkerApiRunReleaseRequestBody>;
+
+export const WorkerApiRunReleaseResponseBody = z.object({
+  ok: z.literal(true),
+  // False when the run could not be requeued, as when its dequeue budget is used up, so it failed.
+  requeued: z.boolean(),
+});
+export type WorkerApiRunReleaseResponseBody = z.infer<typeof WorkerApiRunReleaseResponseBody>;
 
 export const WorkerApiConnectRequestBody = z.object({
   metadata: z.record(z.string(), z.any()),
@@ -109,16 +129,25 @@ export type WorkerApiDequeueResponseBody = z.infer<typeof WorkerApiDequeueRespon
 export const WorkerApiRunHeartbeatRequestBody = z.object({
   cpu: z.number().optional(),
   memory: z.number().optional(),
+  // A malformed report must never fail the heartbeat itself.
+  runToken: RunTokenHeartbeatReport.optional().catch(undefined),
 });
 export type WorkerApiRunHeartbeatRequestBody = z.infer<typeof WorkerApiRunHeartbeatRequestBody>;
 
 export const WorkerApiRunHeartbeatResponseBody = z.object({
   ok: z.literal(true),
+  /** A replacement TRIGGER_RUN_TOKEN, only when the runner's reported token is due for refresh. */
+  runToken: z.string().optional(),
 });
 export type WorkerApiRunHeartbeatResponseBody = z.infer<typeof WorkerApiRunHeartbeatResponseBody>;
 
 export const WorkerApiRunAttemptStartRequestBody = z.object({
   isWarmStart: z.boolean().optional(),
+  // Set by the supervisor, not the runner. A value this webapp cannot accept drops the stamp, never the attempt.
+  workerCell: z.string().max(64).optional().catch(undefined),
+  workerLane: z.string().max(32).optional().catch(undefined),
+  /** Set by runners that report and install run-token refreshes, so the attempt can get a short-lived token. */
+  supportsRunTokenRefresh: z.boolean().optional().catch(undefined),
 });
 export type WorkerApiRunAttemptStartRequestBody = z.infer<
   typeof WorkerApiRunAttemptStartRequestBody
@@ -135,6 +164,8 @@ export type WorkerApiRunAttemptStartResponseBody = z.infer<
 
 export const WorkerApiRunAttemptCompleteRequestBody = z.object({
   completion: TaskRunExecutionResult,
+  /** Queue any retry for a new runner instead of retrying on this one, e.g. when it was killed. */
+  forceRequeue: z.boolean().optional(),
 });
 export type WorkerApiRunAttemptCompleteRequestBody = z.infer<
   typeof WorkerApiRunAttemptCompleteRequestBody
