@@ -191,13 +191,13 @@ function phaseEventState(status: TimelinePhase["status"]): TimelineEventState {
 // `splitTrailingParenthetical` to pull into the info tooltip.
 const TRAILING_DURATION = /\s—\s\d+(?:\.\d+)?\s?(?:ms|min|h|m|s)\b(?=\s*\(|$)/;
 
-export function dedupeDurationSuffix(label: string): string {
+function dedupeDurationSuffix(label: string): string {
   return label.replace(TRAILING_DURATION, "");
 }
 
 // A trailing "(...)" is extra context, not the title — e.g. "Dequeued (54 ms queue wait)".
 // It moves into the info tooltip instead, so the title stays short and scannable.
-export function splitTrailingParenthetical(label: string): { display: string; extra?: string } {
+function splitTrailingParenthetical(label: string): { display: string; extra?: string } {
   const match = label.match(/\s*\(([^()]*)\)\s*$/);
   if (!match) return { display: label };
   return { display: label.slice(0, match.index).trimEnd(), extra: match[1].trim() };
@@ -380,7 +380,6 @@ export function InvestigationCard({
   resolveUri,
   onIntent,
   answered = false,
-  watchEnabled = false,
 }: {
   block: InvestigationBlock;
   defaultExpanded?: boolean;
@@ -388,8 +387,6 @@ export function InvestigationCard({
   onIntent?: (intent: AgentIntent) => void;
   /** The turn kept answering after this card, so "keep digging" has nothing to ask for. */
   answered?: boolean;
-  /** Withholds the card's own watch action while watch functionality is behind its flag. */
-  watchEnabled?: boolean;
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const investigation = block.investigation;
@@ -398,7 +395,7 @@ export function InvestigationCard({
   const answeredActions = (block.capabilities?.actions ?? []).filter(
     (action) => !answered || action.kind !== "ask_follow_up"
   );
-  const cardActions = watchEnabled ? answeredActions : withoutWatchActions(answeredActions);
+  const cardActions = withoutWatchActions(answeredActions);
 
   return (
     <AgentCard>

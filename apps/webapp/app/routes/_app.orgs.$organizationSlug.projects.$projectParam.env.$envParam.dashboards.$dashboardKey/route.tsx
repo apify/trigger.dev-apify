@@ -189,12 +189,14 @@ export default function Page() {
             possibleOperations={possibleOperations}
             possibleProviders={possibleProviders}
             filterAccessories={
-              <CreateDashboardPageButton
-                organization={organization}
-                project={project}
-                environment={environment}
-                shortcut={{ key: "n" }}
-              />
+              <div className="flex items-center gap-x-1.5">
+                <CreateDashboardPageButton
+                  organization={organization}
+                  project={project}
+                  environment={environment}
+                  shortcut={{ key: "n" }}
+                />
+              </div>
             }
           />
         </div>

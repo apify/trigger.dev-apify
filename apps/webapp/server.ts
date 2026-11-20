@@ -3,16 +3,23 @@ import "./sentry.server";
 import { createRequestHandler } from "@remix-run/express";
 import compression from "compression";
 import type { Server as EngineServer } from "engine.io";
-import express, { type RequestHandler } from "express";
+import express, { type ErrorRequestHandler, type RequestHandler } from "express";
 import morgan from "morgan";
 import { nanoid } from "nanoid";
 import path from "path";
+import { setSourceMapsSupport } from "node:module";
 import { pathToFileURL } from "node:url";
 import type { Server as IoServer } from "socket.io";
-import type { WebSocketServer } from "ws";
 import type { RateLimitMiddleware } from "~/services/apiRateLimit.server";
 import { type RunWithHttpContextFunction } from "~/services/httpAsyncStorage.server";
+import { createHostHeaderGuard } from "./app/utils/hostHeader";
 import { getRouterPath, pathHasPrefix, sanitizeHttpUrl } from "./app/utils/sanitizeHttpUrl";
+import { blockOtlpIngestRoutes, otlpIngestRoutesDisabled } from "./app/utils/otlpIngestRoutes";
+import {
+  createApiOnlyServiceMiddleware,
+  parseApiOnlyServiceMode,
+  servesStaticFiles,
+} from "./app/utils/apiOnlyService";
 import cluster from "node:cluster";
 import os from "node:os";
 
@@ -24,6 +31,28 @@ const WORKERS =
 // LB pipelining a request onto a connection Node has already closed (→ 502).
 const HTTP_KEEPALIVE_TIMEOUT_MS =
   Number.parseInt(process.env.HTTP_KEEPALIVE_TIMEOUT_MS || "", 10) || 65 * 1000;
+const HEALTHCHECK_PORT = parseHealthcheckPort(process.env.HEALTHCHECK_PORT);
+
+function parseHealthcheckPort(value: string | undefined) {
+  if (!value) return undefined;
+
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid HEALTHCHECK_PORT: ${value}`);
+  }
+  return port;
+}
+
+function createHealthApp(healthcheckHandler: RequestHandler) {
+  const app = express();
+  app.disable("x-powered-by");
+  app.use(createHostHeaderGuard());
+  app.get("/healthcheck", healthcheckHandler);
+  app.use((_req, res) => {
+    res.status(404).send("Not Found");
+  });
+  return app;
+}
 
 function forkWorkers() {
   for (let i = 0; i < WORKERS; i++) {
@@ -109,6 +138,9 @@ if (ENABLE_CLUSTER && cluster.isPrimary) {
 async function startServer() {
   const app = express();
 
+  // First, so no path-matched middleware ever sees a path different from the one Remix routes.
+  app.use(createHostHeaderGuard());
+
   if (process.env.DISABLE_COMPRESSION !== "1") {
     app.use(compression());
   }
@@ -117,6 +149,10 @@ async function startServer() {
   app.disable("x-powered-by");
 
   const MODE = process.env.NODE_ENV;
+
+  if (MODE === "development") {
+    setSourceMapsSupport(true, { nodeModules: false, generatedCode: true });
+  }
 
   // In development, Vite serves assets (and handles HMR) via middleware.
   // Only NODE_ENV=development boots Vite — scripts that run the built server
@@ -129,8 +165,22 @@ async function startServer() {
       : undefined;
 
   if (viteDevServer) {
+    Reflect.deleteProperty(Error, "prepareStackTrace");
+  }
+
+  const apiOnlyServiceMode = parseApiOnlyServiceMode(process.env.API_ONLY_SERVICE_MODE);
+  if (apiOnlyServiceMode) {
+    app.use(
+      createApiOnlyServiceMiddleware({
+        mode: apiOnlyServiceMode,
+        appOrigin: process.env.APP_ORIGIN,
+      })
+    );
+  }
+
+  if (viteDevServer) {
     app.use(viteDevServer.middlewares);
-  } else {
+  } else if (servesStaticFiles(apiOnlyServiceMode)) {
     // Vite fingerprints its assets so we can cache forever.
     app.use("/assets", express.static("build/client/assets", { immutable: true, maxAge: "1y" }));
     // Stale clients can request an old hashed asset; hard-404 instead of falling
@@ -159,16 +209,17 @@ async function startServer() {
     ? `node webapp-worker-${cluster.isWorker ? cluster.worker?.id : "solo"}`
     : "node webapp-server";
 
-  const loadBuild = () => {
-    if (viteDevServer) {
-      return viteDevServer.ssrLoadModule("virtual:remix/server-build");
-    }
-    return dynamicImport(
-      pathToFileURL(path.join(process.cwd(), "build", "server", "index.mjs")).href
-    );
+  const loadBuild = async () => {
+    const build = viteDevServer
+      ? await viteDevServer.ssrLoadModule("virtual:remix/server-build")
+      : await dynamicImport(
+          pathToFileURL(path.join(process.cwd(), "build", "server", "index.mjs")).href
+        );
+    build.entry.module.configureSdkDefaultAttribution(build.routes);
+    return build;
   };
 
-  // Boots the entry.server singletons (socket.io, wss, rate limiters).
+  // Boots the entry.server singletons (socket.io, rate limiters).
   const build = await loadBuild();
 
   const port = process.env.REMIX_APP_PORT || process.env.PORT || 3000;
@@ -184,16 +235,20 @@ async function startServer() {
     });
 
     const socketIo: { io: IoServer } | undefined = build.entry.module.socketIo;
-    const wss: WebSocketServer | undefined = build.entry.module.wss;
     const apiRateLimiter: RateLimitMiddleware = build.entry.module.apiRateLimiter;
     const deploymentRateLimiter: RateLimitMiddleware = build.entry.module.deploymentRateLimiter;
     const engineRateLimiter: RateLimitMiddleware = build.entry.module.engineRateLimiter;
     const otlpRateLimiter: RequestHandler = build.entry.module.otlpRateLimiter;
     const runWithHttpContext: RunWithHttpContextFunction = build.entry.module.runWithHttpContext;
     const tenantContextMiddleware: RequestHandler = build.entry.module.tenantContextMiddleware;
-    const dashboardAgentBodyCap: RequestHandler = build.entry.module.dashboardAgentBodyCap;
-    const webhookIngressIpRateLimiter: RequestHandler =
-      build.entry.module.webhookIngressIpRateLimiter;
+    const ingressBodyCap: RequestHandler = build.entry.module.createIngressBodyCapMiddleware(
+      build.routes
+    );
+    const ignoreRefusedBodyErrors: ErrorRequestHandler = build.entry.module.ignoreRefusedBodyErrors;
+    const flushAuditLogs: () => Promise<void> = build.entry.module.flushAuditLogs;
+    const mcpRouter: RequestHandler | undefined = build.entry.module.mcpRouter;
+    const mcpProtectedResource: RequestHandler | undefined =
+      build.entry.module.mcpProtectedResource;
 
     app.use((req, res, next) => {
       // helpful headers:
@@ -228,6 +283,7 @@ async function startServer() {
           host: req.hostname,
           method: req.method,
           abortController,
+          closeConnection: () => res.destroy(),
         },
         next
       );
@@ -246,17 +302,28 @@ async function startServer() {
         });
       }
 
+      if (otlpIngestRoutesDisabled(process.env)) {
+        app.use(blockOtlpIngestRoutes);
+      }
+
+      // MCP authenticates before its own rate limit so a bare 401 keeps WWW-Authenticate.
+      if (mcpRouter && mcpProtectedResource) {
+        app.get(
+          ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"],
+          mcpProtectedResource
+        );
+        app.use("/mcp", mcpRouter);
+      }
+
       app.use(apiRateLimiter);
       app.use(deploymentRateLimiter);
       app.use(engineRateLimiter);
       app.use(otlpRateLimiter);
-      app.use(webhookIngressIpRateLimiter);
 
       app.use(tenantContextMiddleware);
 
-      // Before the Remix handler: the agent's chat body is refused while it streams, so a
-      // route never buffers one that was already too large.
-      app.use(dashboardAgentBodyCap);
+      // Before the Remix handler: a body is measured against its limit while it streams.
+      app.use(ingressBodyCap);
 
       app.all(
         "*",
@@ -266,6 +333,8 @@ async function startServer() {
           mode: MODE,
         })
       );
+
+      app.use(ignoreRefusedBodyErrors);
     } else {
       // we need to do the health check here at /healthcheck — forward
       // to the Remix handler so the loader's readiness checks (DB ping,
@@ -295,18 +364,33 @@ async function startServer() {
     // headers will instead be limited by the maxHeaderSize
     server.maxHeadersCount = 0;
 
+    const healthServer = HEALTHCHECK_PORT
+      ? createHealthApp(
+          // @ts-ignore
+          createRequestHandler({
+            build: viteDevServer ? loadBuild : build,
+            mode: MODE,
+          })
+        ).listen(HEALTHCHECK_PORT, () => {
+          console.log(`✅ healthcheck ready: http://localhost:${HEALTHCHECK_PORT}/healthcheck`);
+        })
+      : undefined;
+
     let didCloseServer = false;
 
     function closeServer(signal: NodeJS.Signals) {
       if (didCloseServer) return;
       didCloseServer = true;
 
+      healthServer?.close();
       server.close((err) => {
         if (err) {
           console.error("Error closing express server:", err);
         } else {
           console.log("Express server closed gracefully.");
         }
+        // The requests still running at the signal have finished: hand their audit events over.
+        void flushAuditLogs();
       });
       // Dev-only: release Vite's file watchers and HMR websocket
       viteDevServer?.close();
@@ -336,19 +420,8 @@ async function startServer() {
           return;
         }
 
-        if (pathname !== "/ws") {
-          console.warn(
-            `Rejected upgrade request: path must be /ws, got ${pathname ?? "<invalid>"}`
-          );
-          socket.destroy();
-          return;
-        }
-
-        console.log(`Client connected, upgrading their connection...`);
-
-        wss?.handleUpgrade(req, socket, head, (ws) => {
-          wss?.emit("connection", ws, req);
-        });
+        console.warn(`Rejected upgrade request: unsupported path ${pathname ?? "<invalid>"}`);
+        socket.destroy();
       } catch (error) {
         console.error("Connection upgrade handler failed:", error);
         socket.destroy();

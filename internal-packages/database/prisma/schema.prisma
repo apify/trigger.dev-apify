@@ -84,6 +84,7 @@ model User {
   metricsDashboards                MetricsDashboard[]
   platformNotifications            PlatformNotification[]
   platformNotificationInteractions PlatformNotificationInteraction[]
+  environmentVariableIgnores       EnvironmentVariableIgnore[]
 }
 
 model MfaBackupCode {
@@ -129,8 +130,28 @@ model AuthorizationCode {
   personalAccessToken   PersonalAccessToken? @relation(fields: [personalAccessTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   personalAccessTokenId String?
 
+  /// Client IP of the request that minted the code, compared with the approving browser's IP. Deleted with the code once it expires.
+  requesterIp String?
+  /// S256 PKCE challenge from the client that minted the code. Null for codes minted by CLIs that predate it.
+  codeChallenge    String?
+  /// Loopback port the approving browser is redirected to with the approval code. Null means the user pastes it.
+  callbackPort     Int?
+  /// sha256 of the approval code, which only the approving browser ever sees.
+  approvalCodeHash String?
+
+  oauthClient       OAuthClient? @relation(fields: [oauthClientId], references: [id], onDelete: Cascade)
+  oauthClientId     String?
+  redirectUri       String?
+  scope             String[]     @default([])
+  resource          String?
+  approvedByUserId  String?
+  /// The user who started the OAuth authorization. Only they can approve it.
+  requestedByUserId String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  @@index([oauthClientId])
 }
 
 // Used by User's to perform API actions
@@ -155,12 +176,84 @@ model PersonalAccessToken {
   revokedAt      DateTime?
   lastAccessedAt DateTime?
 
+  /// After this the token no longer authenticates. Null means it never expires.
+  expiresAt DateTime?
+
+  /// Set on CLI login tokens: they stop authenticating this many seconds after their last use
+  /// (or creation, if never used). Null means no idle limit.
+  idleTimeoutSeconds   Int?
+  /// When the "about to expire" email was sent. Set before sending, so it's sent at most once.
+  expiryReminderSentAt DateTime?
+  /// When the "has expired" email was sent. Set before sending, so it's sent at most once.
+  expiredNoticeSentAt  DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   authorizationCodes AuthorizationCode[]
 
+  oauthClient        OAuthClient?        @relation(fields: [oauthClientId], references: [id], onDelete: Restrict)
+  oauthClientId      String?
+  oauthRefreshTokens OAuthRefreshToken[]
+
   @@index([userId])
+  @@index([oauthClientId, userId])
+}
+
+enum OAuthClientKind {
+  PREREGISTERED
+  CIMD
+  DCR
+}
+
+model OAuthClient {
+  id String @id @default(cuid())
+
+  kind     OAuthClientKind
+  clientId String          @unique
+
+  metadataUrl      String?
+  displayName      String?
+  selfReportedName String?
+  redirectUris     String[]
+  dedupeKey        String?  @unique
+
+  metadataExpiresAt DateTime?
+  lastUsedAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  authorizationCodes   AuthorizationCode[]
+  personalAccessTokens PersonalAccessToken[]
+  refreshTokens        OAuthRefreshToken[]
+
+  @@index([kind, lastUsedAt])
+}
+
+model OAuthRefreshToken {
+  id String @id @default(cuid())
+
+  hashedToken String @unique
+
+  personalAccessToken   PersonalAccessToken @relation(fields: [personalAccessTokenId], references: [id], onDelete: Cascade)
+  personalAccessTokenId String
+
+  oauthClient   OAuthClient @relation(fields: [oauthClientId], references: [id], onDelete: Cascade)
+  oauthClientId String
+
+  scope    String[]
+  resource String
+
+  usedAt       DateTime?
+  replacedById String?
+
+  idleExpiresAt DateTime
+  createdAt     DateTime @default(now())
+
+  @@index([personalAccessTokenId])
+  @@index([oauthClientId])
+  @@index([idleExpiresAt])
 }
 
 enum OrganizationAccessTokenType {
@@ -274,6 +367,12 @@ model Organization {
   supportAccessModeUpdatedById String?
 
   supportAccessRequests SupportAccessRequest[]
+
+  /// When true, members without MFA are locked out of the dashboard and CLI until they set it up.
+  mfaRequired            Boolean  @default(false)
+  /// Dashboard actions that need an MFA check within the step-up window (see MfaStepUpAction in the webapp).
+  mfaStepUpActions       String[] @default([])
+  mfaStepUpWindowMinutes Int      @default(5)
 }
 
 model OrgMember {
@@ -286,6 +385,11 @@ model OrgMember {
   userId String
 
   role OrgMemberRole @default(MEMBER)
+
+  /// Who invited them (a User id, kept if that user is deleted). Null if not invited or joined before this was recorded.
+  invitedById String?
+  /// How they joined: created, invite, sso_jit, directory_sync or manual. Null if joined before this was recorded.
+  joinMethod  String?
 
   createdAt    DateTime             @default(now())
   updatedAt    DateTime             @updatedAt
@@ -329,6 +433,9 @@ model OrgMemberInvite {
 }
 
 model RuntimeEnvironment {
+  encryptionPolicy EnvironmentEncryptionPolicy?
+  encryptionKeys   EnvironmentEncryptionKey[]
+
   id                 String    @id @default(cuid())
   slug               String
   apiKey             String    @unique
@@ -396,6 +503,7 @@ model RuntimeEnvironment {
   taskRuns                   TaskRun[]
   taskQueues                 TaskQueue[]
   environmentVariableValues  EnvironmentVariableValue[]
+  environmentVariableIgnores EnvironmentVariableIgnore[]
   checkpoints                Checkpoint[]
   workerDeployments          WorkerDeployment[]
   workerDeploymentPromotions WorkerDeploymentPromotion[]
@@ -420,6 +528,7 @@ model RuntimeEnvironment {
   taskIdentifiers         TaskIdentifier[]
   apiKeys                 ApiKey[]
   revokedApiKeys          RevokedApiKey[]
+  trustedDeployGrant      TrustedDeployEnvironment?
 
   // A partial unique index also enforces one STAGING/PREVIEW root per project and type.
   // It is defined in SQL because Prisma does not support partial indexes in the schema.
@@ -430,11 +539,19 @@ model RuntimeEnvironment {
   @@index([organizationId])
 }
 
+enum ApiKeyIssuer {
+  USER
+  SYSTEM
+}
+
 model ApiKey {
   id       String @id @default(cuid())
   name     String
   keyHash  String @unique @map("key_hash")
   lastFour String @map("last_four")
+
+  /// Optional one-line note the creator adds to say what the key is for.
+  description String?
 
   runtimeEnvironment   RuntimeEnvironment @relation(fields: [runtimeEnvironmentId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   runtimeEnvironmentId String             @map("runtime_environment_id")
@@ -442,16 +559,23 @@ model ApiKey {
   createdBy       User?   @relation(fields: [createdByUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   createdByUserId String? @map("created_by_user_id")
 
+  issuedBy ApiKeyIssuer @default(USER) @map("issued_by")
+
   presetId String?  @map("preset_id")
   scopes   String[]
 
+  /// CIDR ranges this key may be used from. Empty means any IP.
+  allowedIpRanges String[] @default([]) @map("allowed_ip_ranges")
+
   lastUsedAt DateTime? @map("last_used_at")
+  lastUsedIp String?   @map("last_used_ip")
   revokedAt  DateTime? @map("revoked_at")
   expiresAt  DateTime? @map("expires_at")
   updatedAt  DateTime  @updatedAt @map("updated_at")
   createdAt  DateTime  @default(now()) @map("created_at")
 
   @@index([runtimeEnvironmentId, revokedAt, createdAt(sort: Desc)])
+  @@index([runtimeEnvironmentId, issuedBy, revokedAt, createdAt(sort: Desc)], map: "api_keys_env_issued_by_revoked_at_created_at_idx")
   @@map("api_keys")
 }
 
@@ -478,6 +602,7 @@ enum RuntimeEnvironmentType {
 
 enum EnvironmentPauseSource {
   BILLING_LIMIT
+  ADMIN_BAN
 }
 
 model Project {
@@ -521,6 +646,7 @@ model Project {
   runTags                        TaskRunTag[]
   taskQueues                     TaskQueue[]
   environmentVariables           EnvironmentVariable[]
+  environmentVariableIgnores     EnvironmentVariableIgnore[]
   checkpoints                    Checkpoint[]
   WorkerDeployment               WorkerDeployment[]
   CheckpointRestoreEvent         CheckpointRestoreEvent[]
@@ -535,6 +661,7 @@ model Project {
   taskRunCheckpoints             TaskRunCheckpoint[]
   waitpointTags                  WaitpointTag[]
   connectedGithubRepository      ConnectedGithubRepository?
+  trustedDeployRepository        TrustedDeployRepository?
   organizationProjectIntegration OrganizationProjectIntegration[]
   customerQueries                CustomerQuery[]
   playgroundConversations        PlaygroundConversation[]
@@ -553,6 +680,36 @@ model Project {
 enum ProjectVersion {
   V2
   V3
+}
+
+enum EnvironmentKeyWrappingProvider {
+  PLATFORM_KEYRING
+  AWS_KMS
+}
+
+model EnvironmentEncryptionPolicy {
+  environmentId        String                         @id
+  environment          RuntimeEnvironment             @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  revision             Int                            @default(0)
+  wrappingProvider     EnvironmentKeyWrappingProvider?
+  wrappingKeyReference String?
+  activeKeyId          String?
+  activeKey            EnvironmentEncryptionKey?      @relation("activeEnvironmentKey", fields: [activeKeyId, environmentId], references: [id, environmentId], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model EnvironmentEncryptionKey {
+  id                   String                         @id @default(cuid())
+  environmentId        String
+  environment          RuntimeEnvironment             @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  wrappedKey           Json
+  wrappingProvider     EnvironmentKeyWrappingProvider
+  wrappingKeyReference String
+  revision             Int                            @default(0)
+  createdAt            DateTime                       @default(now())
+  activeFor            EnvironmentEncryptionPolicy[]  @relation("activeEnvironmentKey")
+
+  @@unique([id, environmentId])
+  @@index([environmentId])
 }
 
 model SecretReference {
@@ -582,6 +739,41 @@ model SecretStore {
   updatedAt DateTime @updatedAt
 
   @@index([key(ops: raw("text_pattern_ops"))], type: BTree)
+}
+
+enum OidcSigningKeyStatus {
+  STAGED
+  ACTIVE
+  RETIRED
+}
+
+/// Each purpose is a separate key set with its own issuer, rotation and publication.
+enum OidcSigningKeyPurpose {
+  /// Tokens for external relying parties; public keys are served at the issuer's JWKS URL.
+  EXTERNAL_OIDC
+  /// Per-attempt run tokens verified only by the platform; public keys are never served.
+  INTERNAL_RUN
+}
+
+model OidcSigningKey {
+  id      String                @id @default(cuid())
+  kid     String                @unique
+  purpose OidcSigningKeyPurpose @default(EXTERNAL_OIDC)
+  /// At most one STAGED and one ACTIVE key per purpose: enforced by a partial unique index in the migration.
+  status  OidcSigningKeyStatus
+
+  publicJwk   Json
+  readyAt     DateTime
+  publicUntil DateTime?
+
+  generatedByUserId String
+  activatedAt       DateTime?
+  activatedByUserId String?
+  retiredAt         DateTime?
+  retiredByUserId   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model DataMigration {
@@ -781,6 +973,10 @@ model BackgroundWorkerTask {
   /// AGENT: { type: "ai-sdk-chat" }
   config Json?
 
+  executionMode   TaskExecutionMode @default(STANDARD)
+  /// RunExecutionPolicy from @trigger.dev/core. Null means the standard policy.
+  executionPolicy Json?
+
   payloadSchema Json?
 
   @@unique([workerId, slug])
@@ -796,6 +992,12 @@ enum TaskTriggerSource {
   SCHEDULED
   AGENT
   WEBHOOK
+}
+
+enum TaskExecutionMode {
+  STANDARD
+  /// Locked-down policy; only runs on microVM compute.
+  SANDBOX
 }
 
 model WebhookEndpoint {
@@ -872,7 +1074,7 @@ model WebhookDelivery {
   /// Set from the x-trigger-test ingress header; marks console/test-send deliveries so the list can filter them.
   isTest Boolean @default(false)
 
-  parsedEvent  Json? // size-capped snapshot of the verified event (full event lives in ClickHouse)
+  parsedEvent  Json?
   headers      Json? // inbound request headers, surfaced to the webhook task via onEvent({ headers })
   rawBodyHash  String? // sha256 of raw bytes; cheap P2 replay anchor
   errorMessage String?
@@ -884,8 +1086,102 @@ model WebhookDelivery {
   updatedAt   DateTime  @updatedAt // Q14: real column; the status transitions update it, maps straight to CH updated_at
   processedAt DateTime?
 
-  @@id([id, createdAt]) // composite PK: the partition key MUST be in every PK/unique on a partitioned table
+  /// Retention class in days: the LIST partition key, stamped at ingest from the org's plan and encoded in the id.
+  retentionDays Int @default(30)
+
+  @@id([id, createdAt, retentionDays])
   @@index([webhookEndpointId, createdAt(sort: Desc)]) // dashboard recent-deliveries; also partition-pruned
+}
+
+model Alert {
+  id                         String    @id
+  // plain columns, NO @relation -> no FK
+  organizationId             String
+  projectId                  String
+  environmentId              String
+  capabilityKey              String
+  params                     Json
+  condition                  Json
+  query                      String?
+  expiresAt                  DateTime? @db.Timestamptz(6)
+  lifecycle                  String    @default("active")
+  attention                  String    @default("clear")
+  observedCondition          String    @default("unknown")
+  observedConditionChangedAt DateTime? @db.Timestamptz(6)
+  pendingMetSince            DateTime? @db.Timestamptz(6)
+  evaluatorState             Json?
+  evaluationLeaseId          String?
+  evaluationLeaseUntil       DateTime? @db.Timestamptz(6)
+  lastEvaluatedAt            DateTime? @db.Timestamptz(6)
+  nextEvaluationAt           DateTime? @db.Timestamptz(6) // NULL means due now
+  notifiers                  Json      @default("[]")
+  name                       String?
+  createdBy                  String
+  createdAt                  DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt                  DateTime  @default(now()) @db.Timestamptz(6)
+  resolvedAt                 DateTime? @db.Timestamptz(6)
+  resolvedBy                 String?
+  stoppedAt                  DateTime? @db.Timestamptz(6)
+  stoppedBy                  String?
+  lastOccurrenceAt           DateTime? @db.Timestamptz(6)
+  occurrencesSinceRaise      Int       @default(0)
+  occurrencesTotal           BigInt    @default(0)
+  groupId                    String?
+
+  // SQL-only (migration): ("lifecycle", "nextEvaluationAt" NULLS FIRST) and partial active "expiresAt"
+  @@index([environmentId, lifecycle])
+  @@index([lifecycle, evaluationLeaseUntil])
+  @@index([projectId])
+  @@index([organizationId])
+  @@index([groupId])
+}
+
+/// RANGE-partitioned by month on `at` (see migration).
+model AlertEvent {
+  id            String
+  alertId       String
+  type          String
+  at            DateTime @default(now()) @db.Timestamptz(6)
+  facts         Json     @default("{}")
+  actorId       String?
+  sourceEventId String?
+
+  @@id([id, at])
+  @@index([alertId, at(sort: Desc)])
+}
+
+model AlertOccurrenceSeen {
+  alertId       String
+  sourceEventId String
+  rowTime       DateTime @db.Timestamptz(6)
+  seenAt        DateTime @default(now()) @db.Timestamptz(6)
+  expiresAt     DateTime @db.Timestamptz(6)
+
+  @@id([alertId, sourceEventId])
+  @@index([expiresAt])
+}
+
+/// RANGE-partitioned by month on `eventAt` (see migration).
+model AlertDelivery {
+  id               String
+  alertEventId     String
+  eventAt          DateTime  @db.Timestamptz(6)
+  notifierId       String // stable dedup key from notifierRefKey
+  notifier         Json
+  status           String    @default("pending")
+  claimId          String?
+  claimedAt        DateTime? @db.Timestamptz(6)
+  deliveredAt      DateTime? @db.Timestamptz(6)
+  failureReason    String?
+  providerMetadata Json?
+  attempts         Int       @default(0)
+  firstAttemptAt   DateTime? @db.Timestamptz(6)
+  createdAt        DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@id([id, eventAt])
+  @@unique([alertEventId, notifierId, eventAt])
+  @@index([status, createdAt])
+  @@index([status, claimedAt])
 }
 
 enum WebhookDeliveryStatus {
@@ -1038,6 +1334,8 @@ model SessionRun {
   session Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId])
+  /// Pages a session's runs by `(triggeredAt, id)` and counts rows at or before a cursor.
+  @@index([sessionId, triggeredAt, id])
 }
 
 model TaskRun {
@@ -1726,6 +2024,9 @@ model WorkerGroupToken {
 
   tokenHash String @unique
 
+  previousTokenHash       String?   @unique
+  previousTokenValidUntil DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2212,6 +2513,7 @@ model EnvironmentVariable {
   createdAt  DateTime                   @default(now())
   updatedAt  DateTime                   @updatedAt
   values     EnvironmentVariableValue[]
+  ignores    EnvironmentVariableIgnore[]
 
   @@unique([projectId, key])
 }
@@ -2228,6 +2530,9 @@ model EnvironmentVariableValue {
   /// If true, the value is secret and cannot be revealed
   isSecret Boolean @default(false)
 
+  isProxyOnly       Boolean  @default(false)
+  proxyConfig       Json?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2237,6 +2542,37 @@ model EnvironmentVariableValue {
   @@unique([variableId, environmentId])
   @@index([environmentId])
   @@index([valueReferenceId])
+  // One environment's values by last update: the environment variables page's sort by updated
+  @@index([environmentId, updatedAt(sort: Desc), variableId])
+}
+
+/// A reason the environment variables "Needs attention" page shows a key in one environment, which
+/// the project's team chose to ignore. An ignored EMPTY goes when the value is next saved.
+model EnvironmentVariableIgnore {
+  id            String                          @id @default(cuid())
+  project       Project                         @relation(fields: [projectId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  projectId     String
+  environment   RuntimeEnvironment              @relation(fields: [environmentId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  environmentId String
+  /// For MISSING, a variable of the project with no value in this environment.
+  variable      EnvironmentVariable             @relation(fields: [variableId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  variableId    String
+  reason        EnvironmentVariableIgnoreReason
+  createdBy     User?                           @relation(fields: [createdById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  createdById   String?
+  createdAt     DateTime                        @default(now())
+
+  // Also the page's read: one environment's ignores, joined by variable
+  @@unique([environmentId, variableId, reason])
+  @@index([variableId])
+  @@index([projectId])
+  @@index([createdById])
+}
+
+enum EnvironmentVariableIgnoreReason {
+  EMPTY
+  MISSING
+  OIDC
 }
 
 model Checkpoint {
@@ -2320,6 +2656,14 @@ enum WorkerDeploymentType {
   V1
 }
 
+enum DeploymentInitiatedByCredential {
+  ROOT_API_KEY
+  SCOPED_API_KEY
+  PERSONAL_ACCESS_TOKEN
+  ORGANIZATION_ACCESS_TOKEN
+  TRUSTED_PUBLISHING
+}
+
 model WorkerDeployment {
   id String @id @default(cuid())
 
@@ -2330,16 +2674,24 @@ model WorkerDeployment {
 
   runtime        String?
   runtimeVersion String?
-  /// CLI version that initiated the deploy, stamped at initialization
+  /// CLI version that initiated the deploy, stamped at initialization or worker upload
   cliVersion     String?
 
   imageReference String?
   imagePlatform  String  @default("linux/amd64")
+  /// Key of the microVM template prebuilt from this deployment's image, set when the builder succeeds
+  templateKey    String?
+
+  /// Object key of the full index snapshot in the deployment index store. Set only after the upload succeeds.
+  indexObjectKey     String?
+  /// sha256 hex of the snapshot's uncompressed JSON
+  indexSha256        String?
+  indexFormatVersion Int?
 
   externalBuildData   Json?
   buildServerMetadata Json?
   /// Encrypted build-time env vars for pre-bundled (fromBundle) deploys, as an
-  /// EncryptedSecretValue envelope. Cleared when the deployment reaches a terminal status.
+  /// EncryptedSecretValue envelope. Kept for the redeploy window, then cleared by a sweep.
   buildEnvVars        Json?
 
   status WorkerDeploymentStatus @default(PENDING)
@@ -2360,6 +2712,9 @@ model WorkerDeployment {
   commitSHA     String?
   externalId    String?
 
+  /// The kind of credential that started the deployment. Null when unknown.
+  initiatedByCredential DeploymentInitiatedByCredential?
+
   startedAt   DateTime?
   installedAt DateTime?
   builtAt     DateTime?
@@ -2370,6 +2725,9 @@ model WorkerDeployment {
 
   canceledAt     DateTime?
   canceledReason String?
+
+  /// The newer GitHub build that superseded this one while it was still queued
+  supersededById String?
 
   // This is GitMeta type
   git Json?
@@ -2970,6 +3328,51 @@ model GithubRepository {
   @@index([installationId])
 }
 
+model TrustedDeployRepository {
+  id String @id @default(cuid())
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String  @unique
+
+  issuer            String  @default("https://token.actions.githubusercontent.com")
+  repositoryOwner   String
+  repositoryName    String
+  repositoryId      String?
+  repositoryOwnerId String?
+
+  environments TrustedDeployEnvironment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum TrustedDeployScope {
+  ANY
+  BRANCH
+  TAG
+  ENVIRONMENT
+}
+
+model TrustedDeployEnvironment {
+  id String @id @default(cuid())
+
+  trustedDeployRepository   TrustedDeployRepository @relation(fields: [trustedDeployRepositoryId], references: [id], onDelete: Cascade)
+  trustedDeployRepositoryId String
+
+  runtimeEnvironment   RuntimeEnvironment @relation(fields: [runtimeEnvironmentId], references: [id], onDelete: Cascade)
+  runtimeEnvironmentId String             @unique
+
+  enabled          Boolean            @default(false)
+  scope            TrustedDeployScope
+  scopeValue       String?
+  additionalClaims Json               @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([trustedDeployRepositoryId])
+}
+
 model ConnectedGithubRepository {
   id String @id @default(cuid())
 
@@ -2990,6 +3393,13 @@ model ConnectedGithubRepository {
   branchTracking Json
 
   previewDeploymentsEnabled Boolean @default(true)
+
+  /// Skip queued builds once a newer commit is queued for the same environment or preview branch
+  supersedeProductionBuilds Boolean @default(false)
+  supersedeStagingBuilds    Boolean @default(true)
+  supersedePreviewBuilds    Boolean @default(true)
+
+  buildFilters Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -3340,20 +3750,6 @@ model PlatformNotificationInteraction {
   updatedAt DateTime @updatedAt
 
   @@unique([notificationId, userId])
-}
-
-model LogsSearchProjectorCheckpoint {
-  id BigInt @id @default(autoincrement())
-
-  projectorId String
-  mode        String
-  windowStart DateTime
-  windowEnd   DateTime
-  queryId     String?
-  completedAt DateTime @default(now())
-
-  @@unique([projectorId, mode, windowStart, windowEnd])
-  @@index([projectorId, mode, windowEnd(sort: Desc)])
 }
 
 enum ErrorGroupStatus {

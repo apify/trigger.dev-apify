@@ -3,6 +3,7 @@ import { discriminatedUnion } from "../utils/zod.js";
 import type { Enum, RuntimeEnvironmentType } from "./common.js";
 import { MachinePreset, TaskRunExecution } from "./common.js";
 import { EnvironmentType } from "./schemas.js";
+import { RunExecutionPolicy } from "./executionPolicy.js";
 import type * as DB_TYPES from "@trigger.dev/database";
 
 const anyString = z.custom<string & {}>((v) => typeof v === "string");
@@ -31,9 +32,25 @@ export const RunAnnotations = z.object({
   webhookDeliveryId: z.string().optional(),
   /** The endpoint (friendly id) that delivery arrived on. */
   webhookEndpointId: z.string().optional(),
+  /** Where the most recently stamped attempt executed. Set by the supervisor at attempt start. */
+  workerCell: z.string().optional().catch(undefined),
+  workerLane: z.string().optional().catch(undefined),
+  executionMode: z.enum(["STANDARD", "SANDBOX"]).optional(),
+  /** Set only for runs whose task declares a non-standard policy. Pinned for the run's lifetime. */
+  executionPolicy: RunExecutionPolicy.optional(),
+  /** The Session that triggered this run. Fills `$session` in policy scopes. */
+  sessionId: z.string().optional(),
 });
 
 export type RunAnnotations = z.infer<typeof RunAnnotations>;
+
+/** Lenient read of the worker stamp: works on blobs that predate or fail RunAnnotations. */
+export const WorkerStampAnnotations = z.object({
+  workerCell: z.string().optional().catch(undefined),
+  workerLane: z.string().optional().catch(undefined),
+});
+
+export type WorkerStampAnnotations = z.infer<typeof WorkerStampAnnotations>;
 
 export const TaskRunExecutionStatus = {
   RUN_CREATED: "RUN_CREATED",
@@ -195,11 +212,16 @@ export type CheckpointTypeEnum = (typeof CheckpointTypeEnum)[keyof typeof Checkp
 export const CheckpointType = z.enum(Object.values(CheckpointTypeEnum) as [CheckpointTypeEnum]);
 export type CheckpointType = z.infer<typeof CheckpointType>;
 
+/** The sha256 digest of a checkpoint's image manifest, recorded when it is taken. */
+export const CheckpointDigest = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+export type CheckpointDigest = z.infer<typeof CheckpointDigest>;
+
 export const CheckpointInput = z.object({
   type: CheckpointType,
   location: z.string(),
   imageRef: z.string().nullish(),
   reason: z.string().nullish(),
+  digest: CheckpointDigest.nullish(),
 });
 
 export type CheckpointInput = z.infer<typeof CheckpointInput>;
@@ -256,6 +278,8 @@ export const DequeueMessageCheckpoint = z.object({
   location: z.string(),
   imageRef: z.string().nullish(),
   reason: z.string().nullish(),
+  /** Absent for a checkpoint taken without one; the restore can then only trust its location. */
+  digest: CheckpointDigest.nullish(),
 });
 export type DequeueMessageCheckpoint = z.infer<typeof DequeueMessageCheckpoint>;
 
@@ -272,6 +296,8 @@ export const DequeuedMessage = z.object({
   dequeuedAt: z.coerce.date(),
   workerQueueLength: z.number().optional(),
   image: z.string().optional(),
+  /** Names a prebuilt template of `image`. */
+  templateKey: z.string().optional(),
   checkpoint: DequeueMessageCheckpoint.optional(),
   completedWaitpoints: z.array(CompletedWaitpoint),
   backgroundWorker: z.object({

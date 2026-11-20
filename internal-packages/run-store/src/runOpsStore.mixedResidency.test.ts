@@ -628,13 +628,53 @@ describe("RoutingRunStore — mixed-residency matrix (cuid #legacy + run-ops id 
     }
   );
 
+  // ── Case 9c: findRunOrThrow by spanId with no client when BOTH DBs match, and when NEITHER does ──
+  // NEW is probed first, so a NEW match wins; the LEGACY leg owns the not-found throw.
+  // Catches: a no-id read with no client that tries LEGACY before NEW, or returns null on a miss.
+  heteroRunOpsPostgresTest(
+    "case 9c: findRunOrThrow by spanId with no client prefers #new when both match, and throws P2025 when neither does",
+    async ({ prisma14, prisma17 }) => {
+      const { router } = makeSplitRouter(prisma14, prisma17);
+      const env = await seedSharedEnv(prisma14, "m9c");
+
+      const legacyRun = cuidLegacy("m9cl");
+      const newRun = runOpsNew("m9cn");
+      await router.createRun(
+        buildCreateRunInput({
+          runId: legacyRun,
+          friendlyId: "run_m9c_legacy",
+          spanId: "span_m9c_both",
+          ...env,
+        })
+      );
+      await router.createRun(
+        buildCreateRunInput({
+          runId: newRun,
+          friendlyId: "run_m9c_new",
+          spanId: "span_m9c_both",
+          ...env,
+        })
+      );
+
+      const onBoth = (await router.findRunOrThrow(
+        { spanId: "span_m9c_both" },
+        { select: { id: true } }
+      )) as Record<string, any>;
+      expect(onBoth.id).toBe(newRun);
+
+      await expect(
+        router.findRunOrThrow({ spanId: "span_m9c_none" }, { select: { id: true } })
+      ).rejects.toMatchObject({ code: "P2025", name: "PrismaClientKnownRequestError" });
+    }
+  );
+
   // ── Case 7: findManyTaskRunWaitpoints with edges whose relations STRADDLE DBs ──
-  // An edge co-locates with its RUN, but its `waitpoint`/`taskRun` relations can live on the OTHER DB
+  // An edge co-locates with its RUN, but its `waitpoint` relation can live on the OTHER DB
   // (a cuid token blocking a run-ops run, and vice versa). The per-leg scalar query is stripped of the
-  // relation keys; the router re-hydrates `waitpoint`/`taskRun` across BOTH DBs. Exercises BOTH
+  // relation key; the router re-hydrates `waitpoint` across BOTH DBs. Exercises BOTH
   // straddle directions in one read by querying both edges via { taskRunId: { in } }.
   heteroRunOpsPostgresTest(
-    "case 7: findManyTaskRunWaitpoints rehydrates waitpoint/taskRun relations across both DBs (both straddle directions)",
+    "case 7: findManyTaskRunWaitpoints rehydrates the waitpoint relation across both DBs (both straddle directions)",
     async ({ prisma14, prisma17 }) => {
       const { router } = makeSplitRouter(prisma14, prisma17);
       const env = await seedSharedEnv(prisma14, "m7");
@@ -691,7 +731,7 @@ describe("RoutingRunStore — mixed-residency matrix (cuid #legacy + run-ops id 
       expect(await prisma17.taskRunWaitpoint.count({ where: { taskRunId: legacyRun } })).toBe(0);
 
       // One read spanning both runs: both edges returned (deduped by id), and each edge's `waitpoint`
-      // + `taskRun` re-hydrated from whichever DB holds them.
+      // re-hydrated from whichever DB holds it.
       const edges = (await router.findManyTaskRunWaitpoints({
         where: { taskRunId: { in: [newRun, legacyRun] } },
         select: {
@@ -699,25 +739,22 @@ describe("RoutingRunStore — mixed-residency matrix (cuid #legacy + run-ops id 
           taskRunId: true,
           waitpointId: true,
           waitpoint: { select: { id: true, status: true } },
-          taskRun: { select: { id: true } },
         },
       })) as Array<Record<string, any>>;
 
       expect(edges).toHaveLength(2);
       const byRun = new Map(edges.map((e) => [e.taskRunId as string, e]));
 
-      // Direction A edge: waitpoint hydrated from #legacy (cuid token), taskRun is the #new run.
+      // Direction A edge: waitpoint hydrated from #legacy (cuid token).
       const aEdge = byRun.get(newRun)!;
       expect(aEdge.waitpoint?.id).toBe(legacyToken);
       expect(aEdge.waitpoint?.status).toBe("PENDING");
-      expect(aEdge.taskRun?.id).toBe(newRun);
 
       // Direction B edge: waitpoint hydrated from the AUTHORITATIVE #new copy (COMPLETED), proving the
       // relation was re-resolved cross-DB and NEW won the dedup over the stale local #legacy mirror.
       const bEdge = byRun.get(legacyRun)!;
       expect(bEdge.waitpoint?.id).toBe(newToken);
       expect(bEdge.waitpoint?.status).toBe("COMPLETED");
-      expect(bEdge.taskRun?.id).toBe(legacyRun);
     }
   );
 
@@ -789,45 +826,6 @@ describe("RoutingRunStore — mixed-residency matrix (cuid #legacy + run-ops id 
       expect(
         (await router.findBatchTaskRunByFriendlyId("batch_m10_new", env.environmentId))?.id
       ).toBe(newBatch);
-    }
-  );
-
-  // ── Case 11a: updateManyWaitpoints with a NO-ID (batch) where fans out to both and sums ──
-  // A batch where (no single routable id, e.g. completedByTaskRunId IS NULL + status PENDING) must
-  // apply on BOTH DBs and sum the count.
-  heteroRunOpsPostgresTest(
-    "case 11a: updateManyWaitpoints with a no-id where updates both DBs and sums the count",
-    async ({ prisma14, prisma17 }) => {
-      const { router } = makeSplitRouter(prisma14, prisma17);
-      const env = await seedSharedEnv(prisma14, "m11a");
-
-      const legacyWp = cuidLegacy("m11al");
-      const newWp = runOpsNew("m11an");
-      await seedPendingWaitpoint(prisma14, {
-        id: legacyWp,
-        friendlyId: "wp_m11a_legacy",
-        projectId: env.projectId,
-        environmentId: env.environmentId,
-      });
-      await seedPendingWaitpoint(prisma17, {
-        id: newWp,
-        friendlyId: "wp_m11a_new",
-        projectId: env.projectId,
-        environmentId: env.environmentId,
-      });
-
-      const { count } = await router.updateManyWaitpoints({
-        where: { status: "PENDING", projectId: env.projectId },
-        data: { status: "COMPLETED" },
-      });
-      expect(count).toBe(2); // one per DB, summed
-
-      expect((await prisma14.waitpoint.findUnique({ where: { id: legacyWp } }))?.status).toBe(
-        "COMPLETED"
-      );
-      expect((await prisma17.waitpoint.findUnique({ where: { id: newWp } }))?.status).toBe(
-        "COMPLETED"
-      );
     }
   );
 

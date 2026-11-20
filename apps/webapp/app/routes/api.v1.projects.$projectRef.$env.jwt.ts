@@ -8,7 +8,6 @@ import {
   verifyUserActorToken,
   type UserActorClaims,
 } from "@trigger.dev/rbac";
-import parseDuration from "parse-duration";
 import { z } from "zod";
 import {
   authenticatedEnvironmentForAuthentication,
@@ -17,9 +16,24 @@ import {
   type AuthenticationResult,
 } from "~/services/apiAuth.server";
 import { env as appEnv } from "~/env.server";
-import { assertSourcePatActive } from "~/services/personalAccessToken.server";
+import {
+  assertSourcePatActive,
+  personalAccessTokenUnauthorizedResponse,
+} from "~/services/personalAccessToken.server";
+import { validateJwtExpiration } from "~/services/jwtExpiration.server";
 import { logger } from "~/services/logger.server";
 import { authorizePatEnvironmentAccess } from "~/services/environmentVariableApiAccess.server";
+import { signPublicJwtActor } from "~/services/publicJwtActor.server";
+import {
+  isDashboardAgentUserActor,
+  readScopeType,
+  userActorReadableScopes,
+} from "~/services/userActorEnvironment.server";
+import {
+  publicTokenSecret,
+  publicTokenSubject,
+  sourcePersonalAccessTokens,
+} from "~/services/publicTokenSubject.server";
 
 const ParamsSchema = z.object({
   projectRef: z.string(),
@@ -34,27 +48,6 @@ const RequestBodySchema = z.object({
     .optional(),
   expirationTime: z.union([z.number(), z.string()]).optional(),
 });
-
-// A requested `expirationTime` above this (epoch seconds, ~2001) is an absolute
-// timestamp; a smaller number is a relative offset in seconds.
-const EXPIRY_EPOCH_THRESHOLD_SECONDS = 1_000_000_000;
-const DEFAULT_EXPIRY = "1h";
-
-// Resolve the requested expiry to an absolute epoch-second timestamp so it can be
-// clamped against a delegated token's own expiry.
-function resolveRequestedExpirySeconds(
-  expirationTime: number | string | undefined,
-  nowSec: number
-): number {
-  if (typeof expirationTime === "number") {
-    return expirationTime > EXPIRY_EPOCH_THRESHOLD_SECONDS
-      ? expirationTime
-      : nowSec + expirationTime;
-  }
-  const durationMs = parseDuration(expirationTime ?? DEFAULT_EXPIRY);
-  const seconds = durationMs != null ? Math.floor(durationMs / 1000) : 60 * 60;
-  return nowSec + seconds;
-}
 
 export async function action({ request, params }: ActionFunctionArgs) {
   try {
@@ -100,7 +93,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     }
 
     if (!authenticationResult) {
-      return json({ error: "Invalid or Missing Access Token" }, { status: 401 });
+      return personalAccessTokenUnauthorizedResponse(request);
     }
 
     const parsedParams = ParamsSchema.safeParse(params);
@@ -131,16 +124,21 @@ export async function action({ request, params }: ActionFunctionArgs) {
     // This mints a JWT signed with the environment's secret key. For a PAT
     // (a user), gate it on env-tier read:apiKeys so a restricted role can't
     // obtain deployed-environment credentials (and therefore can't deploy).
-    const denied = await authorizePatEnvironmentAccess({
-      request,
-      authType: authenticationResult.type,
-      organizationId: runtimeEnv.organizationId,
-      projectId: runtimeEnv.project.id,
-      envType: runtimeEnv.type,
-      resource: "apiKeys",
-      action: "read",
-    });
-    if (denied) return denied;
+    const authorizeApiKeyRead = () =>
+      authorizePatEnvironmentAccess({
+        request,
+        authType: authenticationResult.type,
+        organizationId: runtimeEnv.organizationId,
+        projectId: runtimeEnv.project.id,
+        envType: runtimeEnv.type,
+        resource: "apiKeys",
+        action: "read",
+      });
+    const dashboardAgent = isDashboardAgentUserActor(userActor);
+    if (!dashboardAgent) {
+      const denied = await authorizeApiKeyRead();
+      if (denied) return denied;
+    }
 
     const parsedBody = RequestBodySchema.safeParse(await request.json());
 
@@ -173,6 +171,24 @@ export async function action({ request, params }: ActionFunctionArgs) {
       scopes = requestedScopes;
     }
 
+    if (dashboardAgent) {
+      const readOnly =
+        !!requestedScopes?.length && requestedScopes.every((scope) => readScopeType(scope));
+      if (readOnly) {
+        const readable = await userActorReadableScopes(
+          request,
+          runtimeEnv,
+          scopes ?? [],
+          userActor!
+        );
+        if (readable instanceof Response) return readable;
+        scopes = readable;
+      } else {
+        const denied = await authorizeApiKeyRead();
+        if (denied) return denied;
+      }
+    }
+
     // Attribution: stamp the acting user on the minted env JWT. A UAT carries
     // its user as `userActorId`; a PAT exchange resolves the user from the
     // authentication result. Either way downstream handlers read `act.sub`
@@ -184,23 +200,60 @@ export async function action({ request, params }: ActionFunctionArgs) {
         ? authenticationResult.result.userId
         : undefined);
 
+    // The PAT this JWT derives from (a UAT's source PAT, or the PAT itself). Every use of the
+    // JWT rechecks it, so revoking or expiring the PAT ends the JWT too.
+    const sourcePatId = isUat
+      ? userActor?.pat
+      : authenticationResult.type === "personalAccessToken"
+        ? authenticationResult.result.tokenId
+        : undefined;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expiry = validateJwtExpiration(parsedBody.data.expirationTime, nowSec);
+    if (expiry.error !== undefined) {
+      return json({ error: expiry.error }, { status: 400 });
+    }
+
+    // A JWT can't outlive the token it was exchanged from, whether a delegated token or a PAT.
+    const sourceExpiresAt = isUat
+      ? userActor?.expiresAt
+      : authenticationResult.type === "personalAccessToken" &&
+          authenticationResult.result.validUntil
+        ? Math.floor(authenticationResult.result.validUntil.getTime() / 1000)
+        : undefined;
+    const expirationTime =
+      sourceExpiresAt !== undefined
+        ? Math.min(expiry.expirationTime, sourceExpiresAt)
+        : expiry.expirationTime;
+
+    const act = actorUserId
+      ? {
+          sub: actorUserId,
+          client: userActor?.client ?? "personal-access-token",
+          // Sealed, so the PAT's id never appears in the token.
+          ...(sourcePatId ? { pat: sourcePersonalAccessTokens.encode(sourcePatId) } : {}),
+        }
+      : undefined;
+
     const claims = {
-      sub: runtimeEnv.id,
+      sub: publicTokenSubject(runtimeEnv.id),
       pub: true,
       ...(scopes ? { scopes } : {}),
-      ...(actorUserId
-        ? { act: { sub: actorUserId, client: userActor?.client ?? "personal-access-token" } }
+      ...(act
+        ? {
+            act: {
+              ...act,
+              // Proves the server minted this token for this user: it covers the user and every
+              // claim the server reads, and the root key can't make it.
+              sig: signPublicJwtActor(publicTokenSecret(), act, {
+                environmentId: runtimeEnv.id,
+                expiresAt: expirationTime,
+                scopes,
+              }),
+            },
+          }
         : {}),
     };
-
-    // A delegated token can't mint a longer-lived JWT than itself: clamp the
-    // requested expiry to the token's own `exp`. Non-UAT callers are unchanged.
-    const nowSec = Math.floor(Date.now() / 1000);
-    const requestedAbsSec = resolveRequestedExpirySeconds(parsedBody.data.expirationTime, nowSec);
-    const expirationTime =
-      isUat && userActor?.expiresAt !== undefined
-        ? Math.min(requestedAbsSec, userActor.expiresAt)
-        : (parsedBody.data.expirationTime ?? DEFAULT_EXPIRY);
 
     const jwt = await internal_generateJWT({
       secretKey: runtimeEnv.apiKey,

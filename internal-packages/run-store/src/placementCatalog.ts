@@ -24,9 +24,9 @@ export const ROUTES_BY_GIVEN_RUN_ID: readonly string[] = [
   "recordRetryOutcome",
   "requeueRun",
   "recordBulkActionMembership",
+  "markRunWaitpointsOnStore",
   "cancelRun",
   "failRunPermanently",
-  "finalizeRun",
   "expireRun",
   "lockRunToWorker",
   "parkPendingVersion",
@@ -45,7 +45,19 @@ export const GIVEN_RUN_ID_ROUTE = "#routeForWrite(runId)";
 
 export const PLACEMENT_SITES: readonly PlacementSite[] = [
   {
+    method: "runInWaitpointKeyTransaction",
+    basis: "owner-id",
+    missMode: "loud",
+    routes: ["#routeOrNew(ownerId)"],
+  },
+  {
     method: "runInTransaction",
+    basis: "own-id",
+    missMode: "loud",
+    routes: ["#routeOrNew(runId)"],
+  },
+  {
+    method: "settlePendingUnit",
     basis: "own-id",
     missMode: "loud",
     routes: ["#routeOrNew(runId)"],
@@ -123,6 +135,12 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
     why: "Routes by the owning run id when the filter names one; otherwise sums across every store, so a delete cannot quietly skip a shard.",
   },
   {
+    method: "markBatchWaitpointOnStore",
+    basis: "own-id",
+    missMode: "loud",
+    routes: ["#routeForWrite(batchId)"],
+  },
+  {
     method: "createBatchTaskRun",
     basis: "own-id",
     missMode: "silent",
@@ -140,13 +158,6 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
     missMode: "silent",
     routes: ["#routeOrNew(id)", "#sumCounts((store) => store.updateManyBatchTaskRun(args))"],
     why: "Routes by batch id when the filter names one, and otherwise sums across every store. An updateMany reports zero rows rather than failing, so the fan-out is what keeps a filtered update from silently skipping a shard.",
-  },
-  {
-    method: "updateManyBatchTaskRunItems",
-    basis: "fan-out",
-    missMode: "silent",
-    routes: ["#routeOrNew(id)", "#sumCounts((store) => store.updateManyBatchTaskRunItems(args))"],
-    why: "Same shape as updateManyBatchTaskRun: id when available, every store otherwise.",
   },
   {
     method: "createWaitpoint",
@@ -170,16 +181,6 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
     why: "The waitpoint's own id wins; the co-location hint is only the fallback for a filter that names no id. Ordering matters here and the arms must stay in this order.",
   },
   {
-    method: "updateManyWaitpoints",
-    basis: "fan-out",
-    missMode: "silent",
-    routes: [
-      "#resolveWaitpointStore(id)",
-      "#sumCounts((store) => store.updateManyWaitpoints(args))",
-    ],
-    why: "Routes by waitpoint id when the filter names one, and sums across every store otherwise, because an updateMany that lands on the wrong database reports zero rows instead of failing.",
-  },
-  {
     method: "markWaitpointCompleted",
     basis: "own-id",
     missMode: "silent",
@@ -197,10 +198,10 @@ export const PLACEMENT_SITES: readonly PlacementSite[] = [
 
 /** Listed so the union covers the interface: a `getOrCreateThing` must not pass as a read. */
 export const READ_ONLY_METHODS: readonly string[] = [
+  "getWaitpointKeyScope",
   "findRun",
   "findRunOrThrow",
   "findRunOnPrimary",
-  "findRunOrThrowOnPrimary",
   "findRuns",
   "findRunsByIds",
   "findRunsByIdempotencyKeys",
@@ -212,7 +213,6 @@ export const READ_ONLY_METHODS: readonly string[] = [
   "findSnapshotCompletedWaitpointIdsWithPresence",
   "findTaskRunCheckpointById",
   "findWaitpointConnectedRunIds",
-  "findWaitpointCompletedSnapshotIds",
   "countPendingWaitpoints",
   "countPendingWaitpointsWithPresence",
   "findWaitpoint",
@@ -225,7 +225,5 @@ export const READ_ONLY_METHODS: readonly string[] = [
   "findBatchTaskRunByFriendlyId",
   "findBatchTaskRunByIdempotencyKey",
   "countBatchTaskRunItems",
-  "findManyBatchTaskRunItems",
-  "findBatchTaskRunItem",
   "findManyWaitpointTags",
 ];

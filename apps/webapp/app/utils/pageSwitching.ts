@@ -8,10 +8,14 @@ export const ENVIRONMENT_MATCH_ID =
 
 /** Pages below a section landing that name no resource, plus the built-in metric dashboards. */
 const NESTED_PORTABLE_PAGES = [
+  "alerts/channels",
+  "alerts/legacy",
   "alerts/new",
   "dashboards/llm",
   "dashboards/overview",
   "dashboards/queues",
+  "environment-variables/attention",
+  "environment-variables/compare",
   "environment-variables/new",
   "models/compare",
   "schedules/new",
@@ -28,6 +32,10 @@ export const PROJECT_SPECIFIC_PAGES = ["branches", "dev-branches"];
  * loaders turn you away in an organization that answers differently.
  */
 export const ORGANIZATION_SPECIFIC_PAGES = [
+  "alerts",
+  "alerts/channels",
+  "alerts/legacy",
+  "alerts/new",
   "logs",
   "query",
   "dashboards/queues",

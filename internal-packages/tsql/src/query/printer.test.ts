@@ -578,6 +578,14 @@ describe("ClickHousePrinter", () => {
       );
     });
 
+    it("should infer a numeric type for round()", () => {
+      const { columns } = printQuery(
+        "SELECT round(count() / 3, 1) AS r FROM runs",
+        createJsonContext()
+      );
+      expect(columns).toContainEqual(expect.objectContaining({ name: "r", type: "Float64" }));
+    });
+
     it("should cast JSON subfield to String with multiple fields and underscore aliases", () => {
       const ctx = createJsonContext();
       const { sql, columns } = printQuery(
@@ -1503,6 +1511,21 @@ describe("ClickHousePrinter", () => {
 
       expect(sql).toContain("in(id,");
       expect(sql).toContain("SELECT run_id FROM");
+    });
+  });
+
+  describe("WITH clauses", () => {
+    it("should print a column CTE as an expression alias", () => {
+      const { sql } = printQuery("WITH 1 AS x SELECT x");
+
+      expect(sql).toBe("WITH 1 AS x SELECT x LIMIT 10000");
+    });
+
+    it("should let a column CTE be selected alongside a table", () => {
+      const { sql } = printQuery("WITH 1 AS x SELECT id, x FROM task_runs WHERE x = 1");
+
+      expect(sql).toMatch(/^WITH 1 AS x SELECT id, x FROM /);
+      expect(sql).toContain("equals(x, 1)");
     });
   });
 
@@ -3000,6 +3023,25 @@ describe("Unknown column blocking", () => {
       }).toThrow(QueryError);
     });
 
+    it("should resolve WITH expression aliases against the table schema", () => {
+      const schema = createSchemaRegistry([runsSchema]);
+      const ctx = createPrinterContext({
+        schema,
+        enforcedWhereClause: {
+          organization_id: { op: "eq", value: "org_test" },
+          project_id: { op: "eq", value: "proj_test" },
+          environment_id: { op: "eq", value: "env_test" },
+        },
+      });
+
+      expect(() => {
+        printQuery("WITH created_at AS x SELECT x FROM runs", ctx);
+      }).toThrow(QueryError);
+      expect(printQuery("WITH created AS x SELECT x FROM runs", ctx).sql).toMatch(
+        /^WITH created_at AS x SELECT x FROM /
+      );
+    });
+
     it("should suggest TSQL column name when user types ClickHouse column name", () => {
       // The schema exposes 'created' but the internal ClickHouse column is 'created_at'
       // When user types 'created_at', we should suggest 'created'
@@ -3302,6 +3344,13 @@ describe("Internal-only column blocking", () => {
       }).toThrow(QueryError);
       expect(() => {
         printQuery("SELECT id, organization_id FROM hidden_tenant_runs", ctx);
+      }).toThrow(/not available for querying/i);
+    });
+
+    it("should throw error when a WITH alias reads a hidden tenant column", () => {
+      const ctx = createHiddenTenantContext();
+      expect(() => {
+        printQuery("WITH organization_id AS x SELECT id, x FROM hidden_tenant_runs", ctx);
       }).toThrow(/not available for querying/i);
     });
 
@@ -4297,5 +4346,176 @@ describe("compound mergeGroupKey validation", () => {
       "SELECT queue, concurrency_key, deltaSumTimestampMerge(started_delta) AS started FROM metrics_by_key GROUP BY queue, concurrency_key"
     );
     expect(bothGrouped.sql).toContain("GROUP BY queue_name, concurrency_key");
+  });
+});
+
+describe("Generated column names", () => {
+  const runsWithDerivedColumns: TableSchema = {
+    ...taskRunsSchema,
+    columns: {
+      ...taskRunsSchema.columns,
+      task: { name: "task", clickhouseName: "task_identifier", ...column("String") },
+      execution_duration: {
+        name: "execution_duration",
+        ...column("Nullable(Int64)"),
+        expression: "dateDiff('millisecond', started_at, completed_at)",
+      },
+      output: { name: "output", ...column("JSON"), textColumn: "output_text" },
+    },
+  };
+
+  function printWithDerivedColumns(query: string) {
+    return printQuery(
+      query,
+      createTestContext({
+        schema: createSchemaRegistry([runsWithDerivedColumns, taskEventsSchema]),
+      })
+    );
+  }
+
+  it.each([
+    ["a function call", "SELECT id, lower(status) FROM task_runs AS lower"],
+    ["a function call in another case", "SELECT id, LOWER(status) FROM task_runs AS Lower"],
+    ["a nested function call", "SELECT id, coalesce(lower(status)) FROM task_runs AS coalesce"],
+    ["an arithmetic expression", "SELECT id, duration_ms + 1 FROM task_runs AS plus"],
+    ["a virtual column", "SELECT id, execution_duration FROM task_runs AS execution_duration"],
+    ["a renamed column", "SELECT id, task FROM task_runs AS task"],
+    ["a text column", "SELECT id, output FROM task_runs AS output"],
+    ["SELECT *", "SELECT * FROM task_runs AS execution_duration"],
+    [
+      "a joined table",
+      "SELECT r.id, lower(lower.event_type) FROM task_runs AS r JOIN task_events AS lower ON r.id = lower.run_id",
+    ],
+    [
+      "an IN subquery",
+      "SELECT id FROM task_runs WHERE id IN (SELECT lower(id) FROM task_runs AS lower)",
+    ],
+  ])("should reject a generated name from %s that matches a table alias", (_, query) => {
+    expect(() => printWithDerivedColumns(query)).toThrow(QueryError);
+    expect(() => printWithDerivedColumns(query)).toThrow(/conflicts with the table alias/);
+  });
+
+  it("should keep generated names that differ from every table alias", () => {
+    const { sql } = printWithDerivedColumns(
+      "SELECT id, lower(status), duration_ms + 1, execution_duration, task, output FROM task_runs AS r"
+    );
+    expect(sql).toContain("lower(status) AS lower");
+    expect(sql).toContain("AS plus");
+    expect(sql).toContain("AS execution_duration");
+    expect(sql).toContain("task_identifier AS task");
+    expect(sql).toContain("output_text AS output");
+  });
+
+  it("should allow an aggregate whose generated name matches the table alias", () => {
+    const { sql } = printQuery("SELECT count() FROM task_runs AS count");
+    expect(sql).toContain("count() AS count");
+  });
+
+  it("should allow a generated name that matches a table alias in another scope", () => {
+    expect(() =>
+      printQuery("SELECT lower FROM (SELECT lower(status) FROM task_runs) AS lower")
+    ).not.toThrow();
+  });
+});
+
+describe("Identifier resolution", () => {
+  const runsWithJsonSchema: TableSchema = {
+    ...taskRunsSchema,
+    name: "runs",
+    columns: {
+      ...taskRunsSchema.columns,
+      output: { name: "output", ...column("JSON") },
+      metadata: { name: "metadata", ...column("Map(String, String)") },
+      root_run_id: { name: "root_run_id", ...column("String") },
+    },
+  };
+
+  function print(query: string) {
+    const schema = createSchemaRegistry([runsWithJsonSchema, taskEventsSchema]);
+    const context = createPrinterContext({
+      schema,
+      enforcedWhereClause: {
+        organization_id: { op: "eq", value: "org_test123" },
+        project_id: { op: "eq", value: "proj_test456" },
+        environment_id: { op: "eq", value: "env_test789" },
+      },
+    });
+    return printToClickHouse(parseTSQLSelect(query), context);
+  }
+
+  describe("allowed forms", () => {
+    // Catches: tightening asterisk or qualifier handling breaks a form that compiles today
+    it.each([
+      "SELECT r.* FROM runs AS r",
+      "SELECT COUNT(*) FROM runs",
+      "SELECT count(r.*) FROM runs AS r",
+      "SELECT output.message FROM runs",
+      "SELECT r.output.message FROM runs AS r",
+      "SELECT metadata.country FROM runs",
+      "SELECT s.* FROM (SELECT id FROM runs) AS s",
+      "SELECT output.message FROM (SELECT output FROM runs) AS s",
+      "SELECT r.id, m.n FROM runs r INNER JOIN (SELECT run_id, count() AS n FROM task_events GROUP BY run_id) m ON m.run_id = r.id",
+      "SELECT c.root_run_id FROM (SELECT root_run_id FROM runs) c INNER JOIN (SELECT id FROM runs) root ON c.root_run_id = root.id",
+      "SELECT count() FROM (SELECT r.id AS id, m.n AS n FROM runs r INNER JOIN (SELECT run_id, count() AS n FROM task_events GROUP BY run_id) m ON m.run_id = r.id)",
+      "SELECT countIf(id NOT IN (SELECT run_id FROM task_events)) FROM runs",
+      "SELECT replaceRegexpOne(status, '^a(.*)$', '\\\\1') AS s FROM runs",
+      "SELECT item.id FROM runs ARRAY JOIN [JSONExtract('{\"id\":\"a\"}', 'Tuple(id String)')] AS item",
+      "WITH JSONExtract('{\"s\":\"\"}', 'Tuple(s String)') AS k SELECT r.id FROM runs r JOIN runs r2 ON r.id = concat(r2.id, k.s)",
+      "WITH output AS o SELECT o.message FROM runs",
+    ])("%s", (query) => {
+      expect(() => print(query)).not.toThrow();
+    });
+  });
+
+  describe("asterisk outside the SELECT list or count", () => {
+    // Catches: an asterisk printed as-is lets ClickHouse expand it to columns the schema hides
+    it.each([
+      "SELECT toString(tuple(*)) FROM runs",
+      "SELECT tuple(r.*) FROM runs AS r",
+      "SELECT [*] FROM runs",
+      "SELECT uniq(*) FROM runs",
+      "SELECT count(DISTINCT *) FROM runs",
+      "SELECT id FROM runs AS r WHERE r.* = 1",
+      "SELECT id FROM runs ORDER BY *",
+      "SELECT id FROM runs GROUP BY *",
+      "SELECT count() FROM runs HAVING count(*) > 0 AND tuple(*) != tuple()",
+    ])("%s", (query) => {
+      expect(() => print(query)).toThrow(QueryError);
+    });
+  });
+
+  describe("qualifiers that are not in scope", () => {
+    // Catches: ClickHouse resolves a physical table or database name to the aliased table
+    it.each([
+      "SELECT task_runs_v2.payload FROM runs",
+      "SELECT trigger_dev.task_runs_v2.organization_id FROM runs",
+      "SELECT task_runs_v2.* FROM runs",
+      "SELECT trigger_dev.task_runs_v2.* FROM runs",
+      "SELECT x.* FROM runs AS r",
+      "SELECT count(x.*) FROM runs AS r",
+      "SELECT id FROM runs WHERE task_runs_v2.payload = 'a'",
+      "SELECT r.id FROM runs r INNER JOIN (SELECT run_id FROM task_events) m ON m.run_id = r.id WHERE task_runs_v2.payload = 'a'",
+      "SELECT (SELECT task_runs_v2.payload) FROM runs",
+      "SELECT 1 AS task_runs_v2, task_runs_v2.payload FROM runs",
+      "SELECT 1 AS trigger_dev, trigger_dev.task_runs_v2.payload FROM runs",
+      "WITH 1 AS task_runs_v2 SELECT task_runs_v2.payload FROM runs",
+      "SELECT task_runs_v2.payload FROM runs ARRAY JOIN [1] AS task_runs_v2",
+      "SELECT item FROM runs ARRAY JOIN [1] AS item",
+    ])("%s", (query) => {
+      expect(() => print(query)).toThrow(QueryError);
+    });
+  });
+
+  describe("table aliases named like a physical table", () => {
+    // Catches: ClickHouse binding a tenant guard written on the alias to the physical table it names
+    it.each([
+      "SELECT event_type FROM runs AS r JOIN task_events AS task_runs_v2 ON 1 = 1",
+      "SELECT event_type FROM runs AS r JOIN task_events AS trigger_dev ON 1 = 1",
+      "SELECT id FROM runs AS task_events_v2",
+      "SELECT s.id FROM runs AS r JOIN (SELECT id FROM runs) AS task_events_v2 ON 1 = 1",
+      "SELECT task_runs_v2.* FROM runs, (SELECT 1 AS x) AS task_runs_v2",
+    ])("%s", (query) => {
+      expect(() => print(query)).toThrow(QueryError);
+    });
   });
 });

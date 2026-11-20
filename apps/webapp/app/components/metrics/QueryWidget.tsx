@@ -1,19 +1,38 @@
-import { DocumentDuplicateIcon, PencilSquareIcon, TrashIcon } from "@heroicons/react/20/solid";
+import {
+  BellAlertIcon,
+  DocumentDuplicateIcon,
+  PencilSquareIcon,
+  TrashIcon,
+} from "@heroicons/react/20/solid";
 import { ClipboardIcon } from "@heroicons/react/24/outline";
 import { ChartBarIcon } from "@heroicons/react/24/solid";
 import { type OutputColumnMetadata } from "@internal/tsql";
+import {
+  DashboardWidgetDisplay,
+  type DashboardBigNumberAggregation,
+  type DashboardBigNumberConfig,
+  type DashboardChartAggregation,
+  type DashboardChartConfig,
+  type DashboardSortDirection,
+} from "@trigger.dev/core/v3/schemas";
 import { DialogClose } from "@radix-ui/react-dialog";
 import { IconBraces, IconChartHistogram, IconFileTypeCsv } from "@tabler/icons-react";
 import { assertNever } from "assert-never";
 import { Maximize2 } from "lucide-react";
 import { useCallback, useRef, useState, type ReactNode } from "react";
-import { z } from "zod";
 import { Card } from "~/components/primitives/charts/Card";
 import { ShortcutKey } from "~/components/primitives/ShortcutKey";
 import { SimpleTooltip } from "~/components/primitives/Tooltip";
+import { useDashboardAgent } from "~/components/dashboard-agent/dashboardAgentLauncher";
+import { queryAnalyzePath } from "~/components/alerts/queryAnalysis";
+import { useCanUseAlertsList } from "~/hooks/useCanUseAlertsList";
+import { useOptionalEnvironment } from "~/hooks/useEnvironment";
+import { useOptionalOrganization } from "~/hooks/useOrganizations";
+import { useOptionalProject } from "~/hooks/useProject";
 import { useShortcutKeys } from "~/hooks/useShortcutKeys";
 import { cn } from "~/utils/cn";
 import { rowsToCSV, rowsToJSON } from "~/utils/dataExport";
+import { openWidgetWatch, type WatchFilters } from "./widgetWatch";
 import { QueryResultsChart } from "../code/QueryResultsChart";
 import { TSQLResultsTable } from "../code/TSQLResultsTable";
 import { Button } from "../primitives/Buttons";
@@ -31,88 +50,13 @@ import {
   PopoverVerticalEllipseTrigger,
 } from "../primitives/Popover";
 
-const ChartType = z.union([z.literal("bar"), z.literal("line")]);
-type ChartType = z.infer<typeof ChartType>;
-
-const SortDirection = z.union([z.literal("asc"), z.literal("desc")]);
-export type SortDirection = z.infer<typeof SortDirection>;
-
-const AggregationType = z.union([
-  z.literal("sum"),
-  z.literal("avg"),
-  z.literal("count"),
-  z.literal("min"),
-  z.literal("max"),
-]);
-export type AggregationType = z.infer<typeof AggregationType>;
-
-const chartConfigOptions = {
-  chartType: ChartType,
-  xAxisColumn: z.string().nullable(),
-  yAxisColumns: z.string().array(),
-  groupByColumn: z.string().nullable(),
-  stacked: z.boolean(),
-  sortByColumn: z.string().nullable(),
-  sortDirection: SortDirection,
-  aggregation: AggregationType,
-  seriesColors: z.record(z.string(), z.string()).optional(),
-};
-
-const ChartConfiguration = z.object({ ...chartConfigOptions });
-export type ChartConfiguration = z.infer<typeof ChartConfiguration>;
-
-const BigNumberAggregationType = z.union([
-  z.literal("sum"),
-  z.literal("avg"),
-  z.literal("count"),
-  z.literal("min"),
-  z.literal("max"),
-  z.literal("first"),
-  z.literal("last"),
-]);
-export type BigNumberAggregationType = z.infer<typeof BigNumberAggregationType>;
-
-const BigNumberSortDirection = z.union([z.literal("asc"), z.literal("desc")]);
-
-const bigNumberConfigOptions = {
-  column: z.string(),
-  aggregation: BigNumberAggregationType,
-  sortDirection: BigNumberSortDirection.optional(),
-  abbreviate: z.boolean().default(false),
-  prefix: z.string().optional(),
-  suffix: z.string().optional(),
-};
-
-const BigNumberConfiguration = z.object({ ...bigNumberConfigOptions });
-export type BigNumberConfiguration = z.infer<typeof BigNumberConfiguration>;
-
-export const QueryWidgetConfig = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("table"),
-    prettyFormatting: z.boolean().default(true),
-    sorting: z
-      .array(
-        z.object({
-          desc: z.boolean(),
-          id: z.string(),
-        })
-      )
-      .default([]),
-  }),
-  z.object({
-    type: z.literal("chart"),
-    ...chartConfigOptions,
-  }),
-  z.object({
-    type: z.literal("bignumber"),
-    ...bigNumberConfigOptions,
-  }),
-  z.object({
-    type: z.literal("title"),
-  }),
-]);
-
-export type QueryWidgetConfig = z.infer<typeof QueryWidgetConfig>;
+export const QueryWidgetConfig = DashboardWidgetDisplay;
+export type QueryWidgetConfig = DashboardWidgetDisplay;
+export type SortDirection = DashboardSortDirection;
+export type AggregationType = DashboardChartAggregation;
+export type ChartConfiguration = DashboardChartConfig;
+export type BigNumberAggregationType = DashboardBigNumberAggregation;
+export type BigNumberConfiguration = DashboardBigNumberConfig;
 
 /** Result data containing rows and column metadata */
 export type QueryWidgetData = {
@@ -141,6 +85,10 @@ export type QueryWidgetProps = {
   config: QueryWidgetConfig;
   /** The effective time range for the query (used to show full x-axis on time-based charts) */
   timeRange?: { from: string; to: string };
+  /** Relative period (e.g. "7d") the query ran with; passed to "Watch" */
+  period?: string;
+  /** Active dashboard filters, which are not part of the query; passed to "Watch" */
+  watchFilters?: WatchFilters;
   accessory?: ReactNode;
   isResizing?: boolean;
   isDraggable?: boolean;
@@ -164,6 +112,8 @@ export function QueryWidget({
   title,
   titleString,
   query,
+  period,
+  watchFilters,
   accessory,
   isLoading,
   error,
@@ -181,6 +131,12 @@ export function QueryWidget({
   const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(titleString ?? "");
   const containerRef = useRef<HTMLDivElement>(null);
+  const agent = useDashboardAgent();
+  const canUseAlerts = useCanUseAlertsList();
+  const organization = useOptionalOrganization();
+  const project = useOptionalProject();
+  const environment = useOptionalEnvironment();
+  const watchPending = useRef(false);
 
   const hasEditActions = onEdit || onRename || onDelete || onDuplicate;
   const hasData = props.data.rows.length > 0;
@@ -316,6 +272,30 @@ export function QueryWidget({
                     }}
                     leadingIconClassName="-ml-0.5 -mr-1"
                   />
+                  {query && agent && canUseAlerts && (
+                    <PopoverMenuItem
+                      icon={BellAlertIcon}
+                      title="Watch"
+                      onClick={() => {
+                        setIsMenuOpen(false);
+                        if (watchPending.current) return;
+                        watchPending.current = true;
+                        void openWidgetWatch({
+                          agent,
+                          analyzePath:
+                            organization && project && environment
+                              ? queryAnalyzePath(organization, project, environment)
+                              : undefined,
+                          query,
+                          period,
+                          title: titleString,
+                          filters: watchFilters,
+                        }).finally(() => {
+                          watchPending.current = false;
+                        });
+                      }}
+                    />
+                  )}
                   {onDelete && (
                     <PopoverMenuItem
                       icon={TrashIcon}

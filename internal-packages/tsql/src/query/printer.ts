@@ -98,6 +98,8 @@ interface JoinExprResponse {
 export class ClickHousePrinter {
   /** Stack of AST nodes being visited (for context) */
   private stack: AST[] = [];
+  /** Index of the top-level UNION branch being printed */
+  private unionBranch = 0;
   /** Indent level for pretty printing */
   private indentLevel = -1;
   /** Tab size for pretty printing */
@@ -140,6 +142,12 @@ export class ClickHousePrinter {
    * When true, internal-only columns will be rejected.
    */
   private inProjectionContext = false;
+  /** Aliases of subqueries in the current scope's FROM clause */
+  private subqueryAliases: Set<string> = new Set();
+  /** Whether the current scope's FROM clause contains a subquery */
+  private hasSubqueryInFrom = false;
+  /** ARRAY JOIN aliases and column CTE names of the current scope, usable as qualifiers */
+  private scopeAliases: Set<string> = new Set();
 
   constructor(
     private context: PrinterContext,
@@ -154,6 +162,7 @@ export class ClickHousePrinter {
   print(node: SelectQuery | SelectSetQuery): PrintResult {
     this.outputColumns = [];
     this.hiddenColumns = [];
+    this.validateColumnCtesDoNotShadowTables(node);
     const sql = this.visit(node);
     const result: PrintResult = {
       sql,
@@ -298,12 +307,15 @@ export class ClickHousePrinter {
 
   private visitSelectSetQuery(node: SelectSetQuery): string {
     this.indentLevel--;
+    const topLevel = this.stack.length === 1;
+    if (topLevel) this.unionBranch = 0;
     let ret = this.visit(node.initial_select_query);
     if (this.pretty) {
       ret = ret.trim();
     }
 
     for (const expr of node.subsequent_select_queries) {
+      if (topLevel) this.unionBranch++;
       let query = this.visit(expr.select_query);
       if (this.pretty) {
         query = query.trim();
@@ -339,6 +351,20 @@ export class ClickHousePrinter {
     const savedTableContexts = new Map(this.tableContexts);
     const savedInternalColumns = new Set(this.allowedInternalColumns);
     const savedInternalOnlyColumns = new Set(this.internalOnlyColumns);
+    const savedSubqueryAliases = this.subqueryAliases;
+    const savedHasSubqueryInFrom = this.hasSubqueryInFrom;
+    const savedScopeAliases = this.scopeAliases;
+    this.subqueryAliases = new Set();
+    this.hasSubqueryInFrom = false;
+    // Registered before the joins so JOIN ON can reference them too
+    this.scopeAliases = new Set([
+      ...Object.values(node.ctes ?? {})
+        .filter((cte) => cte.cte_type === "column")
+        .map((cte) => cte.name),
+      ...(node.array_join_list ?? []).flatMap((expr) =>
+        (expr as Alias).expression_type === "alias" ? [(expr as Alias).alias] : []
+      ),
+    ]);
     if (isTopLevelQuery) {
       this.tableContexts.clear();
       this.allowedInternalColumns.clear();
@@ -354,11 +380,16 @@ export class ClickHousePrinter {
     // Build WHERE clause starting with any existing where
     let where: Expression | undefined = node.where;
 
-    // Process CTEs
-    const cteStrings: string[] = [];
+    // Process subquery CTEs; column CTEs are printed after the joins below
+    const printedCtes = new Map<string, string>();
     if (node.ctes) {
       for (const [name, cte] of Object.entries(node.ctes)) {
-        cteStrings.push(`${this.printIdentifier(name)} AS (${this.visit(cte.expr)})`);
+        printedCtes.set(
+          name,
+          cte.cte_type === "column"
+            ? ""
+            : `${this.printIdentifier(name)} AS (${this.visit(cte.expr)})`
+        );
       }
     }
 
@@ -386,6 +417,7 @@ export class ClickHousePrinter {
     }
 
     this.validateMergeScopedColumns(node);
+    this.validateAliasesDoNotShadowTables(node);
 
     // Extract SELECT column aliases BEFORE visiting columns
     // This allows ORDER BY/HAVING to reference aliased columns
@@ -396,6 +428,21 @@ export class ClickHousePrinter {
         this.extractSelectAlias(col);
       }
     }
+
+    // Process column CTEs after the joins so they resolve fields against this scope's tables,
+    // with the same internal-only column rules as SELECT
+    if (node.ctes) {
+      for (const cte of Object.values(node.ctes)) {
+        if (cte.cte_type === "column") this.selectAliases.set(cte.name.toLowerCase(), cte.name);
+      }
+      for (const [name, cte] of Object.entries(node.ctes)) {
+        if (cte.cte_type !== "column") continue;
+        this.inProjectionContext = true;
+        printedCtes.set(name, `${this.visit(cte.expr)} AS ${this.printIdentifier(name)}`);
+        this.inProjectionContext = false;
+      }
+    }
+    const cteStrings = [...printedCtes.values()];
 
     // Track if query has GROUP BY for JSON subfield type hint decisions
     // (ClickHouse requires .:String for Dynamic types in GROUP BY, and SELECT must match)
@@ -589,6 +636,9 @@ export class ClickHousePrinter {
     this.tableContexts = savedTableContexts;
     this.allowedInternalColumns = savedInternalColumns;
     this.internalOnlyColumns = savedInternalOnlyColumns;
+    this.subqueryAliases = savedSubqueryAliases;
+    this.hasSubqueryInFrom = savedHasSubqueryInFrom;
+    this.scopeAliases = savedScopeAliases;
 
     return response;
   }
@@ -859,7 +909,7 @@ export class ClickHousePrinter {
       const textColumn = this.getTextColumnForField(field.chain);
       if (textColumn !== null && outputName) {
         // Use the text column instead of the JSON column, with alias to preserve name
-        sqlResult = `${this.printIdentifier(textColumn)} AS ${this.printIdentifier(outputName)}`;
+        sqlResult = `${this.printIdentifier(textColumn)} AS ${this.printGeneratedAlias(outputName)}`;
       } else {
         const virtualColumnName = this.getVirtualColumnNameForField(field.chain);
 
@@ -867,7 +917,7 @@ export class ClickHousePrinter {
           // Visit the field (which will return the expression)
           const visited = this.visit(col);
           // Add the alias to preserve the column name
-          sqlResult = `${visited} AS ${this.printIdentifier(virtualColumnName)}`;
+          sqlResult = `${visited} AS ${this.printGeneratedAlias(virtualColumnName)}`;
         } else {
           // Visit the field to get the ClickHouse SQL
           const visited = this.visit(col);
@@ -880,7 +930,7 @@ export class ClickHousePrinter {
             // e.g., output.message -> "output_message" (not "output_data_message")
             const dataPrefix = this.getDataPrefixForField(field.chain);
             const aliasName = this.buildAliasWithoutDataPrefix(field.chain, dataPrefix);
-            sqlResult = `${visited} AS ${this.printIdentifier(aliasName)}`;
+            sqlResult = `${visited} AS ${this.printGeneratedAlias(aliasName)}`;
             // Override output name for metadata
             effectiveOutputName = aliasName;
           }
@@ -891,7 +941,7 @@ export class ClickHousePrinter {
             sourceColumn?.clickhouseName &&
             sourceColumn.clickhouseName !== outputName
           ) {
-            sqlResult = `${visited} AS ${this.printIdentifier(outputName)}`;
+            sqlResult = `${visited} AS ${this.printGeneratedAlias(outputName)}`;
           } else {
             sqlResult = visited;
           }
@@ -908,7 +958,7 @@ export class ClickHousePrinter {
       const visited = this.visit(col);
       // Add explicit AS clause with the implicit name so ClickHouse results match our metadata
       if (outputName) {
-        sqlResult = `${visited} AS ${this.printIdentifier(outputName)}`;
+        sqlResult = `${visited} AS ${this.printGeneratedAlias(outputName, col)}`;
       } else {
         sqlResult = visited;
       }
@@ -1023,7 +1073,9 @@ export class ClickHousePrinter {
     const tableSchema = this.tableContexts.get(tableAlias);
 
     if (!tableSchema) {
-      // Table not found in context, fall back to literal table.*
+      if (!this.subqueryAliases.has(tableAlias) || this.isPhysicalTableName(tableAlias)) {
+        throw new QueryError(`Unknown table "${tableAlias}"`);
+      }
       return [`${this.printIdentifier(tableAlias)}.*`];
     }
 
@@ -1078,10 +1130,10 @@ export class ClickHousePrinter {
       // Check if this is a virtual column (has expression)
       if (isVirtualColumn(columnSchema)) {
         // Virtual column: use the expression with an alias
-        sqlResult = `(${columnSchema.expression}) AS ${this.printIdentifier(columnName)}`;
+        sqlResult = `(${columnSchema.expression}) AS ${this.printGeneratedAlias(columnName)}`;
       } else if (columnSchema.textColumn) {
         // JSON column with text column optimization: use the text column with alias
-        sqlResult = `${this.printIdentifier(columnSchema.textColumn)} AS ${this.printIdentifier(
+        sqlResult = `${this.printIdentifier(columnSchema.textColumn)} AS ${this.printGeneratedAlias(
           columnName
         )}`;
       } else {
@@ -1090,7 +1142,7 @@ export class ClickHousePrinter {
 
         // If the column has a different internal name, add an alias
         if (clickhouseName !== columnName) {
-          sqlResult = `${this.printIdentifier(clickhouseName)} AS ${this.printIdentifier(
+          sqlResult = `${this.printIdentifier(clickhouseName)} AS ${this.printGeneratedAlias(
             columnName
           )}`;
         } else {
@@ -1452,6 +1504,10 @@ export class ClickHousePrinter {
       return "Float64"; // Default
     }
 
+    if (["round", "floor", "ceil", "trunc", "abs"].includes(name)) {
+      return (call.args[0] && this.inferExpressionType(call.args[0])) ?? "Float64";
+    }
+
     // dateDiff returns Int64 (signed difference)
     if (name === "datediff" || name === "date_diff") {
       return "Int64";
@@ -1730,6 +1786,12 @@ export class ClickHousePrinter {
   // ============================================================
 
   private visitJoinExpr(node: JoinExpr): JoinExprResponse {
+    // ClickHouse binds a physical name to that table before an alias, which would move
+    // this table's tenant guard onto another table
+    if (node.alias && this.isPhysicalTableName(node.alias)) {
+      throw new QueryError(`Table alias "${node.alias}" is not allowed`);
+    }
+
     let extraWhere: Expression | null = null;
     const joinStrings: string[] = [];
 
@@ -1812,6 +1874,10 @@ export class ClickHousePrinter {
       ) {
         // Subquery
         joinStrings.push(this.visit(tableExpr));
+        this.hasSubqueryInFrom = true;
+        if (node.alias) {
+          this.subqueryAliases.add(node.alias);
+        }
       } else if ((tableExpr as Placeholder).expression_type === "placeholder") {
         throw new QueryError("Placeholder table expressions are not supported");
       } else {
@@ -1821,8 +1887,8 @@ export class ClickHousePrinter {
       }
     }
 
-    // Add alias
-    if (node.alias) {
+    // Add alias (direct table references already printed theirs)
+    if (node.alias && (node.table as Field | undefined)?.expression_type !== "field") {
       joinStrings.push(`AS ${this.printIdentifier(node.alias)}`);
     }
 
@@ -1922,6 +1988,170 @@ export class ClickHousePrinter {
         }
       }
     }
+  }
+
+  /**
+   * Reject an expression alias that reuses a table alias of this scope. ClickHouse resolves
+   * `r.organization_id` to an expression alias named `r` before the table column, so a Tuple
+   * or JSON alias would replace every tenant guard. A dotted alias such as
+   * `runs.organization_id` is rejected too: as an ARRAY JOIN alias it replaces the column the
+   * same way. Aliases that contain an aggregate or
+   * window function stay allowed (e.g. `count() AS runs FROM runs`): ClickHouse refuses to
+   * substitute those into WHERE, so they can never satisfy a guard. Runs per SELECT scope;
+   * subqueries validate themselves.
+   */
+  private validateAliasesDoNotShadowTables(node: SelectQuery): void {
+    if (this.tableContexts.size === 0) return;
+
+    const tableAliases = new Map<string, string>();
+    for (const alias of this.tableContexts.keys()) {
+      tableAliases.set(alias.toLowerCase(), alias);
+    }
+
+    for (const [property, value] of Object.entries(node)) {
+      if (property === "type" || property === "parent") continue;
+      this.findShadowingAlias(value, tableAliases);
+    }
+  }
+
+  /**
+   * Reject a column CTE (`WITH expr AS name`) whose name, or dotted prefix, matches a table
+   * alias anywhere in the query. ClickHouse carries a WITH alias into every branch of a UNION,
+   * where it would replace that branch's tenant guards, so a per-scope check is not enough.
+   */
+  private validateColumnCtesDoNotShadowTables(root: SelectQuery | SelectSetQuery): void {
+    const tableAliases = new Map<string, string>();
+    const cteNames: string[] = [];
+    const seen = new WeakSet<object>();
+    const walk = (expr: unknown): void => {
+      if (expr === null || typeof expr !== "object" || seen.has(expr)) return;
+      seen.add(expr);
+      if (Array.isArray(expr)) {
+        for (const item of expr) walk(item);
+        return;
+      }
+      const candidate = expr as Partial<JoinExpr> & Partial<CTE> & { expression_type?: string };
+      if (candidate.expression_type === "join_expr") {
+        const table = candidate.table as Field | undefined;
+        if (table?.expression_type === "field" && typeof table.chain[0] === "string") {
+          const alias = candidate.alias || table.chain[0];
+          tableAliases.set(alias.toLowerCase(), alias);
+        }
+      } else if (candidate.expression_type === "cte" && candidate.cte_type === "column") {
+        if (typeof candidate.name === "string") cteNames.push(candidate.name);
+      }
+      for (const [property, value] of Object.entries(expr)) {
+        if (property === "type" || property === "parent") continue;
+        walk(value);
+      }
+    };
+    walk(root);
+
+    for (const name of cteNames) {
+      const lowerName = name.toLowerCase();
+      for (const [lowerTableAlias, original] of tableAliases) {
+        if (lowerName === lowerTableAlias || lowerName.startsWith(`${lowerTableAlias}.`)) {
+          throw new QueryError(
+            `Alias '${name}' conflicts with the table alias '${original}'. ` +
+              `Choose a different alias.`
+          );
+        }
+      }
+    }
+  }
+
+  private findShadowingAlias(
+    expr: unknown,
+    tableAliases: Map<string, string>,
+    seen = new WeakSet<object>()
+  ): void {
+    if (expr === null || typeof expr !== "object") return;
+    if (seen.has(expr)) return;
+    seen.add(expr);
+    if (Array.isArray(expr)) {
+      for (const item of expr) this.findShadowingAlias(item, tableAliases, seen);
+      return;
+    }
+
+    const candidate = expr as Partial<Alias> &
+      Partial<CTE> & { expression_type?: string; name?: unknown };
+    if (
+      candidate.expression_type === "select_query" ||
+      candidate.expression_type === "select_set_query"
+    ) {
+      return;
+    }
+
+    let aliasName: string | undefined;
+    if (candidate.expression_type === "alias" && !candidate.hidden) {
+      aliasName = candidate.alias;
+    } else if (candidate.expression_type === "cte" && candidate.cte_type === "column") {
+      aliasName = typeof candidate.name === "string" ? candidate.name : undefined;
+    }
+    if (aliasName !== undefined) {
+      const lowerAlias = aliasName.toLowerCase();
+      let tableAlias: string | undefined;
+      for (const [lowerTableAlias, original] of tableAliases) {
+        if (lowerAlias === lowerTableAlias || lowerAlias.startsWith(`${lowerTableAlias}.`)) {
+          tableAlias = original;
+          break;
+        }
+      }
+      if (tableAlias !== undefined && !this.containsAggregateOrWindow(candidate.expr)) {
+        throw new QueryError(
+          `Alias '${aliasName}' conflicts with the table alias '${tableAlias}'. ` +
+            `Choose a different alias.`
+        );
+      }
+    }
+
+    for (const [property, value] of Object.entries(expr)) {
+      if (property === "type" || property === "parent") continue;
+      this.findShadowingAlias(value, tableAliases, seen);
+    }
+  }
+
+  private printGeneratedAlias(name: string, expr?: Expression): string {
+    const lowerName = name.toLowerCase();
+    for (const tableAlias of this.tableContexts.keys()) {
+      const lowerTableAlias = tableAlias.toLowerCase();
+      if (lowerName !== lowerTableAlias && !lowerName.startsWith(`${lowerTableAlias}.`)) continue;
+      if (expr !== undefined && this.containsAggregateOrWindow(expr)) break;
+      throw new QueryError(
+        `Column name '${name}' conflicts with the table alias '${tableAlias}'. ` +
+          `Give the column an alias with AS, or choose a different table alias.`
+      );
+    }
+    return this.printIdentifier(name);
+  }
+
+  private containsAggregateOrWindow(expr: unknown, seen = new WeakSet<object>()): boolean {
+    if (expr === null || typeof expr !== "object") return false;
+    if (seen.has(expr)) return false;
+    seen.add(expr);
+    if (Array.isArray(expr)) {
+      return expr.some((item) => this.containsAggregateOrWindow(item, seen));
+    }
+    const candidate = expr as { expression_type?: string; name?: unknown };
+    if (
+      candidate.expression_type === "select_query" ||
+      candidate.expression_type === "select_set_query" ||
+      candidate.expression_type === "lambda"
+    ) {
+      return false;
+    }
+    if (candidate.expression_type === "window_function") return true;
+    if (
+      candidate.expression_type === "call" &&
+      typeof candidate.name === "string" &&
+      findTSQLAggregation(candidate.name) !== undefined
+    ) {
+      return true;
+    }
+    return Object.entries(expr).some(
+      ([property, value]) =>
+        property !== "type" && property !== "parent" && this.containsAggregateOrWindow(value, seen)
+    );
   }
 
   private scopeReferencesColumn(node: SelectQuery, name: string): boolean {
@@ -2176,6 +2406,19 @@ export class ClickHousePrinter {
       if (validColumns.has(column)) {
         guards.push(this.createConditionExpression(column, condition, tableAlias));
       }
+    }
+
+    for (const window of this.context.windowConditions) {
+      if (window.table !== tableSchema.name) continue;
+      if (window.branch !== undefined && window.branch !== this.unionBranch) continue;
+      guards.push(
+        this.createConditionExpression(
+          window.column,
+          { op: "gte", value: window.from },
+          tableAlias
+        ),
+        this.createConditionExpression(window.column, { op: "lt", value: window.to }, tableAlias)
+      );
     }
 
     // Add required filters from the table schema (e.g., engine = 'V2')
@@ -2642,22 +2885,82 @@ export class ClickHousePrinter {
     return this.context.addValue(value);
   }
 
+  /**
+   * Print `*` or `alias.*` as the only argument of count(). Anywhere else ClickHouse would
+   * expand it to every stored column, including ones the schema doesn't expose.
+   */
+  private visitCountAsterisk(chain: Array<string | number>): string {
+    const parent = this.stack[this.stack.length - 2] as Call | undefined;
+    const isCountArg =
+      parent?.expression_type === "call" &&
+      parent.name.toLowerCase() === "count" &&
+      parent.args.length === 1 &&
+      !parent.distinct;
+    if (!isCountArg) {
+      throw new QueryError("* is only allowed as a SELECT column or in count(*)");
+    }
+
+    if (chain.length === 1) {
+      return "*";
+    }
+
+    const tableAlias = chain[0];
+    if (
+      chain.length === 2 &&
+      typeof tableAlias === "string" &&
+      (this.tableContexts.has(tableAlias) ||
+        (this.subqueryAliases.has(tableAlias) && !this.isPhysicalTableName(tableAlias)))
+    ) {
+      return `${this.printIdentifier(tableAlias)}.*`;
+    }
+
+    throw new QueryError(`Unknown table "${chain.slice(0, -1).join(".")}"`);
+  }
+
+  /**
+   * Reject a qualifier that isn't a name in scope. ClickHouse also resolves a qualifier
+   * against the physical table and database names, which would bypass the column allowlist.
+   */
+  private assertQualifierInScope(qualifier: string): void {
+    // Checked first: ClickHouse resolves a physical name to the table even when an alias matches it
+    if (this.isPhysicalTableName(qualifier)) {
+      throw new QueryError(`Unknown table "${qualifier}"`);
+    }
+
+    const isColumnInScope = [...this.tableContexts.values()].some((table) =>
+      Object.prototype.hasOwnProperty.call(table.columns, qualifier)
+    );
+    if (
+      isColumnInScope ||
+      this.subqueryAliases.has(qualifier) ||
+      this.scopeAliases.has(qualifier) ||
+      this.selectAliases.has(qualifier.toLowerCase())
+    ) {
+      return;
+    }
+
+    // With a subquery in FROM, the qualifier may be one of its output columns, which aren't tracked
+    if (this.hasSubqueryInFrom) {
+      return;
+    }
+
+    throw new QueryError(`Unknown table "${qualifier}"`);
+  }
+
+  private isPhysicalTableName(name: string): boolean {
+    return Object.values(this.context.schema.tables).some((table) =>
+      table.clickhouseName.split(".").includes(name)
+    );
+  }
+
   private visitField(node: Field): string {
     if (node.chain.length === 0) {
       throw new ImpossibleASTError("Field chain is empty");
     }
 
-    // Handle asterisk
-    if (node.chain.length === 1 && node.chain[0] === "*") {
-      return "*";
-    }
-
-    // Handle table.* asterisk
-    if (node.chain.length === 2 && node.chain[1] === "*") {
-      const tableAlias = node.chain[0];
-      if (typeof tableAlias === "string") {
-        return `${this.printIdentifier(tableAlias)}.*`;
-      }
+    // SELECT-list asterisks are expanded before reaching here, so only count(*) is left
+    if (node.chain[node.chain.length - 1] === "*") {
+      return this.visitCountAsterisk(node.chain);
     }
 
     // Check if this field is a virtual column
@@ -3073,7 +3376,8 @@ export class ClickHousePrinter {
           return [tableAlias, resolvedColumn, ...chain.slice(2)];
         }
       }
-      // Not a known table alias, might be a nested field or JSON path - return as-is
+      // Not a table alias: a JSON/Map path, or a subquery, ARRAY JOIN, CTE or SELECT alias
+      this.assertQualifierInScope(tableAlias);
       return chain;
     }
 

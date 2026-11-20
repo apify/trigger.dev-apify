@@ -4,6 +4,7 @@ import { z } from "zod";
 import { ClickhouseClient } from "./client/client.js";
 import { executeTSQL, createTSQLExecutor, type TableSchema } from "./client/tsql.js";
 import { insertTaskRuns } from "./taskRuns.js";
+import { insertMetrics } from "./metrics.js";
 import { column } from "@internal/tsql";
 
 /**
@@ -231,6 +232,146 @@ describe("TSQL Integration Tests", () => {
     expect(result2?.rows).toHaveLength(2);
     expect(result2?.rows?.map((r) => r.run_id).sort()).toEqual(["run_tenant2_a", "run_tenant2_b"]);
   });
+
+  clickhouseTest(
+    "should not let an alias that reuses the table alias replace the tenant guard",
+    async ({ clickhouseContainer }) => {
+      const client = new ClickhouseClient({
+        name: "test",
+        url: clickhouseContainer.getConnectionUrl(),
+      });
+
+      const insert = insertTaskRuns(client, { async_insert: 0 });
+
+      await insert([
+        createTaskRun({
+          run_id: "run_tenant1_a",
+          organization_id: "org_tenant1",
+          project_id: "proj_tenant1",
+          environment_id: "env_tenant1",
+        }),
+        createTaskRun({
+          run_id: "run_tenant2_a",
+          organization_id: "org_tenant2",
+          project_id: "proj_tenant2",
+          environment_id: "env_tenant2",
+        }),
+      ]);
+
+      const enforcedWhereClause = {
+        organization_id: { op: "eq" as const, value: "org_tenant1" },
+        project_id: { op: "eq" as const, value: "proj_tenant1" },
+        environment_id: { op: "eq" as const, value: "env_tenant1" },
+      };
+      const ownTenant = `JSONExtract('{"organization_id":"org_tenant1","project_id":"proj_tenant1","environment_id":"env_tenant1"}', 'Tuple(organization_id String, project_id String, environment_id String)')`;
+
+      for (const query of [
+        `SELECT run_id FROM task_runs AS r WHERE ${ownTenant} AS r IS NOT NULL`,
+        `SELECT run_id, ${ownTenant} AS task_runs FROM task_runs`,
+        `SELECT run_id FROM task_runs AS r ARRAY JOIN [${ownTenant}] AS r`,
+        "SELECT run_id FROM task_runs ARRAY JOIN ['org_tenant1'] AS `task_runs.organization_id`",
+      ]) {
+        const [error, result] = await executeTSQL(client, {
+          name: "test-alias-shadowing",
+          query,
+          schema: z.object({ run_id: z.string() }),
+          enforcedWhereClause,
+          tableSchema: [taskRunsSchema],
+        });
+
+        expect(error?.message).toMatch(/conflicts with the table alias/);
+        expect(result).toBeNull();
+      }
+
+      const [countError, countResult] = await executeTSQL(client, {
+        name: "test-alias-shadowing-count",
+        query: "SELECT count() AS task_runs FROM task_runs",
+        schema: z.object({ task_runs: z.coerce.number() }),
+        enforcedWhereClause,
+        tableSchema: [taskRunsSchema],
+      });
+
+      expect(countError).toBeNull();
+      expect(countResult?.rows).toEqual([{ task_runs: 1 }]);
+    }
+  );
+
+  clickhouseTest(
+    "should not let a WITH alias replace a tenant guard in another scope",
+    async ({ clickhouseContainer }) => {
+      const client = new ClickhouseClient({
+        name: "test",
+        url: clickhouseContainer.getConnectionUrl(),
+      });
+
+      const insert = insertTaskRuns(client, { async_insert: 0 });
+
+      await insert([
+        createTaskRun({
+          run_id: "run_tenant1_a",
+          organization_id: "org_tenant1",
+          project_id: "proj_tenant1",
+          environment_id: "env_tenant1",
+        }),
+        createTaskRun({
+          run_id: "run_tenant2_a",
+          organization_id: "org_tenant2",
+          project_id: "proj_tenant2",
+          environment_id: "env_tenant2",
+        }),
+      ]);
+
+      const enforcedWhereClause = {
+        organization_id: { op: "eq" as const, value: "org_tenant1" },
+        project_id: { op: "eq" as const, value: "proj_tenant1" },
+        environment_id: { op: "eq" as const, value: "env_tenant1" },
+      };
+      const ownTenant = `JSONExtract('{"organization_id":"org_tenant1","project_id":"proj_tenant1","environment_id":"env_tenant1"}', 'Tuple(organization_id String, project_id String, environment_id String)')`;
+
+      // ClickHouse carries a WITH alias into every UNION branch, where it would replace the
+      // branch's guards, so a WITH alias may not reuse a table alias anywhere in the query.
+      for (const query of [
+        `WITH ${ownTenant} AS r SELECT run_id FROM task_runs AS q UNION ALL SELECT run_id FROM task_runs AS r`,
+        `WITH ${ownTenant} AS task_runs SELECT 'x' AS run_id UNION ALL SELECT run_id FROM task_runs`,
+        `WITH ${ownTenant} AS r SELECT run_id FROM (SELECT run_id FROM task_runs AS r)`,
+        `WITH ${ownTenant} AS task_runs SELECT run_id FROM (SELECT run_id FROM task_runs)`,
+        `WITH (SELECT ${ownTenant}) AS task_runs SELECT run_id FROM task_runs AS q WHERE run_id IN (SELECT run_id FROM task_runs)`,
+      ]) {
+        const [error, result] = await executeTSQL(client, {
+          name: "test-outer-with-shadowing",
+          query,
+          schema: z.object({ run_id: z.string() }),
+          enforcedWhereClause,
+          tableSchema: [taskRunsSchema],
+        });
+
+        expect(error?.message).toMatch(/conflicts with the table alias/);
+        expect(result).toBeNull();
+      }
+
+      const [withError, withResult] = await executeTSQL(client, {
+        name: "test-with-expression-alias",
+        query: "WITH 1 AS x SELECT x",
+        schema: z.object({ x: z.coerce.number() }),
+        enforcedWhereClause,
+        tableSchema: [taskRunsSchema],
+      });
+
+      expect(withError).toBeNull();
+      expect(withResult?.rows).toEqual([{ x: 1 }]);
+
+      const [tableError, tableResult] = await executeTSQL(client, {
+        name: "test-with-expression-alias-and-table",
+        query: "WITH 1 AS x SELECT run_id, x FROM task_runs WHERE x = 1",
+        schema: z.object({ run_id: z.string(), x: z.coerce.number() }),
+        enforcedWhereClause,
+        tableSchema: [taskRunsSchema],
+      });
+
+      expect(tableError).toBeNull();
+      expect(tableResult?.rows).toEqual([{ run_id: "run_tenant1_a", x: 1 }]);
+    }
+  );
 
   clickhouseTest(
     "should not allow cross-tenant access even with malicious WHERE",
@@ -1835,6 +1976,118 @@ describe("TSQL Error Log Levels", () => {
       expect(error).not.toBeNull();
       expect(logged(errorSpy)).toContain("Error querying clickhouse");
       expect(logged(warnSpy)).not.toContain("Query exceeded a ClickHouse limit");
+    }
+  );
+});
+
+describe("TSQL correlated subqueries", () => {
+  const tenant = {
+    organization_id: { op: "eq" as const, value: "org_tenant1" },
+    project_id: { op: "eq" as const, value: "proj_tenant1" },
+    environment_id: { op: "eq" as const, value: "env_tenant1" },
+  };
+
+  // Catches: a subquery reading a stored column of the outer row that the schema doesn't list
+  clickhouseTest(
+    "rejects a WHERE subquery that reads the outer row, even if the caller enables it",
+    async ({ clickhouseContainer }) => {
+      const client = new ClickhouseClient({
+        name: "test",
+        url: clickhouseContainer.getConnectionUrl(),
+      });
+      await insertTaskRuns(client, { async_insert: 0 })([
+        createTaskRun({ run_id: "run_correlated1" }),
+      ]);
+
+      for (const query of [
+        "SELECT count() AS n FROM task_runs WHERE (SELECT engine) = 'V2'",
+        "SELECT count() AS n FROM task_runs WHERE (SELECT any(engine) FROM (SELECT 1)) = 'V2'",
+      ]) {
+        const [error, result] = await executeTSQL(client, {
+          name: "test-correlated-subquery",
+          query,
+          schema: z.any(),
+          enforcedWhereClause: tenant,
+          tableSchema: [taskRunsSchema],
+          clickhouseSettings: { allow_experimental_correlated_subqueries: 1 },
+        });
+
+        expect(error, query).not.toBeNull();
+        expect(result, query).toBeNull();
+      }
+
+      const [error, result] = await executeTSQL(client, {
+        name: "test-uncorrelated-subquery",
+        query: "SELECT run_id FROM task_runs WHERE run_id IN (SELECT run_id FROM task_runs)",
+        schema: z.object({ run_id: z.string() }),
+        enforcedWhereClause: tenant,
+        tableSchema: [taskRunsSchema],
+      });
+
+      expect(error).toBeNull();
+      expect(result?.rows).toEqual([{ run_id: "run_correlated1" }]);
+    }
+  );
+});
+
+describe("TSQL table aliases", () => {
+  const metricsSchema: TableSchema = {
+    name: "metrics",
+    clickhouseName: "trigger_dev.metrics_v1",
+    columns: {
+      metric_name: { name: "metric_name", ...column("String") },
+      organization_id: { name: "organization_id", ...column("String") },
+      project_id: { name: "project_id", ...column("String") },
+      environment_id: { name: "environment_id", ...column("String") },
+    },
+    tenantColumns: {
+      organizationId: "organization_id",
+      projectId: "project_id",
+      environmentId: "environment_id",
+    },
+  };
+
+  // Catches: a table alias naming another table's physical name moving its tenant guard
+  clickhouseTest(
+    "rejects a table alias that names another table's physical table",
+    async ({ clickhouseContainer }) => {
+      const client = new ClickhouseClient({
+        name: "test",
+        url: clickhouseContainer.getConnectionUrl(),
+      });
+      await insertTaskRuns(client, { async_insert: 0 })([createTaskRun({ run_id: "run_alias1" })]);
+      const [metricInsertError] = await insertMetrics(client)(
+        [
+          {
+            organization_id: "org_tenant2",
+            project_id: "proj_tenant2",
+            environment_id: "env_tenant2",
+            metric_name: "other_tenant_metric",
+            metric_type: "gauge",
+            metric_subject: "",
+            bucket_start: new Date().toISOString().slice(0, 19).replace("T", " "),
+            value: 1,
+            attributes: {},
+          },
+        ],
+        { params: { clickhouse_settings: { async_insert: 0 } } }
+      );
+      expect(metricInsertError).toBeNull();
+
+      const [error, result] = await executeTSQL(client, {
+        name: "test-physical-name-alias",
+        query: "SELECT metric_name FROM task_runs AS r JOIN metrics AS task_runs_v2 ON 1 = 1",
+        schema: z.object({ metric_name: z.string() }),
+        enforcedWhereClause: {
+          organization_id: { op: "eq", value: "org_tenant1" },
+          project_id: { op: "eq", value: "proj_tenant1" },
+          environment_id: { op: "eq", value: "env_tenant1" },
+        },
+        tableSchema: [taskRunsSchema, metricsSchema],
+      });
+
+      expect(error).not.toBeNull();
+      expect(result).toBeNull();
     }
   );
 });

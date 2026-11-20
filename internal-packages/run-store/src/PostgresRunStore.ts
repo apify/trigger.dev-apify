@@ -1,4 +1,8 @@
 import {
+  waitpointKeyTransactionLaneForClient,
+  type WaitpointKeyTransactionLane,
+} from "./waitpointKeyTransactionLane.js";
+import {
   Prisma,
   boundedIn,
   withInfraRetry,
@@ -24,7 +28,6 @@ import type {
   CreateFailedRunInput,
   CreateRunInput,
   ExpireSnapshotInput,
-  FinalizeRunData,
   ForWaitpointCompletionContext,
   IdempotencyKeyRunMatch,
   LatestExecutionSnapshotRead,
@@ -67,9 +70,6 @@ export interface RunOpsCapableClient {
   taskRunExecutionSnapshot: RunOpsDelegate<"create" | "findFirst" | "findMany">;
   taskRunWaitpoint: RunOpsDelegate<"deleteMany" | "findMany">;
   taskRunCheckpoint: RunOpsDelegate<"create" | "findFirst">;
-  checkpoint: RunOpsDelegate<"create" | "findFirst">;
-  checkpointRestoreEvent: RunOpsDelegate<"create" | "findFirst">;
-  taskRunDependency: RunOpsDelegate<"create" | "findFirst" | "findMany">;
   waitpoint: RunOpsDelegate<
     "create" | "findFirst" | "findMany" | "update" | "updateMany" | "upsert"
   >;
@@ -317,17 +317,6 @@ const hydrateAssociatedWaitpoint: DedicatedRelationHydrator = async (
   return byParent;
 };
 
-// Display connections for a run: WaitpointRunConnection → Waitpoint rows.
-const hydrateConnectedWaitpoints: DedicatedRelationHydrator = async (client, parents, projection) =>
-  batchHydrateJoinRelation(
-    client.waitpointRunConnection,
-    client.waitpoint,
-    parents.map((p) => p.id as string),
-    "taskRunId",
-    "waitpointId",
-    projection
-  );
-
 // Completed waitpoints for a snapshot: CompletedWaitpoint join → Waitpoint rows.
 const hydrateCompletedWaitpoints: DedicatedRelationHydrator = async (client, parents, projection) =>
   batchHydrateJoinRelation(
@@ -339,111 +328,10 @@ const hydrateCompletedWaitpoints: DedicatedRelationHydrator = async (client, par
     projection
   );
 
-// Runs a waitpoint is blocking: TaskRunWaitpoint rows keyed by waitpointId. A nested `taskRun`
-// select (the run-engine's getWaitpoint shape) is resolved from the scalar TaskRunWaitpoint.taskRunId.
-const hydrateBlockingTaskRuns: DedicatedRelationHydrator = async (client, parents, projection) => {
-  const parentIds = parents.map((p) => p.id as string);
-  const byParent = new Map<string, unknown[]>(parentIds.map((id) => [id, []]));
-  if (parentIds.length === 0) {
-    return byParent;
-  }
-  const edges = (await client.taskRunWaitpoint.findMany({
-    where: { waitpointId: { in: boundedIn(parentIds) } },
-  })) as Record<string, unknown>[];
-  const nestedTaskRun = projection?.select?.taskRun;
-  const runProjection = nestedTaskRun ? projectionOf(nestedTaskRun as SubProjection) : undefined;
-  let byRunId = new Map<string, Record<string, unknown>>();
-  if (nestedTaskRun) {
-    const runIds = [...new Set(edges.map((e) => e.taskRunId as string))];
-    const runs = (
-      runIds.length > 0
-        ? await client.taskRun.findMany(
-            targetFindManyArgs({ id: { in: boundedIn(runIds) } }, runProjection, ["id"])
-          )
-        : []
-    ) as Record<string, unknown>[];
-    byRunId = new Map(runs.map((r) => [r.id as string, r]));
-  }
-  for (const edge of edges) {
-    const bucket = byParent.get(edge.waitpointId as string);
-    if (!bucket) continue;
-    bucket.push(
-      nestedTaskRun
-        ? {
-            ...edge,
-            taskRun: applyProjection(byRunId.get(edge.taskRunId as string) ?? null, runProjection),
-          }
-        : edge
-    );
-  }
-  return byParent;
-};
-
-// Display connections for a waitpoint: WaitpointRunConnection → TaskRun rows. Bounded per parent to
-// CONNECTED_RUNS_LIMIT via a window function + existence-JOIN to TaskRun, mirroring the id-list
-// helper findWaitpointConnectedRunIds: a dangling (run-less) connection row never occupies a LIMIT
-// slot, and a heavily-fanned-in waitpoint never hydrates an unbounded connectedRuns list. This is
-// the DISPLAY relation only — functional blocking reads (hydrateBlockingTaskRuns) stay uncapped.
-const hydrateConnectedRuns: DedicatedRelationHydrator = async (client, parents, projection) => {
-  const parentIds = parents.map((p) => p.id as string);
-  const byParent = new Map<string, unknown[]>(parentIds.map((id) => [id, []]));
-  if (parentIds.length === 0) {
-    return byParent;
-  }
-  // One grouped query for the bounded edges across every parent: ROW_NUMBER partitioned per
-  // waitpoint keeps at most CONNECTED_RUNS_LIMIT rows per parent (uses @@index([waitpointId])).
-  const links = (await client.$queryRaw`
-    SELECT ranked."waitpointId" AS "waitpointId", ranked."taskRunId" AS "taskRunId"
-    FROM (
-      SELECT c."waitpointId", c."taskRunId",
-        ROW_NUMBER() OVER (PARTITION BY c."waitpointId" ORDER BY c."id") AS rn
-      FROM "WaitpointRunConnection" c
-      JOIN "TaskRun" t ON t."id" = c."taskRunId"
-      WHERE c."waitpointId" = ANY(${parentIds}::text[])
-    ) ranked
-    WHERE ranked.rn <= ${CONNECTED_RUNS_LIMIT}
-  `) as { waitpointId: string; taskRunId: string }[];
-  if (links.length === 0) {
-    return byParent;
-  }
-  const targetIds = [...new Set(links.map((l) => l.taskRunId))];
-  const rows = (await client.taskRun.findMany(
-    targetFindManyArgs({ id: { in: boundedIn(targetIds) } }, projection, ["id"])
-  )) as Record<string, unknown>[];
-  const byTargetId = new Map(rows.map((r) => [r.id as string, r]));
-  for (const link of links) {
-    const target = byTargetId.get(link.taskRunId);
-    const bucket = byParent.get(link.waitpointId);
-    if (target && bucket) {
-      bucket.push(applyProjection(target, projection));
-    }
-  }
-  return byParent;
-};
-
-// Snapshots that completed a waitpoint: CompletedWaitpoint join → TaskRunExecutionSnapshot rows.
-const hydrateCompletedExecutionSnapshots: DedicatedRelationHydrator = async (
-  client,
-  parents,
-  projection
-) =>
-  batchHydrateJoinRelation(
-    client.completedWaitpoint,
-    client.taskRunExecutionSnapshot,
-    parents.map((p) => p.id as string),
-    "waitpointId",
-    "snapshotId",
-    projection
-  );
-
 // The waitpoint each block edge points at, resolved from its scalar `waitpointId`. The edge's own
 // client only finds a co-resident token; the router re-resolves cross-DB.
 const hydrateEdgeWaitpoint: DedicatedRelationHydrator = async (client, parents, projection) =>
   batchHydrateEdgeTarget(client.waitpoint, parents, "waitpointId", projection);
-
-// The run each block edge belongs to, resolved from its scalar `taskRunId`.
-const hydrateEdgeTaskRun: DedicatedRelationHydrator = async (client, parents, projection) =>
-  batchHydrateEdgeTarget(client.taskRun, parents, "taskRunId", projection);
 
 // Generic to-one relation reached via a scalar FK ON the parent itself (not a join model): one
 // grouped target query for every distinct FK value across the batch.
@@ -478,7 +366,6 @@ async function batchHydrateEdgeTarget(
 
 const TASK_RUN_DEDICATED: DedicatedRelationSpec = {
   associatedWaitpoint: hydrateAssociatedWaitpoint,
-  connectedWaitpoints: hydrateConnectedWaitpoints,
 };
 
 // Dedicated-schema relations on the TaskRunWaitpoint (block edge) model. The dedicated subset has only the
@@ -486,18 +373,14 @@ const TASK_RUN_DEDICATED: DedicatedRelationSpec = {
 // stripped and hydrated.
 const TASK_RUN_WAITPOINT_DEDICATED: DedicatedRelationSpec = {
   waitpoint: hydrateEdgeWaitpoint,
-  taskRun: hydrateEdgeTaskRun,
 };
 
 const SNAPSHOT_DEDICATED: DedicatedRelationSpec = {
   completedWaitpoints: hydrateCompletedWaitpoints,
 };
 
-const WAITPOINT_DEDICATED: DedicatedRelationSpec = {
-  blockingTaskRuns: hydrateBlockingTaskRuns,
-  connectedRuns: hydrateConnectedRuns,
-  completedExecutionSnapshots: hydrateCompletedExecutionSnapshots,
-};
+// Nothing is hydrated; kept so stripDedicatedRelations still adds id to a narrowed select.
+const WAITPOINT_DEDICATED: DedicatedRelationSpec = {};
 
 // Cross-generation Prisma error normalization.
 //
@@ -550,9 +433,6 @@ const RUN_OPS_DELEGATE_KEYS: ReadonlySet<string> = new Set([
   "taskRunExecutionSnapshot",
   "taskRunWaitpoint",
   "taskRunCheckpoint",
-  "checkpoint",
-  "checkpointRestoreEvent",
-  "taskRunDependency",
   "waitpoint",
   "completedWaitpoint",
   "waitpointRunConnection",
@@ -666,7 +546,10 @@ export class PostgresRunStore implements RunStore {
   private readonly infraRetry?: InfraRetryConfig;
   private readonly readInfraRetry?: InfraRetryConfig;
 
+  private readonly waitpointKeyTransactionLane?: WaitpointKeyTransactionLane;
+
   constructor(options: PostgresRunStoreOptions) {
+    this.waitpointKeyTransactionLane = waitpointKeyTransactionLaneForClient(options.prisma);
     // Normalize foreign (run-ops-generation) Prisma known-request-errors to the control-plane
     // class at the write boundary so callers' `instanceof Prisma.PrismaClientKnownRequestError`
     // (P2002→422) works regardless of which generated client backs the store.
@@ -713,6 +596,23 @@ export class PostgresRunStore implements RunStore {
   // DBs. Cast mirrors runInTransaction: the generated clients differ only in delegates reads use.
   get primaryReadClient(): ReadClient {
     return this.prisma as unknown as ReadClient;
+  }
+
+  getWaitpointKeyScope(_ownerId?: string): string {
+    return "legacy";
+  }
+
+  /** Enabled keyed creation uses its isolated writer, retaining this leaf’s schema semantics. */
+  runInWaitpointKeyTransaction<R>(
+    _ownerId: string | undefined,
+    organizationId: string,
+    acceptUntil: number,
+    fn: (store: RunStore, tx: PrismaClientOrTransaction) => Promise<R>
+  ): Promise<R> {
+    if (!this.waitpointKeyTransactionLane) {
+      throw new Error("Keyed waitpoint creation requires an isolated transaction lane");
+    }
+    return this.waitpointKeyTransactionLane.run(organizationId, acceptUntil, (tx) => fn(this, tx));
   }
 
   // Open ONE interactive transaction on this store's OWN writer client and run `fn` against THIS store
@@ -944,7 +844,12 @@ export class PostgresRunStore implements RunStore {
 
   async startAttempt<S extends Prisma.TaskRunSelect>(
     runId: string,
-    data: { attemptNumber: number; executedAt?: Date; isWarmStart: boolean },
+    data: {
+      attemptNumber: number;
+      executedAt?: Date;
+      isWarmStart: boolean;
+      annotations?: Prisma.InputJsonValue;
+    },
     args: { select: S },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
@@ -958,6 +863,7 @@ export class PostgresRunStore implements RunStore {
         attemptNumber: data.attemptNumber,
         executedAt: data.executedAt,
         isWarmStart: data.isWarmStart,
+        annotations: data.annotations,
       },
       { select: args.select }
     ) as Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
@@ -1034,7 +940,7 @@ export class PostgresRunStore implements RunStore {
 
   async requeueRun<S extends Prisma.TaskRunSelect>(
     runId: string,
-    args: { select: S },
+    args: { select: S; workerQueue?: string },
     tx?: PrismaClientOrTransaction
   ): Promise<Prisma.TaskRunGetPayload<{ select: S }>> {
     const prisma = tx ?? this.prisma;
@@ -1042,9 +948,26 @@ export class PostgresRunStore implements RunStore {
     return this.#updateTaskRunWithSelect(
       prisma,
       { id: runId },
-      { status: "PENDING" },
+      { status: "PENDING", ...(args.workerQueue ? { workerQueue: args.workerQueue } : {}) },
       { select: args.select }
     ) as Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
+  }
+
+  async markRunWaitpointsOnStore(runId: string): Promise<void> {
+    const marked = await this.prisma.$executeRaw`
+      UPDATE "TaskRun"
+      SET "annotations" =
+            (CASE WHEN jsonb_typeof("annotations") = 'object'
+              THEN "annotations" ELSE '{}'::jsonb END) || '{"waitpointsOnStore":true}'::jsonb,
+          "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = ${runId}
+        AND ("annotations" -> 'waitpointsOnStore') IS DISTINCT FROM 'true'::jsonb
+    `;
+    if (marked === 0) {
+      // An existing marker is already durable; avoid another row version/replication event.
+      // Preserve the missing-run error before the caller may absorb native edges.
+      await this.prisma.taskRun.findFirstOrThrow({ where: { id: runId }, select: { id: true } });
+    }
   }
 
   async recordBulkActionMembership(
@@ -1121,61 +1044,6 @@ export class PostgresRunStore implements RunStore {
       },
       { select: args.select }
     ) as Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
-  }
-
-  finalizeRun<S extends Prisma.TaskRunSelect>(
-    runId: string,
-    data: FinalizeRunData,
-    args: { select: S },
-    tx?: PrismaClientOrTransaction
-  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
-  finalizeRun<I extends Prisma.TaskRunInclude>(
-    runId: string,
-    data: FinalizeRunData,
-    args: { include: I },
-    tx?: PrismaClientOrTransaction
-  ): Promise<Prisma.TaskRunGetPayload<{ include: I }>>;
-  finalizeRun(
-    runId: string,
-    data: FinalizeRunData,
-    tx?: PrismaClientOrTransaction
-  ): Promise<TaskRun>;
-  async finalizeRun(
-    runId: string,
-    data: FinalizeRunData,
-    argsOrTx?:
-      | { select?: Prisma.TaskRunSelect; include?: Prisma.TaskRunInclude }
-      | PrismaClientOrTransaction,
-    tx?: PrismaClientOrTransaction
-  ): Promise<unknown> {
-    // Disambiguate the 3rd positional: a `{ select | include }` projection vs. a tx client (a client
-    // never carries a select/include own-key), mirroring #resolveReadArgs on the read path.
-    const isProjection =
-      typeof argsOrTx === "object" &&
-      argsOrTx !== null &&
-      ("select" in argsOrTx || "include" in argsOrTx);
-    const args = isProjection
-      ? (argsOrTx as { select?: Prisma.TaskRunSelect; include?: Prisma.TaskRunInclude })
-      : {};
-    const prisma =
-      (isProjection ? tx : (argsOrTx as PrismaClientOrTransaction | undefined)) ?? this.prisma;
-
-    // status + error land in the SAME update (a separate later error write races realtime, which
-    // shuts the stream on the final status before the error lands). undefined fields are skipped.
-    return this.#updateTaskRunWithSelect(
-      prisma,
-      { id: runId },
-      {
-        ...(data.status !== undefined && { status: data.status }),
-        ...(data.expiredAt !== undefined && { expiredAt: data.expiredAt }),
-        ...(data.completedAt !== undefined && { completedAt: data.completedAt }),
-        ...(data.error !== undefined && { error: data.error as Prisma.InputJsonValue }),
-        ...(data.bulkActionId !== undefined && {
-          bulkActionGroupIds: { push: data.bulkActionId },
-        }),
-      },
-      args
-    );
   }
 
   async expireRun<S extends Prisma.TaskRunSelect>(
@@ -1766,22 +1634,6 @@ export class PostgresRunStore implements RunStore {
     return this.#findTaskRunWithSelect(this.prisma, "findFirst", where, args ?? {});
   }
 
-  findRunOrThrowOnPrimary<S extends Prisma.TaskRunSelect>(
-    where: Prisma.TaskRunWhereInput,
-    args: { select: S }
-  ): Promise<Prisma.TaskRunGetPayload<{ select: S }>>;
-  findRunOrThrowOnPrimary<I extends Prisma.TaskRunInclude>(
-    where: Prisma.TaskRunWhereInput,
-    args: { include: I }
-  ): Promise<Prisma.TaskRunGetPayload<{ include: I }>>;
-  findRunOrThrowOnPrimary(where: Prisma.TaskRunWhereInput): Promise<TaskRun>;
-  async findRunOrThrowOnPrimary(
-    where: Prisma.TaskRunWhereInput,
-    args?: { select?: Prisma.TaskRunSelect; include?: Prisma.TaskRunInclude }
-  ): Promise<unknown> {
-    return this.#findTaskRunWithSelect(this.prisma, "findFirstOrThrow", where, args ?? {});
-  }
-
   findRuns<S extends Prisma.TaskRunSelect>(
     args: {
       where: Prisma.TaskRunWhereInput;
@@ -2080,6 +1932,9 @@ export class PostgresRunStore implements RunStore {
     return undefined;
   }
 
+  // Nor any pending snapshot unit to settle.
+  async settlePendingUnit(): Promise<void> {}
+
   async #createExecutionSnapshot(
     input: CreateExecutionSnapshotInput,
     prisma: PrismaClientOrTransaction
@@ -2278,7 +2133,7 @@ export class PostgresRunStore implements RunStore {
     };
   }
 
-  // Reverse of `connectedRuns`: the run ids linked to a waitpoint. Co-resident with the RUN (the join
+  // The run ids linked to a waitpoint. Co-resident with the RUN (the join
   // is written on the run's DB in blockRunWithWaitpointEdges), so the waitpoint's own store can MISS a
   // cross-DB run — the router fans this across BOTH DBs.
   // Bounded to CONNECTED_RUNS_LIMIT via an existence-JOIN to TaskRun, mirroring the webapp's
@@ -2309,31 +2164,6 @@ export class PostgresRunStore implements RunStore {
       LIMIT ${CONNECTED_RUNS_LIMIT}
     `;
     return rows.map((row) => row.A);
-  }
-
-  // Reverse of `completedExecutionSnapshots`: the snapshot ids that completed a waitpoint. The join is
-  // co-resident with the SNAPSHOT/run, so the waitpoint's own store can MISS a cross-DB snapshot — the
-  // router fans this across BOTH DBs (the reverse direction of the resume-payload output recovery).
-  async findWaitpointCompletedSnapshotIds(
-    waitpointId: string,
-    client?: ReadClient
-  ): Promise<string[]> {
-    const prisma = client ?? this.readOnlyPrisma;
-
-    const joinDelegate = (prisma as RunOpsCapableClient).completedWaitpoint;
-    if (this.schemaVariant === "dedicated" && joinDelegate) {
-      const links = (await joinDelegate.findMany({
-        where: { waitpointId },
-        select: { snapshotId: true },
-      })) as { snapshotId: string }[];
-      return links.map((l) => l.snapshotId);
-    }
-
-    // Legacy implicit M2M `_completedWaitpoints`: A = TaskRunExecutionSnapshot.id, B = Waitpoint.id.
-    const result = await prisma.$queryRaw<{ A: string }[]>`
-      SELECT "A" FROM "_completedWaitpoints" WHERE "B" = ${waitpointId}
-    `;
-    return result.map((r) => r.A);
   }
 
   async blockRunWithWaitpointEdges(params: {
@@ -2608,17 +2438,6 @@ export class PostgresRunStore implements RunStore {
     return prisma.waitpoint.update(args) as Promise<Prisma.WaitpointGetPayload<T>>;
   }
 
-  async updateManyWaitpoints(
-    args: Prisma.WaitpointUpdateManyArgs,
-    tx?: PrismaClientOrTransaction
-  ): Promise<Prisma.BatchPayload> {
-    // Generic update: NOT retried. It accepts arbitrary update args, which may be non-idempotent (e.g.
-    // a Prisma increment), so replaying it on a blip is unsafe. Replay-safe waitpoint completion has
-    // its own retried path, markWaitpointCompleted.
-    const prisma = tx ?? this.prisma;
-    return prisma.waitpoint.updateMany(args);
-  }
-
   async markWaitpointCompleted(
     waitpointId: string,
     completion: {
@@ -2665,7 +2484,7 @@ export class PostgresRunStore implements RunStore {
         >;
       }
 
-      // Dedicated subset: strip the `waitpoint`/`taskRun` relation keys (no relation on the subset →
+      // Dedicated subset: strip the `waitpoint` relation key (no relation on the subset →
       // straight-through would throw a Prisma validation error), run the scalar findMany, then hydrate
       // from the edge's own client. A cross-DB token is missed here and re-resolved by the router.
       const { where, orderBy, take, skip, cursor, ...projection } = args as Record<string, any>;
@@ -2673,7 +2492,7 @@ export class PostgresRunStore implements RunStore {
         projection,
         TASK_RUN_WAITPOINT_DEDICATED
       );
-      // Keep the scalar ids the hydrators key off through a narrowed select.
+      // Keep the scalar ids `waitpointId` and `taskRunId` through a narrowed select.
       if (stripped.select) {
         stripped.select.waitpointId = true;
         stripped.select.taskRunId = true;
@@ -2775,6 +2594,24 @@ export class PostgresRunStore implements RunStore {
   }
 
   // --- BatchTaskRun (run-ops) ---
+
+  async markBatchWaitpointOnStore(batchId: string, waitpointId: string): Promise<void> {
+    const count = await this.prisma.$executeRaw`
+      UPDATE "BatchTaskRun" SET "options" = (CASE WHEN jsonb_typeof("options") = 'object' THEN "options" ELSE '{}'::jsonb END) || jsonb_build_object('waitpointStoreId',${waitpointId}::text), "updatedAt" = CURRENT_TIMESTAMP
+      WHERE "id" = ${batchId} AND ("options" ->> 'waitpointStoreId') IS NULL
+    `;
+    if (count === 0) {
+      const batch = await this.prisma.batchTaskRun.findFirst({
+        where: { id: batchId },
+        select: { options: true },
+      });
+      if (
+        !batch ||
+        (batch.options as Record<string, unknown> | null)?.waitpointStoreId !== waitpointId
+      )
+        throw new Error("Batch waitpoint storage identity changed or batch is missing");
+    }
+  }
 
   async createBatchTaskRun(
     data: CreateBatchTaskRunData,
@@ -2879,43 +2716,6 @@ export class PostgresRunStore implements RunStore {
     const prisma = client ?? this.prisma;
 
     return prisma.batchTaskRunItem.count({ where });
-  }
-
-  async updateManyBatchTaskRunItems(
-    args: Prisma.BatchTaskRunItemUpdateManyArgs,
-    tx?: PrismaClientOrTransaction
-  ): Promise<Prisma.BatchPayload> {
-    const prisma = tx ?? this.prisma;
-
-    return prisma.batchTaskRunItem.updateMany(args);
-  }
-
-  // The item's `batchTaskRun`/`taskRun` relations stay real FKs on BOTH schemas (co-resident), so a
-  // caller `include` passes straight through — no dedicated-subset stripping is needed.
-  async findManyBatchTaskRunItems<I extends Prisma.BatchTaskRunItemInclude = {}>(
-    where: { taskRunId?: string; batchTaskRunId?: string },
-    args?: { include?: I },
-    client?: ReadClient
-  ): Promise<Prisma.BatchTaskRunItemGetPayload<{ include: I }>[]> {
-    const prisma = client ?? this.readOnlyPrisma;
-
-    return prisma.batchTaskRunItem.findMany({
-      where,
-      ...(args?.include ? { include: args.include } : {}),
-    }) as Promise<Prisma.BatchTaskRunItemGetPayload<{ include: I }>[]>;
-  }
-
-  async findBatchTaskRunItem<I extends Prisma.BatchTaskRunItemInclude = {}>(
-    where: { batchTaskRunId: string; taskRunId?: string },
-    args?: { include?: I },
-    client?: ReadClient
-  ): Promise<Prisma.BatchTaskRunItemGetPayload<{ include: I }> | null> {
-    const prisma = client ?? this.readOnlyPrisma;
-
-    return prisma.batchTaskRunItem.findFirst({
-      where,
-      ...(args?.include ? { include: args.include } : {}),
-    }) as Promise<Prisma.BatchTaskRunItemGetPayload<{ include: I }> | null>;
   }
 
   // --- WaitpointTag (run-ops) ---

@@ -55,7 +55,8 @@ import {
 } from "../taskContext/otelProcessors.js";
 import { traceContext } from "../trace-context-api.js";
 import { getEnvVar } from "../utils/getEnv.js";
-import { machineId } from "./machineId.js";
+import { getMachineId } from "./machineId.js";
+import { UserSpanProcessorWrapper } from "./userSpanProcessor.js";
 import { startDiskIoMetrics } from "./diskIoMetrics.js";
 import { startFilesystemMetrics } from "./filesystemMetrics.js";
 import { startNodejsRuntimeMetrics } from "./nodejsRuntimeMetrics.js";
@@ -75,6 +76,7 @@ export type TracingSDKConfig = {
   forceFlushTimeoutMillis?: number;
   instrumentations?: Instrumentation[];
   exporters?: SpanExporter[];
+  spanProcessors?: SpanProcessor[];
   logExporters?: LogRecordExporter[];
   metricExporters?: PushMetricExporter[];
   metricReaders?: MetricReader[];
@@ -128,7 +130,7 @@ export class TracingSDK {
           [SemanticInternalAttributes.CLI_VERSION]: VERSION,
           [SemanticInternalAttributes.SDK_VERSION]: VERSION,
           [SemanticInternalAttributes.SDK_LANGUAGE]: "typescript",
-          [SemanticInternalAttributes.MACHINE_ID]: machineId,
+          [SemanticInternalAttributes.MACHINE_ID]: getMachineId(),
         })
       )
       .merge(resourceFromAttributes(envResourceAttributes))
@@ -141,7 +143,9 @@ export class TracingSDK {
       timeoutMillis: config.forceFlushTimeoutMillis,
     });
 
-    const spanProcessors: Array<SpanProcessor> = [];
+    const spanProcessors: Array<SpanProcessor> = (config.spanProcessors ?? []).map(
+      (processor) => new UserSpanProcessorWrapper(processor)
+    );
 
     spanProcessors.push(
       new TaskContextSpanProcessor(

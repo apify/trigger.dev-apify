@@ -1,5 +1,4 @@
 import type { FinalizeDeploymentRequestBody } from "@trigger.dev/core/v3/schemas";
-import { Prisma } from "@trigger.dev/database";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { updateEnvConcurrencyLimits } from "../runQueue.server";
@@ -14,8 +13,17 @@ import { recordDeploymentFinished } from "./recordDeploymentFinished.server";
 import { engine } from "../runEngine.server";
 import { tryCatch } from "@trigger.dev/core";
 import { externalDeploymentCacheInstance } from "~/services/externalDeploymentCacheInstance.server";
+import type { PrismaClientOrTransaction } from "~/db.server";
+import { queueDeploymentCheck } from "../deploymentChecksWorker.server";
 
 export class FinalizeDeploymentService extends BaseService {
+  constructor(
+    prisma?: PrismaClientOrTransaction,
+    private readonly queueCheck: (deploymentId: string) => Promise<void> = queueDeploymentCheck
+  ) {
+    super(prisma);
+  }
+
   public async call(
     authenticatedEnv: AuthenticatedEnvironment,
     id: string,
@@ -65,6 +73,16 @@ export class FinalizeDeploymentService extends BaseService {
       throw new ServiceValidationError("Worker deployment is not in DEPLOYING status");
     }
 
+    // Sandbox tasks only run on microVMs, so a deployment without a template cannot serve them.
+    const sandboxTask = deployment.worker.tasks.find((task) => task.executionMode === "SANDBOX");
+    if (sandboxTask && !deployment.templateKey) {
+      const message = `Sandbox task "${sandboxTask.slug}" needs microVM compute, but this deployment has no compute template.`;
+      await new FailDeploymentService().call(authenticatedEnv, deployment.friendlyId, {
+        error: { name: "MissingComputeTemplate", message },
+      });
+      throw new ServiceValidationError(message);
+    }
+
     const imageDigest = validatedImageDigest(body.imageDigest);
     const deployedAt = new Date();
     const imageReference = imageDigest
@@ -82,7 +100,6 @@ export class FinalizeDeploymentService extends BaseService {
         deployedAt,
         // Only add the digest, if any
         imageReference: imageDigest ? imageReference : undefined,
-        buildEnvVars: Prisma.DbNull,
       },
     });
 
@@ -93,12 +110,14 @@ export class FinalizeDeploymentService extends BaseService {
       throw new ServiceValidationError("Worker deployment is not in DEPLOYING status");
     }
 
+    // Queue the check as soon as the deployment is marked DEPLOYED.
+    void this.queueCheck(deployment.id);
+
     const finalizedDeployment = {
       ...deployment,
       status: "DEPLOYED" as const,
       deployedAt,
       imageReference,
-      buildEnvVars: null,
     };
 
     recordDeploymentFinished({
@@ -132,7 +151,7 @@ export class FinalizeDeploymentService extends BaseService {
     await TimeoutDeploymentService.dequeue(deployment.id, this._prisma);
 
     if (typeof body.skipPromotion === "undefined" || !body.skipPromotion) {
-      const promotionService = new ChangeCurrentDeploymentService();
+      const promotionService = new ChangeCurrentDeploymentService(this._prisma);
 
       await promotionService.call(finalizedDeployment, "promote");
     }

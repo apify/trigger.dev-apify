@@ -19,6 +19,7 @@ export const action = createActionWorkerApiRoute(
     params,
     runnerId,
     environmentId,
+    sandboxRunId,
   }): Promise<TypedResponse<WorkerApiRunAttemptStartResponseBody>> => {
     const { runFriendlyId, snapshotFriendlyId } = params;
 
@@ -26,8 +27,14 @@ export const action = createActionWorkerApiRoute(
       runFriendlyId,
       snapshotFriendlyId,
       isWarmStart: body.isWarmStart,
+      workerCell: body.workerCell,
+      workerLane: body.workerLane,
+      supportsRunTokenRefresh: body.supportsRunTokenRefresh,
+      supportsUsageJwtRefresh: body.supportsUsageJwtRefresh,
+      supportsSecretProxy: body.supportsSecretProxy,
       runnerId,
       environmentId,
+      sandboxRunId,
     });
 
     return json(runExecutionData);

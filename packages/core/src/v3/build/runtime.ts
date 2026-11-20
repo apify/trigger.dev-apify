@@ -3,6 +3,7 @@ import { pathToFileURL } from "url";
 import { BuildRuntime, ConfigRuntime } from "../schemas/build.js";
 import { dedupFlags } from "./flags.js";
 import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 
 export const CURRENT_NODE_LTS_RUNTIME = "node-24" satisfies BuildRuntime;
 export const DEFAULT_RUNTIME = CURRENT_NODE_LTS_RUNTIME;
@@ -11,6 +12,31 @@ export type DeprecatedConfigRuntime = "experimental-node-24" | "experimental-nod
 
 export function isDeprecatedConfigRuntime(runtime: unknown): runtime is DeprecatedConfigRuntime {
   return runtime === "experimental-node-24" || runtime === "experimental-node-26";
+}
+
+/**
+ * True for every bun runtime, including the plain "bun" alias that already-deployed
+ * workers still report. Branch on this instead of `runtime === "bun"` so a new bun
+ * version never regresses a bun-specific code path.
+ */
+export function isBunRuntime(runtime: unknown): boolean {
+  return typeof runtime === "string" && (runtime === "bun" || runtime.startsWith("bun-"));
+}
+
+/** The date from which "bun" / "bun-legacy" deploys stop being accepted (UTC). */
+export const LEGACY_BUN_REMOVAL_DATE = "2027-01-05";
+
+/** True for the deprecated node + bun runtimes, "bun" and its explicit spelling "bun-legacy". */
+export function isLegacyBunRuntime(runtime: unknown): boolean {
+  return runtime === "bun" || runtime === "bun-legacy";
+}
+
+/**
+ * True for the bun runtimes whose image contains no node binary ("bun-1.4", ...).
+ * "bun" / "bun-legacy" run on a node + bun image and are excluded.
+ */
+export function isNodelessBunRuntime(runtime: unknown): boolean {
+  return isBunRuntime(runtime) && !isLegacyBunRuntime(runtime);
 }
 
 /** Maps a deprecated runtime alias to the runtime that should be used instead. */
@@ -66,6 +92,8 @@ export function binaryForRuntime(runtime: BuildRuntime): string {
     case "node-26":
       return "node";
     case "bun":
+    case "bun-legacy":
+    case "bun-1.4":
       return "bun";
     default:
       throw new Error(`Unsupported runtime ${runtime}`);
@@ -80,6 +108,8 @@ export function execPathForRuntime(runtime: BuildRuntime): string {
     case "node-26":
       return process.execPath;
     case "bun":
+    case "bun-legacy":
+    case "bun-1.4": {
       if (typeof process.env.BUN_INSTALL === "string") {
         return join(process.env.BUN_INSTALL, "bin", "bun");
       }
@@ -88,10 +118,39 @@ export function execPathForRuntime(runtime: BuildRuntime): string {
         return join(process.env.BUN_INSTALL_BIN, "bun");
       }
 
-      return join(homedir(), ".bun", "bin", "bun");
+      const defaultPath = join(homedir(), ".bun", "bin", "bun");
+      // Bun installed some other way (Homebrew, mise, a distro package) is found on PATH
+      return existsSync(defaultPath) ? defaultPath : "bun";
+    }
     default:
       throw new Error(`Unsupported runtime ${runtime}`);
   }
+}
+
+/**
+ * Node 24 and 26 can share a compile cache between the image build and the runtime. Node 22 is
+ * left out: its cache key includes --max-old-space-size, which the run worker sets per machine, so
+ * a cache built in the image would never be read.
+ */
+export function supportsNodeCompileCache(runtime: BuildRuntime): boolean {
+  return runtime === "node" || runtime === "node-24" || runtime === "node-26";
+}
+
+/**
+ * The env that points Node at the compile cache. The image build writes it and the run worker reads
+ * it from the same /app path, so entries are keyed by absolute path (portable mode drops the query
+ * that instrumented module wrappers use, so a wrapper and its module would share one entry). Node 24
+ * has no read-only mode, so it also writes entries the build missed.
+ */
+export function nodeCompileCacheEnv(
+  runtime: BuildRuntime,
+  compileCacheDir: string,
+  mode: "write" | "read"
+): Record<string, string> {
+  return {
+    NODE_COMPILE_CACHE: compileCacheDir,
+    ...(mode === "read" && runtime === "node-26" ? { NODE_COMPILE_CACHE_READONLY: "1" } : {}),
+  };
 }
 
 export type ExecOptions = {
@@ -129,7 +188,9 @@ export function execOptionsForRuntime(
 
       return dedupFlags(flags);
     }
-    case "bun": {
+    case "bun":
+    case "bun-legacy":
+    case "bun-1.4": {
       return "";
     }
   }

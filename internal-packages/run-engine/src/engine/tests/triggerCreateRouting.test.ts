@@ -500,10 +500,16 @@ describe("RunEngine trigger/create routing", () => {
         async resolveEnvDeletionState(): Promise<any> {
           return null;
         }
+        async resolveDeploymentStatus(): Promise<any> {
+          return null;
+        }
         async resolveAuthenticatedEnv(): Promise<any> {
           return null;
         }
         async resolveWorkerVersion(): Promise<any> {
+          return null;
+        }
+        async resolveWorkerVersionFromPrimary(): Promise<any> {
           return null;
         }
       }

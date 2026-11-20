@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Waitpoint coordination keyspace. Three hash tags, deliberately:
  *
@@ -40,12 +42,30 @@ export type WaitpointKeys = {
   /** The durable fanout entry: claim, lease, failure streak and drain state. */
   fanout: string;
 };
-export type RunBlockKeys = { pend: string; done: string; edge: string; state: string };
+export type RunBlockKeys = {
+  pend: string;
+  done: string;
+  edge: string;
+  state: string;
+  /** Edge counts by waitpoint ID and operation claim counts by `!edgeField`. */
+  refs: string;
+  /** Stable edge order and immutable first-completion ordinals for bounded snapshot reads. */
+  edgeIndex: string;
+  doneOrder: string;
+  /** Unreferenced receipts are detached in constant work by selective reconciliation. */
+  early: string;
+  earlyOrder: string;
+};
 export type FanoutIndexKeys = { due: string; quarantine: string };
 
 export function waitpointKeys(waitpointId: string): WaitpointKeys {
   const base = `${NAMESPACE}:{${waitpointId}}`;
   return { record: base, watchers: `${base}:w`, queue: `${base}:q`, fanout: `${base}:f` };
+}
+
+/** Successful token subscriptions, independent of destructive watcher/fanout state. */
+export function waitpointRelatedRunsKey(waitpointId: string): string {
+  return `${waitpointKeys(waitpointId).record}:related`;
 }
 
 export function runBlockKeys(runId: string): RunBlockKeys {
@@ -55,7 +75,76 @@ export function runBlockKeys(runId: string): RunBlockKeys {
     done: `${base}:done`,
     edge: `${base}:edge`,
     state: `${base}:st`,
+    refs: `${base}:refs`,
+    edgeIndex: `${base}:ei`,
+    doneOrder: `${base}:do`,
+    early: `${base}:early`,
+    earlyOrder: `${base}:eo`,
   };
+}
+
+/** Immutable completions referenced by this parent's durable snapshots, retained until terminal cleanup. */
+export function runResultKey(runId: string): string {
+  return `${NAMESPACE}:run:{${runId}}:results`;
+}
+
+/**
+ * The durable manifest retained for ONE block while its watchers are being
+ * withdrawn (terminal release or non-terminal abandon). Its target hash is detached atomically from
+ * the active edge hash. The manifest survives even an empty hash so a failed or interrupted
+ * withdrawal can be retried from an authoritative target list even when the active block is gone or a
+ * newer block is installed. Keyed by block id (same hash slot as the run's block keys) so it never
+ * collides with another cycle's record.
+ */
+export function runWithdrawalKey(runId: string, blockId: string): string {
+  return `${NAMESPACE}:run:{${runId}}:wd:${blockId}`;
+}
+
+/** The detached edge hash owned by a retained withdrawal; never expires before convergence. */
+export function runWithdrawalTargetsKey(runId: string, blockId: string): string {
+  return `${runWithdrawalKey(runId, blockId)}:edges`;
+}
+
+/**
+ * Store the edges claimed by one registration, plus its acceptance markers.
+ * Cleanup releases these claims without removing edges still claimed by another operation.
+ * After phase 3, keep only the request proof until registration finishes.
+ * Each operation has its own key in the run's Redis hash slot.
+ */
+export function runContributionKey(runId: string, blockId: string, absorptionId: string): string {
+  return `${NAMESPACE}:run:{${runId}}:cn:${blockId}:${absorptionId}`;
+}
+
+/** Outstanding contribution identities for a known run; bounded pages, no TTL or keyspace scan. */
+export function runContributionIndexKey(runId: string): string {
+  return `${NAMESPACE}:run:{${runId}}:contributions`;
+}
+
+/** Organization-owned admission evidence. Published before any native run mutation, no TTL. */
+export function organizationRunIndexKey(organizationId: string, partition: number): string {
+  return `${NAMESPACE}:org:{${organizationId}:p${partition}}:runs`;
+}
+
+/** Pending source publication evidence, before the first source write; no TTL. */
+export function organizationPendingSourceIndexKey(
+  organizationId: string,
+  partition: number
+): string {
+  return `${NAMESPACE}:f{p${partition}}:org:${organizationId}:sources`;
+}
+
+/** Exact scoped receipt identities for keyed source attempts, beside organization source discovery. */
+export function organizationSourceReceiptKey(organizationId: string, partition: number): string {
+  return `${organizationPendingSourceIndexKey(organizationId, partition)}:receipts`;
+}
+
+/** Detached withdrawal identities outlive ordinary block state and terminal tombstones. */
+export function runWithdrawalIndexKey(runId: string): string {
+  return `${NAMESPACE}:run:{${runId}}:withdrawals`;
+}
+
+export function contributionMember(blockId: string, absorptionId: string): string {
+  return JSON.stringify([blockId, absorptionId]);
 }
 
 /**
@@ -98,6 +187,23 @@ export function fanoutIndexKeys(partition: number): FanoutIndexKeys {
 
 export function idempotencyKey(environmentId: string, key: string): string {
   return `${NAMESPACE}:idem:{${environmentId}}:${key}`;
+}
+
+/** Outcome evidence shares the reservation slot, but never its expiry. */
+export function idempotencyReceiptKey(
+  environmentId: string,
+  key: string,
+  candidateId: string
+): string {
+  return `${NAMESPACE}:idem-receipt:{${environmentId}}:${key.length}:${key}:${candidateId}`;
+}
+
+export function idempotencyClaimKey(environmentId: string, key: string): string {
+  return `${NAMESPACE}:idem-claim:{${environmentId}}:${key.length}:${key}`;
+}
+
+export function candidateMintFenceKey(candidateId: string): string {
+  return `${waitpointKeys(candidateId).record}:mint-fence`;
 }
 
 // "#" separates the id from the index. An absent index collapses onto the empty suffix,
@@ -205,4 +311,23 @@ export function assertSingleSlot(operation: string, keys: string[]): void {
       throw new WaitpointKeyTagError(operation, keys, key);
     }
   }
+}
+
+/** Source holds that an unfinished registration must release, in its parent's slot. */
+export function runRegistrationSourcesKey(
+  runId: string,
+  blockId: string,
+  absorptionId: string
+): string {
+  return `${runContributionKey(runId, blockId, absorptionId)}:sources`;
+}
+
+/** Hash the full request. Reserved proof markers cannot match edge fields. */
+export function registrationEvidence(waitpointIds: string[], batchIndex?: number): string {
+  return (
+    "!request:" +
+    createHash("sha256")
+      .update(JSON.stringify([batchIndex ?? null, [...new Set(waitpointIds)].sort()]))
+      .digest("hex")
+  );
 }

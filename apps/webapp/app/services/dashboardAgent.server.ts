@@ -1,4 +1,5 @@
 import { signUserActorToken } from "@trigger.dev/rbac";
+import type { RuntimeEnvironmentType } from "@trigger.dev/database";
 import { TriggerClient } from "@trigger.dev/sdk";
 import { chat } from "@trigger.dev/sdk/ai";
 import { Counter } from "prom-client";
@@ -12,7 +13,7 @@ import { logger } from "./logger.server";
 
 const TASK_ID = "dashboard-agent";
 
-// The wake poll runs once a minute per visible tab. That trade-off is only defensible while it
+// The unread poll runs once a minute per visible tab. That trade-off is only defensible while it
 // stays measurable, so count the requests. singleton: module-scope registration double-registers
 // under dev HMR.
 export const dashboardAgentWakeFeedCounter = singleton(
@@ -25,10 +26,8 @@ export const dashboardAgentWakeFeedCounter = singleton(
     })
 );
 
-// Read-only cap on the agent's delegated user-actor token. `read:apiKeys` is
-// what lets it exchange the token for an env JWT (the gate on the exchange
-// route); the rest scope the actual reads. No write/admin scopes, so even a
-// leaked token can't mutate anything.
+// Read-only cap on the agent's delegated user-actor token. No write/admin
+// scopes, so even a leaked token can't mutate anything.
 export const DASHBOARD_AGENT_UAT_CAP = [
   "read:apiKeys",
   "read:runs",
@@ -39,6 +38,7 @@ export const DASHBOARD_AGENT_UAT_CAP = [
   // Queue metrics ride on `read:query`, but a queue's own row — paused, depth, limit —
   // is a `queues` read, and without it the agent can only see the metrics window.
   "read:queues",
+  "read:alerts",
 ];
 
 // Minted fresh on every turn (the `in` proxy injects it), so the lifetime only
@@ -65,24 +65,43 @@ export function dashboardAgentUserApiOrigin(): string {
 // than taken from the caller.
 export async function mintDashboardAgentUserActorToken(
   userId: string,
-  opts: { environmentId: string }
+  opts: { environmentId: string; alertWrites?: { request: Request } }
 ): Promise<string> {
   const environment = await $replica.runtimeEnvironment.findFirst({
     where: { id: opts.environmentId },
-    select: { organizationId: true },
+    select: { organizationId: true, projectId: true, type: true },
   });
   if (!environment) {
     throw new Error(`Environment ${opts.environmentId} not found`);
   }
+
+  const canWriteAlerts =
+    opts.alertWrites !== undefined &&
+    (await userCanWriteAlerts(opts.alertWrites.request, userId, environment));
 
   return signUserActorToken(env.SESSION_SECRET, {
     userId,
     client: "dashboard-agent",
     environmentId: opts.environmentId,
     organizationId: environment.organizationId,
-    cap: DASHBOARD_AGENT_UAT_CAP,
+    cap: canWriteAlerts ? [...DASHBOARD_AGENT_UAT_CAP, "write:alerts"] : DASHBOARD_AGENT_UAT_CAP,
     expirationTime: Math.floor(Date.now() / 1000) + DASHBOARD_AGENT_UAT_TTL_SECONDS,
   });
+}
+
+async function userCanWriteAlerts(
+  request: Request,
+  userId: string,
+  environment: { organizationId: string; projectId: string; type: RuntimeEnvironmentType }
+): Promise<boolean> {
+  // Lazy: loading rbac.server at module init drags the RBAC plugin into every importer.
+  const { rbac } = await import("./rbac.server");
+  const auth = await rbac.authenticateSession(request, {
+    userId,
+    organizationId: environment.organizationId,
+    projectId: environment.projectId,
+  });
+  return auth.ok && auth.ability.can("write", { type: "alerts", envType: environment.type });
 }
 
 // The session is created in whatever env DASHBOARD_AGENT_SECRET_KEY belongs to.
@@ -135,15 +154,23 @@ export async function startDashboardAgentSession(params: {
 
 // Read is narrowed to the `.out` stream (`read:sessions:{chatId}:out`): `.in` records carry
 // the delegated user token the `in` proxy injects, and the session row carries the trigger
-// config, so the browser gets neither.
+// config, so the browser gets neither. No write: every `.in` append goes through the proxy.
 export async function mintDashboardAgentToken(chatId: string): Promise<string> {
+  return mintSessionToken({ read: { sessions: `${chatId}:out` } }, "1h");
+}
+
+export async function mintDashboardAgentAppendToken(chatId: string): Promise<string> {
+  return mintSessionToken({ write: { sessions: chatId } }, "5m");
+}
+
+async function mintSessionToken(
+  scopes: { read?: { sessions: string }; write?: { sessions: string } },
+  expirationTime: string
+): Promise<string> {
   const config = dashboardAgentConfig();
   if (!config) throw new Error("DASHBOARD_AGENT_SECRET_KEY is not set");
   const client = new TriggerClient(config);
-  return client.auth.createPublicToken({
-    scopes: { read: { sessions: `${chatId}:out` }, write: { sessions: chatId } },
-    expirationTime: "1h",
-  });
+  return client.auth.createPublicToken({ scopes, expirationTime });
 }
 
 // A signed, short-lived pointer to the project's connected repo at a commit. Only

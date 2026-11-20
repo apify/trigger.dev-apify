@@ -1,9 +1,15 @@
 import { nanoid } from "nanoid";
 import { z } from "zod/v4";
 import { VERSION } from "../../version.js";
-import { isAdditionalApiKey } from "../apiKeys.js";
-import type { ApiClientConfiguration } from "../apiClientManager-api.js";
 import { generateJWT } from "../jwt.js";
+import { canFallbackToLocalPublicToken } from "./publicTokenCompatibility.js";
+import type { ApiClientConfiguration } from "../apiClientManager-api.js";
+import { isRunTokenOperation } from "../runTokenOperations.js";
+import type { RunTokenSelectionReason } from "../runTokenTelemetry.js";
+import {
+  SDK_CREDENTIAL_OPERATION_HEADER,
+  SDK_CREDENTIAL_REASON_HEADER,
+} from "../sdkCredentialTelemetry.js";
 import {
   type AddTagsRequestBody,
   type ApiDeploymentListOptions,
@@ -20,6 +26,10 @@ import {
   type ListWebhookDeliveriesQuery,
   ReplayWebhookDeliveryResponse,
   WebhookDeliveryObject,
+  CancelWebhookWaiterResponseBody,
+  CreateWebhookWaiterResponseBody,
+  type CreateWebhookWaiterRequestBody,
+  type RotateWebhookEndpointSecretRequestBody,
   RotateWebhookEndpointSecretResponse,
   SetWebhookEndpointSecretResponse,
   type SetWebhookEndpointSecretRequestBody,
@@ -32,12 +42,16 @@ import {
   type ListQueueOptions,
   type ListConcurrencyLimitOptions,
   ConcurrencyLimitItem,
-  type OverrideConcurrencyLimitRequestBody,
+  ConcurrencyLimitKeyItem,
+  type OverrideConcurrencyLimitBoundsBody,
+  type OverrideConcurrencyLimitKeyBody,
+  type ResetConcurrencyLimitRequestBody,
   type ListScheduleOptions,
   type ListSessionsOptions,
   type PromotePromptVersionRequestBody,
   type QueueTypeName,
   type ReactivatePromptOverrideRequestBody,
+  ReplayRunRequestBody,
   type RescheduleRunRequestBody,
   type ResolvePromptRequestBody,
   type RetrieveQueueParam,
@@ -71,6 +85,14 @@ import {
   EnvironmentVariableResponseBody,
   EnvironmentVariableWithSecret,
   ListDashboardsResponseBody,
+  AddDashboardWidgetResponseBody,
+  type AddDashboardWidgetRequestBody,
+  type CreateDashboardRequestBody,
+  DashboardObject,
+  DeleteDashboardResponseBody,
+  type ReplaceDashboardRequestBody,
+  type UpdateDashboardRequestBody,
+  type UpdateDashboardWidgetRequestBody,
   ListPromptVersionsResponseBody,
   ListPromptsResponseBody,
   ListRunResponseItem,
@@ -91,6 +113,7 @@ import {
   RetrieveCurrentDeploymentResponseBody,
   RetrieveRunResponse,
   RetrieveRunTraceResponseBody,
+  RetrieveRunTracePageResponseBody,
   RetrieveSessionResponseBody,
   RetrieveSpanDetailResponseBody,
   ScheduleObject,
@@ -109,6 +132,7 @@ import type { AsyncIterableStream } from "../streams/asyncIterableStream.js";
 import { taskContext } from "../task-context-api.js";
 import type { AnyRunTypes, TriggerJwtOptions } from "../types/tasks.js";
 import type { Prettify } from "../types/utils.js";
+import superjson from "../imports/superjson.js";
 import { getEnvVar } from "../utils/getEnv.js";
 import { calculateNextRetryDelay } from "../utils/retries.js";
 import {
@@ -221,6 +245,7 @@ export type {
 };
 
 export * from "./getBranch.js";
+export { canFallbackToLocalPublicToken } from "./publicTokenCompatibility.js";
 export { encodeTaskIdForPath } from "./encodeTaskIdForPath.js";
 
 export type CreatePublicTokenRequestBody = {
@@ -237,6 +262,8 @@ const CreatePublicTokenResponseBody = z.object({ token: z.string() });
  */
 export class ApiClient {
   public readonly baseUrl: string;
+  // ponytail: the configured credential, so the root key while it is injected into runs.
+  // TRI-15076 decides this property's contract once runs only receive run tokens.
   public readonly accessToken: string;
   public readonly previewBranch?: string;
   public readonly futureFlags: ApiClientFutureFlags;
@@ -252,7 +279,11 @@ export class ApiClient {
     previewBranch?: string,
     requestOptions: ApiRequestOptions = {},
     futureFlags: ApiClientFutureFlags = {},
-    refreshAccessToken?: RefreshAccessTokenFn
+    refreshAccessToken?: RefreshAccessTokenFn,
+    private readonly resolveAccessToken?: (
+      operation: string,
+      recordSelection: boolean
+    ) => string | { accessToken: string | undefined; reason: RunTokenSelectionReason } | undefined
   ) {
     this.accessToken = accessToken;
     this.refreshAccessToken = refreshAccessToken;
@@ -264,30 +295,77 @@ export class ApiClient {
     this.futureFlags = futureFlags;
   }
 
-  /**
-   * Key for signing a public access token locally. Only root keys can do this —
-   * an additional key isn't the environment's signing material, so a token
-   * signed with one would never verify. Throw rather than return a dead token.
-   */
-  get #selfSigningKey(): string {
-    if (isAdditionalApiKey(this.accessToken)) {
-      throw new Error(
-        "This additional API key cannot self-sign public tokens, and the server did not return one. Upgrade the server or use the root API key."
-      );
-    }
+  getAccessToken(operation: string, recordSelection = false): string {
+    return this.getAuthenticationHeaders(operation, recordSelection).Authorization.slice(
+      "Bearer ".length
+    );
+  }
 
-    return this.accessToken;
+  getAuthenticationHeaders(
+    operation: string,
+    recordSelection = true
+  ): Record<string, string> & { Authorization: string } {
+    const selection = this.resolveAccessToken
+      ? this.resolveAccessToken(operation, recordSelection)
+      : this.accessToken;
+    const token = typeof selection === "object" ? selection.accessToken : selection;
+    if (!token) {
+      const reason =
+        taskContext.isInsideTask && typeof selection === "object"
+          ? ` (run token: ${selection.reason})`
+          : "";
+      throw new Error(`This run has no credential for "${operation}"${reason}`);
+    }
+    const headers: Record<string, string> & { Authorization: string } = {
+      Authorization: `Bearer ${token}`,
+    };
+    if (
+      typeof selection === "object" &&
+      taskContext.isInsideTask &&
+      selection.reason !== "outside_task" &&
+      !this.refreshAccessToken &&
+      isRunTokenOperation(operation)
+    ) {
+      headers["x-trigger-worker"] = "true";
+      headers[SDK_CREDENTIAL_OPERATION_HEADER] = operation;
+      headers[SDK_CREDENTIAL_REASON_HEADER] = selection.reason;
+    }
+    return headers;
+  }
+
+  async #createPublicAccessToken(
+    scope: string,
+    resourceId: string,
+    expirationTime: number | Date | string,
+    requestOptions?: ZodFetchOptions
+  ): Promise<string> {
+    try {
+      const { token } = await this.createPublicToken(
+        {
+          scopes: [scope],
+          expirationTime:
+            expirationTime instanceof Date
+              ? Math.floor(expirationTime.getTime() / 1000)
+              : expirationTime,
+        },
+        { ...requestOptions, prepareData: undefined, onResponseBody: undefined }
+      );
+      return token;
+    } catch (error) {
+      if (error instanceof Error) {
+        error.message = `Resource ${resourceId} was already created, but its public access token could not be minted. Do not blindly repeat the mutation. ${error.message}`;
+      }
+      throw error;
+    }
   }
 
   get fetchClient(): typeof fetch {
-    const headers = this.#getHeaders(false);
-
     const fetchClient: typeof fetch = (input, requestInit) => {
       const $requestInit: RequestInit = {
         ...requestInit,
         headers: {
           ...requestInit?.headers,
-          ...headers,
+          ...this.#getHeaders(false, undefined, "default", true),
         },
       };
 
@@ -297,8 +375,34 @@ export class ApiClient {
     return fetchClient;
   }
 
-  getHeaders() {
-    return this.#getHeaders(false);
+  getHeaders(operation = "unknown") {
+    return this.#getHeaders(false, undefined, operation, true);
+  }
+
+  #requestOptions(
+    operation: string,
+    options?: ApiRequestOptions,
+    defaults = this.defaultRequestOptions
+  ): AnyZodFetchOptions {
+    return {
+      ...mergeRequestOptions(defaults, options),
+      resolveHeaders: () => this.getAuthenticationHeaders(operation),
+    };
+  }
+
+  #requestFetch(operation: string, fetchClient?: typeof fetch): typeof fetch | undefined {
+    if (!this.resolveAccessToken || this.refreshAccessToken) return fetchClient;
+    return (input, init) => {
+      const headers = new Headers(
+        init?.headers ?? (input instanceof Request ? input.headers : undefined)
+      );
+      headers.delete(SDK_CREDENTIAL_OPERATION_HEADER);
+      headers.delete(SDK_CREDENTIAL_REASON_HEADER);
+      for (const [key, value] of Object.entries(this.getAuthenticationHeaders(operation))) {
+        headers.set(key, value);
+      }
+      return (fetchClient ?? fetch)(input, { ...init, headers });
+    };
   }
 
   /**
@@ -306,24 +410,24 @@ export class ApiClient {
    * a 401/403 can reconnect with a freshly minted token. `undefined` when no
    * `refreshAccessToken` was configured, which keeps auth errors terminal.
    */
-  #resolveStreamHeaders(): (() => Promise<Record<string, string>>) | undefined {
+  #resolveStreamHeaders(operation: string): (() => Promise<Record<string, string>>) | undefined {
     const refreshAccessToken = this.refreshAccessToken;
     if (!refreshAccessToken) return undefined;
 
     return async () => {
       const accessToken = await refreshAccessTokenOnce(refreshAccessToken);
-      return this.#getHeaders(false, { Authorization: `Bearer ${accessToken}` });
+      return this.#getHeaders(false, { Authorization: `Bearer ${accessToken}` }, operation);
     };
   }
 
   /** As {@link ApiClient.#resolveStreamHeaders}, for the leaner realtime header set. */
-  #resolveRealtimeHeaders(): (() => Promise<Record<string, string>>) | undefined {
+  #resolveRealtimeHeaders(operation: string): (() => Promise<Record<string, string>>) | undefined {
     const refreshAccessToken = this.refreshAccessToken;
     if (!refreshAccessToken) return undefined;
 
     return async () => {
       const accessToken = await refreshAccessTokenOnce(refreshAccessToken);
-      return { ...this.#getRealtimeHeaders(), Authorization: `Bearer ${accessToken}` };
+      return { ...this.#getRealtimeHeaders(operation), Authorization: `Bearer ${accessToken}` };
     };
   }
 
@@ -337,9 +441,9 @@ export class ApiClient {
         `${this.baseUrl}/api/v1/runs/${runId}/result`,
         {
           method: "GET",
-          headers: this.#getHeaders(false),
+          headers: this.#getHeaders(false, undefined, "getRunResult"),
         },
-        mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+        this.#requestOptions("getRunResult", requestOptions)
       );
     } catch (error) {
       if (error instanceof ApiError) {
@@ -361,9 +465,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/batches/${batchId}/results`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getBatchResults"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getBatchResults", requestOptions)
     );
   }
 
@@ -380,10 +484,14 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/tasks/${encodedTaskId}/trigger`,
       {
         method: "POST",
-        headers: this.#getHeaders(clientOptions?.spanParentAsLink ?? false),
+        headers: this.#getHeaders(
+          clientOptions?.spanParentAsLink ?? false,
+          undefined,
+          "triggerTask"
+        ),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("triggerTask", requestOptions)
     )
       .withResponse()
       .then(async ({ data, response }) => {
@@ -396,17 +504,12 @@ export class ApiClient {
           };
         }
 
-        const claimsHeader = response.headers.get("x-trigger-jwt-claims");
-        const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
-
-        const jwt = await generateJWT({
-          secretKey: this.#selfSigningKey,
-          payload: {
-            ...claims,
-            scopes: [`read:runs:${data.id}`],
-          },
-          expirationTime: requestOptions?.publicAccessToken?.expirationTime ?? "1h",
-        });
+        const jwt = await this.#createPublicAccessToken(
+          `read:runs:${data.id}`,
+          data.id,
+          requestOptions?.publicAccessToken?.expirationTime ?? "1h",
+          requestOptions
+        );
 
         return {
           ...data,
@@ -425,12 +528,16 @@ export class ApiClient {
       `${this.baseUrl}/api/v2/tasks/batch`,
       {
         method: "POST",
-        headers: this.#getHeaders(clientOptions?.spanParentAsLink ?? false, {
-          "batch-processing-strategy": clientOptions?.processingStrategy,
-        }),
+        headers: this.#getHeaders(
+          clientOptions?.spanParentAsLink ?? false,
+          {
+            "batch-processing-strategy": clientOptions?.processingStrategy,
+          },
+          "batchTriggerV3"
+        ),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("batchTriggerV3", requestOptions)
     )
       .withResponse()
       .then(async ({ data, response }) => {
@@ -443,17 +550,12 @@ export class ApiClient {
           };
         }
 
-        const claimsHeader = response.headers.get("x-trigger-jwt-claims");
-        const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
-
-        const jwt = await generateJWT({
-          secretKey: this.#selfSigningKey,
-          payload: {
-            ...claims,
-            scopes: [`read:batch:${data.id}`],
-          },
-          expirationTime: requestOptions?.publicAccessToken?.expirationTime ?? "1h",
-        });
+        const jwt = await this.#createPublicAccessToken(
+          `read:batch:${data.id}`,
+          data.id,
+          requestOptions?.publicAccessToken?.expirationTime ?? "1h",
+          requestOptions
+        );
 
         return {
           ...data,
@@ -484,10 +586,14 @@ export class ApiClient {
       `${this.baseUrl}/api/v3/batches`,
       {
         method: "POST",
-        headers: this.#getHeaders(clientOptions?.spanParentAsLink ?? false),
+        headers: this.#getHeaders(
+          clientOptions?.spanParentAsLink ?? false,
+          undefined,
+          "createBatch"
+        ),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createBatch", requestOptions)
     )
       .withResponse()
       .then(async ({ data, response }) => {
@@ -500,17 +606,12 @@ export class ApiClient {
           };
         }
 
-        const claimsHeader = response.headers.get("x-trigger-jwt-claims");
-        const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
-
-        const jwt = await generateJWT({
-          secretKey: this.#selfSigningKey,
-          payload: {
-            ...claims,
-            scopes: [`read:batch:${data.id}`],
-          },
-          expirationTime: requestOptions?.publicAccessToken?.expirationTime ?? "1h",
-        });
+        const jwt = await this.#createPublicAccessToken(
+          `read:batch:${data.id}`,
+          data.id,
+          requestOptions?.publicAccessToken?.expirationTime ?? "1h",
+          requestOptions
+        );
 
         return {
           ...data,
@@ -558,7 +659,7 @@ export class ApiClient {
     retryOptions: RetryOptions,
     attempt: number = 1
   ): Promise<StreamBatchItemsResponse> {
-    const headers = this.#getHeaders(false);
+    const headers = this.#getHeaders(false, undefined, "streamBatchItems", true);
     headers["Content-Type"] = "application/x-ndjson";
 
     // Tee the stream: one branch for this attempt, one for potential retry
@@ -679,9 +780,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v2/packets/${encoded}`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createUploadPayloadUrl"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createUploadPayloadUrl", requestOptions)
     );
   }
 
@@ -692,9 +793,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/packets/${encoded}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getPayloadUrl"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getPayloadUrl", requestOptions)
     );
   }
 
@@ -714,9 +815,38 @@ export class ApiClient {
         `${this.baseUrl}/api/v1/runs/${encodeURIComponent(runId)}/packets/${field}`,
         {
           method: "GET",
-          headers: this.#getHeaders(false),
+          headers: this.#getHeaders(false, undefined, "getRunPacketUrl"),
         },
-        mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+        this.#requestOptions("getRunPacketUrl", requestOptions)
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        return await this.getPayloadUrl(path, requestOptions);
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Presigned GET URL for the offloaded output of a waitpoint the run resumed from, authorized
+   * against the run. Falls back to the legacy packet route on servers that predate this endpoint.
+   */
+  async getRunWaitpointOutputUrl(
+    runId: string,
+    waitpointId: string,
+    path: string,
+    requestOptions?: ZodFetchOptions
+  ) {
+    try {
+      return await zodfetch(
+        CreateUploadPayloadUrlResponseBody,
+        `${this.baseUrl}/api/v1/runs/${encodeURIComponent(runId)}/waitpoints/${encodeURIComponent(waitpointId)}/output`,
+        {
+          method: "GET",
+          headers: this.#getHeaders(false, undefined, "getRunWaitpointOutputUrl"),
+        },
+        this.#requestOptions("getRunWaitpointOutputUrl", requestOptions)
       );
     } catch (error) {
       if (error instanceof ApiError && error.status === 404) {
@@ -734,9 +864,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot-url`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createChatSnapshotUploadUrl"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createChatSnapshotUploadUrl", requestOptions)
     );
   }
 
@@ -747,9 +877,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/snapshot-url`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getChatSnapshotUrl"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getChatSnapshotUrl", requestOptions)
     );
   }
 
@@ -771,9 +901,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionId)}/transcript${suffix}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getSessionTranscript"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getSessionTranscript", requestOptions)
     );
   }
 
@@ -783,9 +913,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v3/runs/${runId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveRun"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveRun", requestOptions)
     );
   }
 
@@ -795,9 +925,35 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/trace`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveRunTrace"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveRunTrace", requestOptions)
+    );
+  }
+
+  /**
+   * Retrieves one page of a root run's trace as flat spans. Omit `after` for the first
+   * page, then pass back `pagination.next` until it's missing. Use `assembleRunTracePages`
+   * to rebuild the tree. Spans are lean: fetch a span's events and properties with
+   * `retrieveSpan`.
+   */
+  retrieveRunTracePage(
+    runId: string,
+    options?: { limit?: number; after?: string },
+    requestOptions?: ZodFetchOptions
+  ) {
+    const query = new URLSearchParams();
+    query.set("page[size]", String(options?.limit ?? 10_000));
+    if (options?.after !== undefined) query.set("page[after]", options.after);
+
+    return zodfetch(
+      RetrieveRunTracePageResponseBody,
+      `${this.baseUrl}/api/v1/runs/${encodeURIComponent(runId)}/trace?${query.toString()}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false, undefined, "retrieveRunTracePage"),
+      },
+      this.#requestOptions("retrieveRunTracePage", requestOptions)
     );
   }
 
@@ -807,9 +963,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/spans/${spanId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveSpan"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveSpan", requestOptions)
     );
   }
 
@@ -830,9 +986,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listRuns"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listRuns", requestOptions)
     );
   }
 
@@ -861,21 +1017,40 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listProjectRuns"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listProjectRuns", requestOptions)
     );
   }
 
-  replayRun(runId: string, requestOptions?: ZodFetchOptions) {
+  replayRun(runId: string, requestOptions?: ZodFetchOptions): ApiPromise<ReplayRunResponse>;
+  replayRun(
+    runId: string,
+    body?: ReplayRunRequestBody,
+    requestOptions?: ZodFetchOptions
+  ): ApiPromise<ReplayRunResponse>;
+  replayRun(
+    runId: string,
+    bodyOrRequestOptions?: ReplayRunRequestBody | ZodFetchOptions,
+    requestOptions?: ZodFetchOptions
+  ): ApiPromise<ReplayRunResponse> {
+    const isBody =
+      bodyOrRequestOptions !== undefined &&
+      Object.keys(bodyOrRequestOptions).every((key) => key in ReplayRunRequestBody.shape);
+    const body = isBody ? (bodyOrRequestOptions as ReplayRunRequestBody) : undefined;
+    const $requestOptions = isBody
+      ? requestOptions
+      : ((bodyOrRequestOptions as ZodFetchOptions | undefined) ?? requestOptions);
+
     return zodfetch(
       ReplayRunResponse,
       `${this.baseUrl}/api/v1/runs/${runId}/replay`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "replayRun"),
+        body: body ? JSON.stringify(withSuperJsonPayload(body)) : undefined,
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("replayRun", $requestOptions)
     );
   }
 
@@ -885,9 +1060,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v2/runs/${runId}/cancel`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "cancelRun"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("cancelRun", requestOptions)
     );
   }
 
@@ -897,10 +1072,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/bulk-actions`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createBulkAction"),
         body: JSON.stringify(options),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createBulkAction", requestOptions)
     );
   }
 
@@ -919,9 +1094,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listBulkActions"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listBulkActions", requestOptions)
     );
   }
 
@@ -931,9 +1106,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/bulk-actions/${bulkActionId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveBulkAction"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveBulkAction", requestOptions)
     );
   }
 
@@ -943,9 +1118,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/bulk-actions/${bulkActionId}/abort`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "abortBulkAction"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("abortBulkAction", requestOptions)
     );
   }
 
@@ -959,10 +1134,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/idempotencyKeys/${encodeURIComponent(idempotencyKey)}/reset`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "resetIdempotencyKey"),
         body: JSON.stringify({ taskIdentifier }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("resetIdempotencyKey", requestOptions)
     );
   }
 
@@ -972,10 +1147,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/reschedule`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "rescheduleRun"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("rescheduleRun", requestOptions)
     );
   }
 
@@ -985,9 +1160,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/events`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listRunEvents"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listRunEvents", requestOptions)
     );
   }
 
@@ -997,10 +1172,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/tags`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "addTags"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("addTags", requestOptions)
     );
   }
 
@@ -1010,10 +1185,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createSchedule"),
         body: JSON.stringify(options),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createSchedule", requestOptions)
     );
   }
 
@@ -1037,9 +1212,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listSchedules"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listSchedules", requestOptions)
     );
   }
 
@@ -1049,9 +1224,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules/${scheduleId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveSchedule"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveSchedule", requestOptions)
     );
   }
 
@@ -1065,10 +1240,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules/${scheduleId}`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "updateSchedule"),
         body: JSON.stringify(options),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("updateSchedule", requestOptions)
     );
   }
 
@@ -1078,9 +1253,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules/${scheduleId}/deactivate`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "deactivateSchedule"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("deactivateSchedule", requestOptions)
     );
   }
 
@@ -1090,9 +1265,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules/${scheduleId}/activate`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "activateSchedule"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("activateSchedule", requestOptions)
     );
   }
 
@@ -1102,9 +1277,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/schedules/${scheduleId}`,
       {
         method: "DELETE",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "deleteSchedule"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("deleteSchedule", requestOptions)
     );
   }
 
@@ -1114,9 +1289,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listEnvVars"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listEnvVars", requestOptions)
     );
   }
 
@@ -1131,10 +1306,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}/import`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "importEnvVars"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("importEnvVars", requestOptions)
     );
   }
 
@@ -1144,9 +1319,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}/${key}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveEnvVar"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveEnvVar", requestOptions)
     );
   }
 
@@ -1161,10 +1336,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createEnvVar"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createEnvVar", requestOptions)
     );
   }
 
@@ -1180,10 +1355,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}/${key}`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "updateEnvVar"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("updateEnvVar", requestOptions)
     );
   }
 
@@ -1193,9 +1368,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/projects/${projectRef}/envvars/${slug}/${key}`,
       {
         method: "DELETE",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "deleteEnvVar"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("deleteEnvVar", requestOptions)
     );
   }
 
@@ -1209,10 +1384,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/metadata`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "updateRunMetadata"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("updateRunMetadata", requestOptions)
     );
   }
 
@@ -1222,9 +1397,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runId}/metadata`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getRunMetadata"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getRunMetadata", requestOptions)
     );
   }
 
@@ -1234,11 +1409,11 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/waitpoints/tokens`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createWaitpointToken"),
         body: JSON.stringify(options),
       },
       {
-        ...mergeRequestOptions(this.defaultRequestOptions, requestOptions),
+        ...this.#requestOptions("createWaitpointToken", requestOptions),
         prepareData: async (data, response) => {
           const jwtHeader = response.headers.get("x-trigger-jwt");
 
@@ -1249,17 +1424,12 @@ export class ApiClient {
             };
           }
 
-          const claimsHeader = response.headers.get("x-trigger-jwt-claims");
-          const claims = claimsHeader ? JSON.parse(claimsHeader) : undefined;
-
-          const jwt = await generateJWT({
-            secretKey: this.#selfSigningKey,
-            payload: {
-              ...claims,
-              scopes: [`write:waitpoints:${data.id}`],
-            },
-            expirationTime: "24h",
-          });
+          const jwt = await this.#createPublicAccessToken(
+            `write:waitpoints:${data.id}`,
+            data.id,
+            "24h",
+            requestOptions
+          );
 
           return {
             ...data,
@@ -1287,9 +1457,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listWaitpointTokens"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listWaitpointTokens", requestOptions)
     );
   }
 
@@ -1299,9 +1469,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/waitpoints/tokens/${friendlyId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveWaitpointToken"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveWaitpointToken", requestOptions)
     );
   }
 
@@ -1315,11 +1485,11 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/waitpoints/tokens/${friendlyId}/complete`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "completeWaitpointToken"),
         body: JSON.stringify(options),
       },
       {
-        ...mergeRequestOptions(this.defaultRequestOptions, requestOptions),
+        ...this.#requestOptions("completeWaitpointToken", requestOptions),
       }
     );
   }
@@ -1339,9 +1509,9 @@ export class ApiClient {
       `${this.baseUrl}/engine/v1/runs/${runFriendlyId}/waitpoints/tokens/${waitpointFriendlyId}/wait`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "waitForWaitpointToken"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("waitForWaitpointToken", requestOptions)
     );
   }
 
@@ -1355,10 +1525,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createSession"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createSession", requestOptions)
     );
   }
 
@@ -1368,9 +1538,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveSession"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveSession", requestOptions)
     );
   }
 
@@ -1384,10 +1554,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}`,
       {
         method: "PATCH",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "updateSession"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("updateSession", requestOptions)
     );
   }
 
@@ -1401,10 +1571,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/close`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "closeSession"),
         body: JSON.stringify(body ?? {}),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("closeSession", requestOptions)
     );
   }
 
@@ -1418,10 +1588,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sessionIdOrExternalId)}/end-and-continue`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "endAndContinueSession"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("endAndContinueSession", requestOptions)
     );
   }
 
@@ -1442,9 +1612,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listSessions"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listSessions", requestOptions)
     );
   }
 
@@ -1469,9 +1639,9 @@ export class ApiClient {
       url,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "initializeSessionStream"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("initializeSessionStream", requestOptions)
     )
       .withResponse()
       .then(({ data, response }) => ({
@@ -1501,10 +1671,13 @@ export class ApiClient {
       appendUrl,
       {
         method: "POST",
-        headers: { ...this.#getHeaders(false), "X-Part-Id": partId },
+        headers: {
+          ...this.#getHeaders(false, undefined, "appendToSessionStream"),
+          "X-Part-Id": partId,
+        },
         body: part,
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("appendToSessionStream", requestOptions)
     );
   }
 
@@ -1540,9 +1713,9 @@ export class ApiClient {
       url,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "readSessionStreamRecords"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, undefined)
+      this.#requestOptions("readSessionStreamRecords", undefined)
     );
   }
 
@@ -1587,8 +1760,9 @@ export class ApiClient {
       : `${sessionSegment}/${io}`;
 
     const subscription = new SSEStreamSubscription(url, {
-      headers: this.getHeaders(),
-      resolveHeaders: this.#resolveStreamHeaders(),
+      headers: this.#getHeaders(false, undefined, "subscribeToSessionStream"),
+      fetchClient: this.#requestFetch("subscribeToSessionStream"),
+      resolveHeaders: this.#resolveStreamHeaders("subscribeToSessionStream"),
       signal: options?.signal,
       onComplete: options?.onComplete,
       onError: options?.onError,
@@ -1648,10 +1822,10 @@ export class ApiClient {
       `${this.baseUrl}/engine/v1/runs/${runId}/wait/duration`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "waitForDuration"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("waitForDuration", requestOptions)
     );
   }
 
@@ -1675,9 +1849,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listQueues"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listQueues", requestOptions)
     );
   }
 
@@ -1693,9 +1867,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/queues/${encodedValue}?type=${type}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveQueue"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveQueue", requestOptions)
     );
   }
 
@@ -1715,13 +1889,13 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/queues/${encodedValue}/pause`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "pauseQueue"),
         body: JSON.stringify({
           type,
           action,
         }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("pauseQueue", requestOptions)
     );
   }
 
@@ -1741,13 +1915,13 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/queues/${encodedValue}/concurrency/override`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "overrideQueueConcurrencyLimit"),
         body: JSON.stringify({
           type,
           concurrencyLimit,
         }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("overrideQueueConcurrencyLimit", requestOptions)
     );
   }
 
@@ -1763,12 +1937,12 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/queues/${encodedValue}/concurrency/reset`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "resetQueueConcurrencyLimit"),
         body: JSON.stringify({
           type,
         }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("resetQueueConcurrencyLimit", requestOptions)
     );
   }
 
@@ -1782,9 +1956,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listConcurrencyLimits"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listConcurrencyLimits", requestOptions)
     );
   }
 
@@ -1794,15 +1968,32 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveConcurrencyLimit"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveConcurrencyLimit", requestOptions)
+    );
+  }
+
+  retrieveConcurrencyLimitKey(
+    name: string,
+    concurrencyKey: string,
+    requestOptions?: ZodFetchOptions
+  ) {
+    const query = new URLSearchParams({ concurrencyKey });
+    return zodfetch(
+      ConcurrencyLimitKeyItem,
+      `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}?${query.toString()}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false, undefined, "retrieveConcurrencyLimitKey"),
+      },
+      this.#requestOptions("retrieveConcurrencyLimitKey", requestOptions)
     );
   }
 
   overrideConcurrencyLimit(
     name: string,
-    override: OverrideConcurrencyLimitRequestBody,
+    override: OverrideConcurrencyLimitBoundsBody,
     requestOptions?: ZodFetchOptions
   ) {
     return zodfetch(
@@ -1810,10 +2001,27 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}/override`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "overrideConcurrencyLimit"),
         body: JSON.stringify(override),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("overrideConcurrencyLimit", requestOptions)
+    );
+  }
+
+  overrideConcurrencyLimitKey(
+    name: string,
+    override: OverrideConcurrencyLimitKeyBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      ConcurrencyLimitKeyItem,
+      `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}/override`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "overrideConcurrencyLimitKey"),
+        body: JSON.stringify(override),
+      },
+      this.#requestOptions("overrideConcurrencyLimitKey", requestOptions)
     );
   }
 
@@ -1827,12 +2035,12 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}/pause`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "pauseConcurrencyLimit"),
         body: JSON.stringify({
           action,
         }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("pauseConcurrencyLimit", requestOptions)
     );
   }
 
@@ -1842,10 +2050,27 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}/reset`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "resetConcurrencyLimit"),
         body: JSON.stringify({}),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("resetConcurrencyLimit", requestOptions)
+    );
+  }
+
+  resetConcurrencyLimitKey(
+    name: string,
+    body: ResetConcurrencyLimitRequestBody & { concurrencyKey: string },
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      ConcurrencyLimitKeyItem,
+      `${this.baseUrl}/api/v1/concurrency-limits/${encodeURIComponent(name)}/reset`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "resetConcurrencyLimitKey"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("resetConcurrencyLimitKey", requestOptions)
     );
   }
 
@@ -1856,6 +2081,7 @@ export class ApiClient {
       closeOnComplete?: boolean;
       onFetchError?: (error: Error) => void;
       skipColumns?: string[];
+      fetchClient?: typeof fetch;
     }
   ) {
     const queryParams = new URLSearchParams();
@@ -1869,11 +2095,12 @@ export class ApiClient {
       {
         closeOnComplete:
           typeof options?.closeOnComplete === "boolean" ? options.closeOnComplete : true,
-        headers: this.#getRealtimeHeaders(),
-        resolveHeaders: this.#resolveRealtimeHeaders(),
+        headers: this.#getRealtimeHeaders("subscribeToRun"),
+        resolveHeaders: this.#resolveRealtimeHeaders("subscribeToRun"),
         client: this,
         signal: options?.signal,
         onFetchError: options?.onFetchError,
+        fetchClient: this.#requestFetch("subscribeToRun", options?.fetchClient),
       }
     );
   }
@@ -1881,7 +2108,11 @@ export class ApiClient {
   subscribeToRunsWithTag<TRunTypes extends AnyRunTypes>(
     tag: string | string[],
     filters?: { createdAt?: string; skipColumns?: string[] },
-    options?: { signal?: AbortSignal; onFetchError?: (error: Error) => void }
+    options?: {
+      signal?: AbortSignal;
+      onFetchError?: (error: Error) => void;
+      fetchClient?: typeof fetch;
+    }
   ) {
     const searchParams = createSearchQueryForSubscribeToRuns({
       tags: tag,
@@ -1893,11 +2124,12 @@ export class ApiClient {
       `${this.baseUrl}/realtime/v1/runs${searchParams ? `?${searchParams}` : ""}`,
       {
         closeOnComplete: false,
-        headers: this.#getRealtimeHeaders(),
-        resolveHeaders: this.#resolveRealtimeHeaders(),
+        headers: this.#getRealtimeHeaders("subscribeToRunsWithTag"),
+        resolveHeaders: this.#resolveRealtimeHeaders("subscribeToRunsWithTag"),
         client: this,
         signal: options?.signal,
         onFetchError: options?.onFetchError,
+        fetchClient: this.#requestFetch("subscribeToRunsWithTag", options?.fetchClient),
       }
     );
   }
@@ -1908,6 +2140,7 @@ export class ApiClient {
       signal?: AbortSignal;
       onFetchError?: (error: Error) => void;
       skipColumns?: string[];
+      fetchClient?: typeof fetch;
     }
   ) {
     const queryParams = new URLSearchParams();
@@ -1920,11 +2153,12 @@ export class ApiClient {
       `${this.baseUrl}/realtime/v1/batches/${batchId}${queryParams ? `?${queryParams}` : ""}`,
       {
         closeOnComplete: false,
-        headers: this.#getRealtimeHeaders(),
-        resolveHeaders: this.#resolveRealtimeHeaders(),
+        headers: this.#getRealtimeHeaders("subscribeToBatch"),
+        resolveHeaders: this.#resolveRealtimeHeaders("subscribeToBatch"),
         client: this,
         signal: options?.signal,
         onFetchError: options?.onFetchError,
+        fetchClient: this.#requestFetch("subscribeToBatch", options?.fetchClient),
       }
     );
   }
@@ -1958,9 +2192,9 @@ export class ApiClient {
       },
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listDeployments"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listDeployments", requestOptions)
     );
   }
 
@@ -1970,9 +2204,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/deployments/current`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveCurrentDeployment"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveCurrentDeployment", requestOptions)
     );
   }
 
@@ -1997,9 +2231,10 @@ export class ApiClient {
     }
   ): Promise<AsyncIterableStream<T>> {
     const streamFactory = new SSEStreamSubscriptionFactory(options?.baseUrl ?? this.baseUrl, {
-      headers: this.getHeaders(),
+      headers: this.#getHeaders(false, undefined, "fetchStream"),
+      fetchClient: this.#requestFetch("fetchStream"),
       signal: options?.signal,
-      resolveHeaders: this.#resolveStreamHeaders(),
+      resolveHeaders: this.#resolveStreamHeaders("fetchStream"),
     });
 
     const subscription = streamFactory.createSubscription(runId, streamKey, {
@@ -2036,9 +2271,9 @@ export class ApiClient {
       `${this.baseUrl}/realtime/v1/streams/${runId}/${target}/${streamId}`,
       {
         method: "PUT",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createStream"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createStream", requestOptions)
     )
       .withResponse()
       .then(async ({ data, response }) => {
@@ -2061,10 +2296,10 @@ export class ApiClient {
       `${this.baseUrl}/realtime/v1/streams/${runId}/${target}/${streamId}/append`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "appendToStream"),
         body: part,
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("appendToStream", requestOptions)
     );
   }
 
@@ -2079,10 +2314,10 @@ export class ApiClient {
       `${this.baseUrl}/realtime/v1/streams/${runId}/input/${streamId}`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "sendInputStream"),
         body: JSON.stringify({ data }),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("sendInputStream", requestOptions)
     );
   }
 
@@ -2096,10 +2331,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runFriendlyId}/input-streams/wait`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createInputStreamWaitpoint"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createInputStreamWaitpoint", requestOptions)
     );
   }
 
@@ -2113,10 +2348,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/runs/${runFriendlyId}/session-streams/wait`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "createSessionStreamWaitpoint"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("createSessionStreamWaitpoint", requestOptions)
     );
   }
 
@@ -2126,9 +2361,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/auth/jwt/claims`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "generateJWTClaims"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("generateJWTClaims", requestOptions)
     );
   }
 
@@ -2136,16 +2371,46 @@ export class ApiClient {
     body: CreatePublicTokenRequestBody,
     requestOptions?: ZodFetchOptions
   ): Promise<{ token: string }> {
-    return zodfetch(
-      CreatePublicTokenResponseBody,
-      `${this.baseUrl}/api/v1/auth/public-tokens`,
-      {
-        method: "POST",
-        headers: this.#getHeaders(false),
-        body: JSON.stringify(body),
-      },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
-    );
+    const accessToken = this.getAccessToken("createPublicToken");
+    try {
+      return await zodfetch(
+        CreatePublicTokenResponseBody,
+        `${this.baseUrl}/api/v1/auth/public-tokens`,
+        {
+          method: "POST",
+          headers: this.#getHeaders(false, undefined, "createPublicToken"),
+          body: JSON.stringify(body),
+        },
+        this.#requestOptions("createPublicToken", requestOptions)
+      );
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        canFallbackToLocalPublicToken(accessToken, body.scopes, error.status, error.body)
+      ) {
+        const claims = await this.generateJWTClaims({
+          ...requestOptions,
+          prepareData: undefined,
+          onResponseBody: undefined,
+        });
+        const token = await generateJWT({
+          secretKey: accessToken,
+          payload: {
+            ...claims,
+            scopes: body.scopes,
+            otu: body.oneTimeUse,
+            realtime: body.realtime,
+          },
+          expirationTime: body.expirationTime,
+        });
+        return { token };
+      }
+      if (error instanceof ApiError && error.status === 404) {
+        error.message =
+          "The server does not support public-token minting for this credential. Upgrade your self-hosted server (v4.8.4 or later also supports tokens without scopes).";
+      }
+      throw error;
+    }
   }
 
   retrieveBatch(batchId: string, requestOptions?: ZodFetchOptions) {
@@ -2154,9 +2419,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v2/batches/${batchId}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "retrieveBatch"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("retrieveBatch", requestOptions)
     );
   }
 
@@ -2171,6 +2436,10 @@ export class ApiClient {
     },
     requestOptions?: ZodFetchOptions
   ): Promise<QueryExecuteResponseBody> {
+    const operation =
+      !options?.scope || options.scope === "environment"
+        ? "executeQuery"
+        : "executeQueryProjectOrOrganization";
     const body = {
       query,
       scope: options?.scope ?? "environment",
@@ -2185,10 +2454,10 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/query`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, operation),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions(operation, requestOptions)
     );
   }
 
@@ -2198,9 +2467,9 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/query/schema`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getQuerySchema"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("getQuerySchema", requestOptions)
     );
   }
 
@@ -2210,9 +2479,136 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/query/dashboards`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "listDashboards"),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("listDashboards", requestOptions)
+    );
+  }
+
+  retrieveDashboard(dashboardId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}`,
+      {
+        method: "GET",
+        headers: this.#getHeaders(false, undefined, "retrieveDashboard"),
+      },
+      this.#requestOptions("retrieveDashboard", requestOptions)
+    );
+  }
+
+  createDashboard(body: CreateDashboardRequestBody, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "createDashboard"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("createDashboard", requestOptions)
+    );
+  }
+
+  updateDashboard(
+    dashboardId: string,
+    body: UpdateDashboardRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}`,
+      {
+        method: "PATCH",
+        headers: this.#getHeaders(false, undefined, "updateDashboard"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("updateDashboard", requestOptions)
+    );
+  }
+
+  replaceDashboard(
+    dashboardId: string,
+    body: ReplaceDashboardRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}`,
+      {
+        method: "PUT",
+        headers: this.#getHeaders(false, undefined, "replaceDashboard"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("replaceDashboard", requestOptions)
+    );
+  }
+
+  deleteDashboard(dashboardId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      DeleteDashboardResponseBody,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}`,
+      {
+        method: "DELETE",
+        headers: this.#getHeaders(false, undefined, "deleteDashboard"),
+      },
+      this.#requestOptions("deleteDashboard", requestOptions)
+    );
+  }
+
+  addDashboardWidget(
+    dashboardId: string,
+    body: AddDashboardWidgetRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      AddDashboardWidgetResponseBody,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}/widgets`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "addDashboardWidget"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("addDashboardWidget", requestOptions)
+    );
+  }
+
+  updateDashboardWidget(
+    dashboardId: string,
+    widgetId: string,
+    body: UpdateDashboardWidgetRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}`,
+      {
+        method: "PATCH",
+        headers: this.#getHeaders(false, undefined, "updateDashboardWidget"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("updateDashboardWidget", requestOptions)
+    );
+  }
+
+  deleteDashboardWidget(
+    dashboardId: string,
+    widgetId: string,
+    options?: { revision?: string },
+    requestOptions?: ZodFetchOptions
+  ) {
+    const search = options?.revision
+      ? `?${new URLSearchParams({ revision: options.revision }).toString()}`
+      : "";
+
+    return zodfetch(
+      DashboardObject,
+      `${this.baseUrl}/api/v1/query/dashboards/${encodeURIComponent(dashboardId)}/widgets/${encodeURIComponent(widgetId)}${search}`,
+      {
+        method: "DELETE",
+        headers: this.#getHeaders(false, undefined, "deleteDashboardWidget"),
+      },
+      this.#requestOptions("deleteDashboardWidget", requestOptions)
     );
   }
 
@@ -2241,7 +2637,7 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/reports/${encodeURIComponent(key)}?${searchParams.toString()}`,
       {
         method: "GET",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "getReport", true),
       }
     );
 
@@ -2261,10 +2657,17 @@ export class ApiClient {
     return response.text();
   }
 
-  #getHeaders(spanParentAsLink: boolean, additionalHeaders?: Record<string, string | undefined>) {
+  #getHeaders(
+    spanParentAsLink: boolean,
+    additionalHeaders?: Record<string, string | undefined>,
+    operation = "unknown",
+    recordSelection = false
+  ) {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${this.accessToken}`,
+      ...(additionalHeaders?.Authorization
+        ? { Authorization: additionalHeaders.Authorization }
+        : this.getAuthenticationHeaders(operation, recordSelection)),
       "trigger-version": VERSION,
       ...Object.entries(additionalHeaders ?? {}).reduce(
         (acc, [key, value]) => {
@@ -2334,10 +2737,36 @@ export class ApiClient {
       `${this.baseUrl}/api/v1/prompts/${slug}`,
       {
         method: "POST",
-        headers: this.#getHeaders(false),
+        headers: this.#getHeaders(false, undefined, "resolvePrompt"),
         body: JSON.stringify(body),
       },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      this.#requestOptions("resolvePrompt", requestOptions)
+    );
+  }
+
+  createWebhookWaiter(
+    endpointId: string,
+    body: CreateWebhookWaiterRequestBody,
+    requestOptions?: ZodFetchOptions
+  ) {
+    return zodfetch(
+      CreateWebhookWaiterResponseBody,
+      `${this.baseUrl}/api/v1/webhooks/endpoints/${encodeURIComponent(endpointId)}/waiters`,
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "createWebhookWaiter"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("createWebhookWaiter", requestOptions)
+    );
+  }
+
+  cancelWebhookWaiter(waiterId: string, requestOptions?: ZodFetchOptions) {
+    return zodfetch(
+      CancelWebhookWaiterResponseBody,
+      `${this.baseUrl}/api/v1/webhooks/waiters/${encodeURIComponent(waiterId)}/cancel`,
+      { method: "POST", headers: this.#getHeaders(false, undefined, "cancelWebhookWaiter") },
+      this.#requestOptions("cancelWebhookWaiter", requestOptions)
     );
   }
 
@@ -2345,8 +2774,8 @@ export class ApiClient {
     return zodfetch(
       ListWebhookEndpointsResponse,
       `${this.baseUrl}/api/v1/webhooks/endpoints`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "listWebhookEndpoints") },
+      this.#requestOptions("listWebhookEndpoints", requestOptions)
     );
   }
 
@@ -2354,17 +2783,25 @@ export class ApiClient {
     return zodfetch(
       WebhookEndpointDetailObject,
       `${this.baseUrl}/api/v1/webhooks/endpoints/${encodeURIComponent(endpointId)}`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "retrieveWebhookEndpoint") },
+      this.#requestOptions("retrieveWebhookEndpoint", requestOptions)
     );
   }
 
-  generateWebhookEndpointSecret(endpointId: string, requestOptions?: ZodFetchOptions) {
+  generateWebhookEndpointSecret(
+    endpointId: string,
+    body: RotateWebhookEndpointSecretRequestBody = {},
+    requestOptions?: ZodFetchOptions
+  ) {
     return zodfetch(
       RotateWebhookEndpointSecretResponse,
       `${this.baseUrl}/api/v1/webhooks/endpoints/${encodeURIComponent(endpointId)}/rotate-secret`,
-      { method: "POST", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "generateWebhookEndpointSecret"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("generateWebhookEndpointSecret", requestOptions)
     );
   }
 
@@ -2376,8 +2813,12 @@ export class ApiClient {
     return zodfetch(
       SetWebhookEndpointSecretResponse,
       `${this.baseUrl}/api/v1/webhooks/endpoints/${encodeURIComponent(endpointId)}/secret`,
-      { method: "PUT", headers: this.#getHeaders(false), body: JSON.stringify(body) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "PUT",
+        headers: this.#getHeaders(false, undefined, "setWebhookEndpointSecret"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("setWebhookEndpointSecret", requestOptions)
     );
   }
 
@@ -2399,8 +2840,8 @@ export class ApiClient {
     return zodfetch(
       ListWebhookDeliveriesResponse,
       `${this.baseUrl}/api/v1/webhooks/deliveries${qs ? `?${qs}` : ""}`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "listWebhookDeliveries") },
+      this.#requestOptions("listWebhookDeliveries", requestOptions)
     );
   }
 
@@ -2408,8 +2849,8 @@ export class ApiClient {
     return zodfetch(
       WebhookDeliveryObject,
       `${this.baseUrl}/api/v1/webhooks/deliveries/${encodeURIComponent(deliveryId)}`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "retrieveWebhookDelivery") },
+      this.#requestOptions("retrieveWebhookDelivery", requestOptions)
     );
   }
 
@@ -2423,8 +2864,8 @@ export class ApiClient {
     return zodfetch(
       ReplayWebhookDeliveryResponse,
       `${this.baseUrl}/api/v1/webhooks/deliveries/${encodeURIComponent(deliveryId)}/replay${qs}`,
-      { method: "POST", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "POST", headers: this.#getHeaders(false, undefined, "replayWebhookDelivery") },
+      this.#requestOptions("replayWebhookDelivery", requestOptions)
     );
   }
 
@@ -2432,8 +2873,8 @@ export class ApiClient {
     return zodfetch(
       ListPromptsResponseBody,
       `${this.baseUrl}/api/v1/prompts`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "listPrompts") },
+      this.#requestOptions("listPrompts", requestOptions)
     );
   }
 
@@ -2441,8 +2882,8 @@ export class ApiClient {
     return zodfetch(
       ListPromptVersionsResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/versions`,
-      { method: "GET", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "GET", headers: this.#getHeaders(false, undefined, "listPromptVersions") },
+      this.#requestOptions("listPromptVersions", requestOptions)
     );
   }
 
@@ -2454,8 +2895,12 @@ export class ApiClient {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/promote`,
-      { method: "POST", headers: this.#getHeaders(false), body: JSON.stringify(body) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "promotePromptVersion"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("promotePromptVersion", requestOptions)
     );
   }
 
@@ -2467,8 +2912,12 @@ export class ApiClient {
     return zodfetch(
       PromptOverrideCreatedResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override`,
-      { method: "POST", headers: this.#getHeaders(false), body: JSON.stringify(body) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "createPromptOverride"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("createPromptOverride", requestOptions)
     );
   }
 
@@ -2480,8 +2929,12 @@ export class ApiClient {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override`,
-      { method: "PUT", headers: this.#getHeaders(false), body: JSON.stringify(body) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "PUT",
+        headers: this.#getHeaders(false, undefined, "updatePromptOverride"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("updatePromptOverride", requestOptions)
     );
   }
 
@@ -2489,8 +2942,8 @@ export class ApiClient {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override`,
-      { method: "DELETE", headers: this.#getHeaders(false) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      { method: "DELETE", headers: this.#getHeaders(false, undefined, "removePromptOverride") },
+      this.#requestOptions("removePromptOverride", requestOptions)
     );
   }
 
@@ -2502,14 +2955,18 @@ export class ApiClient {
     return zodfetch(
       PromptOkResponseBody,
       `${this.baseUrl}/api/v1/prompts/${slug}/override/reactivate`,
-      { method: "POST", headers: this.#getHeaders(false), body: JSON.stringify(body) },
-      mergeRequestOptions(this.defaultRequestOptions, requestOptions)
+      {
+        method: "POST",
+        headers: this.#getHeaders(false, undefined, "reactivatePromptOverride"),
+        body: JSON.stringify(body),
+      },
+      this.#requestOptions("reactivatePromptOverride", requestOptions)
     );
   }
 
-  #getRealtimeHeaders() {
+  #getRealtimeHeaders(operation = "unknown") {
     let headers: Record<string, string> = {
-      Authorization: `Bearer ${this.accessToken}`,
+      Authorization: `Bearer ${this.getAccessToken(operation)}`,
       "trigger-version": VERSION,
     };
 
@@ -2823,6 +3280,27 @@ function shouldRetryStreamBatchItems(
  */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Serializes a replay payload override with SuperJSON, like `trigger()` does, so values such
+ * as `Date` and `BigInt` reach the task intact. Falls back to plain JSON when SuperJSON can't
+ * serialize the value.
+ */
+function withSuperJsonPayload(body: ReplayRunRequestBody): ReplayRunRequestBody {
+  if (body.payload === undefined || body.payloadType !== undefined) {
+    return body;
+  }
+
+  try {
+    return {
+      ...body,
+      payload: superjson.stringify(body.payload),
+      payloadType: "application/super+json",
+    };
+  } catch {
+    return body;
+  }
 }
 
 /**

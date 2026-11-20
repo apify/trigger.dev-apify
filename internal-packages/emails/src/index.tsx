@@ -2,10 +2,8 @@ import type { ReactElement } from "react";
 
 import { z } from "zod";
 import AlertAttemptFailureEmail, { AlertAttemptEmailSchema } from "../emails/alert-attempt-failure";
-import AlertDashboardAgentWatchEmail, {
-  AlertDashboardAgentWatchEmailSchema,
-} from "../emails/alert-dashboard-agent-watch";
 import AlertErrorGroupEmail, { AlertErrorGroupEmailSchema } from "../emails/alert-error-group";
+import AlertRaisedEmail, { AlertRaisedEmailSchema } from "../emails/alert-raised";
 import AlertRunFailureEmail, { AlertRunEmailSchema } from "../emails/alert-run-failure";
 import { setGlobalBasePath } from "../emails/components/BasePath";
 import ConfirmEmailChangeEmail, {
@@ -25,9 +23,18 @@ import type { MailTransport, MailTransportOptions } from "./transports";
 import { constructMailTransport } from "./transports";
 import MfaEnabledEmail, { MfaEnabledEmailSchema } from "../emails/mfa-enabled";
 import MfaDisabledEmail, { MfaDisabledEmailSchema } from "../emails/mfa-disabled";
+import CliLoginAuthorizedEmail, {
+  CliLoginAuthorizedEmailSchema,
+} from "../emails/cli-login-authorized";
 import BulkActionCompletedEmail, {
   BulkActionCompletedEmailSchema,
 } from "../emails/bulk-action-complete";
+import PersonalAccessTokenExpiredEmail, {
+  PersonalAccessTokenExpiredEmailSchema,
+} from "../emails/personal-access-token-expired";
+import PersonalAccessTokenExpiringEmail, {
+  PersonalAccessTokenExpiringEmailSchema,
+} from "../emails/personal-access-token-expiring";
 
 export { type MailTransportOptions };
 
@@ -43,12 +50,15 @@ export const DeliverEmailSchema = z
     AlertRunEmailSchema,
     AlertAttemptEmailSchema,
     AlertErrorGroupEmailSchema,
-    AlertDashboardAgentWatchEmailSchema,
+    AlertRaisedEmailSchema,
     AlertDeploymentFailureEmailSchema,
     AlertDeploymentSuccessEmailSchema,
     MfaEnabledEmailSchema,
     MfaDisabledEmailSchema,
+    CliLoginAuthorizedEmailSchema,
     BulkActionCompletedEmailSchema,
+    PersonalAccessTokenExpiringEmailSchema,
+    PersonalAccessTokenExpiredEmailSchema,
   ])
   .and(z.object({ to: z.string() }));
 
@@ -149,11 +159,10 @@ export class EmailClient {
           component: <AlertErrorGroupEmail {...data} />,
         };
       }
-      case "alert-dashboard-agent-watch": {
+      case "alert-raised": {
         return {
-          // The headline is the same sentence the chat and Slack use; `identity` is a key.
-          subject: `[${data.organization}] ${data.headline ?? `Watch update: ${data.identity}`}`,
-          component: <AlertDashboardAgentWatchEmail {...data} />,
+          subject: `[${data.organization}] ${data.headline}`,
+          component: <AlertRaisedEmail {...data} />,
         };
       }
       case "alert-deployment-failure": {
@@ -180,10 +189,28 @@ export class EmailClient {
           component: <MfaDisabledEmail {...data} />,
         };
       }
+      case "cli-login-authorized": {
+        return {
+          subject: `New login authorized on your Trigger.dev account`,
+          component: <CliLoginAuthorizedEmail {...data} />,
+        };
+      }
       case "bulk-action-completed": {
         return {
           subject: `Bulk action finished`,
           component: <BulkActionCompletedEmail {...data} />,
+        };
+      }
+      case "personal-access-token-expiring": {
+        return {
+          subject: `Your Trigger.dev personal access token is about to expire`,
+          component: <PersonalAccessTokenExpiringEmail {...data} />,
+        };
+      }
+      case "personal-access-token-expired": {
+        return {
+          subject: `Your Trigger.dev personal access token has expired`,
+          component: <PersonalAccessTokenExpiredEmail {...data} />,
         };
       }
     }

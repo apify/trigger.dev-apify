@@ -588,7 +588,9 @@ export const TableCellMenu = forwardRef<
           <div
             className={cn(
               "absolute right-0 top-1/2 mr-1 flex -translate-y-1/2 items-center justify-end gap-0.5 rounded-[0.25rem] p-0.5 group-hover/table-row:ring-1",
-              variants[variant].menuButton
+              variants[variant].menuButton,
+              // On a selected row the button sits on the row's selected background, hovered or not.
+              isSelected && variants[variant].rowSelected
             )}
           >
             {/* Hidden buttons that show on hover */}
@@ -596,8 +598,11 @@ export const TableCellMenu = forwardRef<
               <div
                 data-hidden-buttons
                 className={cn(
-                  "hidden group-hover/table-row:block",
-                  popoverContent && "pr-0.5 group-hover/table-row:border-r",
+                  // On row hover, and also for the keyboard (focus inside the row) and on touch
+                  // screens, which have no hover.
+                  "hidden group-focus-within/table-row:block group-hover/table-row:block pointer-coarse:block",
+                  popoverContent &&
+                    "pr-0.5 group-focus-within/table-row:border-r group-hover/table-row:border-r pointer-coarse:border-r",
                   variants[variant].menuButtonDivider
                 )}
               >

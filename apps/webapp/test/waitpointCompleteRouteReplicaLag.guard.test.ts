@@ -30,6 +30,8 @@ vi.mock("~/db.server", () => ({
 
 vi.mock("~/v3/runEngine.server", () => ({
   engine: {
+    // Existing legacy-route fixture remains on its disabled waitpoint path.
+    waitpointSystem: { isWaitpointStoreEnabled: async () => false },
     completeWaitpoint: async (args: any) => {
       engineHolder.calls.push(args);
       return { id: args.id };
@@ -68,7 +70,9 @@ vi.mock("~/models/message.server", () => ({
 // whose id matches the seeded waitpoint so the scoped lookup can authorize it.
 const envHolder = vi.hoisted(() => ({ id: undefined as string | undefined }));
 vi.mock("~/models/runtimeEnvironment.server", () => ({
-  findEnvironmentBySlug: async () => (envHolder.id ? { id: envHolder.id } : null),
+  // The route reads environment.organization.id to route the continuation by org; the stub must carry it.
+  findEnvironmentBySlug: async () =>
+    envHolder.id ? { id: envHolder.id, organization: { id: `org_${envHolder.id}` } } : null,
 }));
 vi.mock("~/runEngine/concerns/waitpointCompletionPacket.server", () => ({
   processWaitpointCompletionPacket: async () => ({ data: undefined, dataType: "application/json" }),

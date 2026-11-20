@@ -2,6 +2,7 @@ import type {
   ControlPlaneResolver as EngineControlPlaneResolver,
   EnvDeletionState,
   ResolvedAuthenticatedEnv,
+  ResolvedDeploymentStatus,
   ResolvedEngineEnv,
   ResolvedWorkerVersion,
 } from "@internal/run-engine";
@@ -52,6 +53,10 @@ export class RunEngineControlPlaneResolver implements EngineControlPlaneResolver
     return this.#resolver.resolveEnvDeletionState(environmentId);
   }
 
+  async resolveDeploymentStatus(deploymentId: string): Promise<ResolvedDeploymentStatus | null> {
+    return this.#resolver.resolveDeploymentStatus(deploymentId);
+  }
+
   async resolveWorkerVersion(args: {
     environmentId: string;
     type: RuntimeEnvironmentType;
@@ -60,6 +65,22 @@ export class RunEngineControlPlaneResolver implements EngineControlPlaneResolver
     queue?: { lockedQueueId?: string | null; name: string };
   }): Promise<ResolvedWorkerVersion | null> {
     return this.#resolver.resolveWorkerVersion({
+      environmentId: args.environmentId,
+      backgroundWorkerId: args.workerId,
+      type: args.type,
+      taskIdentifier: args.taskIdentifier,
+      queue: args.queue,
+    });
+  }
+
+  async resolveWorkerVersionFromPrimary(args: {
+    environmentId: string;
+    type: RuntimeEnvironmentType;
+    workerId?: string;
+    taskIdentifier?: string;
+    queue?: { lockedQueueId?: string | null; name: string };
+  }): Promise<ResolvedWorkerVersion | null> {
+    return this.#resolver.resolveWorkerVersionFromPrimary({
       environmentId: args.environmentId,
       backgroundWorkerId: args.workerId,
       type: args.type,

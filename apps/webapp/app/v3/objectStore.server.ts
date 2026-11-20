@@ -57,6 +57,16 @@ export function formatStorageUri(path: string, protocol?: string): string {
 
 export const INVALID_PACKET_STORAGE_PATH = "Invalid packet storage path";
 
+/** True when a stored-payload pointer, once normalised, sits under `prefix/`. Fails closed. */
+export function isPacketPathUnder(pointer: unknown, prefix: string): boolean {
+  if (typeof pointer !== "string") return false;
+  try {
+    return resolveSafePacketRelativePath(parseStorageUri(pointer).path).startsWith(`${prefix}/`);
+  } catch {
+    return false;
+  }
+}
+
 export type PacketPresignFailure = {
   success: false;
   error: string;
@@ -212,7 +222,7 @@ const objectStoreClients = singleton(
   () => new Map<string, ObjectStoreClient>()
 );
 
-function getObjectStoreClient(protocol?: string): ObjectStoreClient | undefined {
+export function getObjectStoreClient(protocol?: string): ObjectStoreClient | undefined {
   const config = getObjectStoreConfig(protocol);
   if (!config) return undefined;
 

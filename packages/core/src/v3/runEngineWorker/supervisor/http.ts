@@ -6,24 +6,31 @@ import type {
   WorkerApiRunAttemptCompleteRequestBody,
   WorkerApiRunAttemptStartRequestBody,
   WorkerApiRunHeartbeatRequestBody,
+  WorkerApiRunReleaseRequestBody,
   WorkerApiRunRestoreOutcomeRequestBody,
   WorkerApiDebugLogBody,
   WorkerApiSuspendRunRequestBody,
 } from "./schemas.js";
 import {
   WorkerApiConnectResponseBody,
-  WorkerApiContinueRunExecutionRequestBody,
+  WorkerApiContinueRunExecutionResponseBody,
   WorkerApiDequeueResponseBody,
   WorkerApiHeartbeatResponseBody,
   WorkerApiRunAttemptCompleteResponseBody,
   WorkerApiRunAttemptStartResponseBody,
   WorkerApiRunHeartbeatResponseBody,
   WorkerApiRunLatestSnapshotResponseBody,
+  WorkerApiRunReleaseResponseBody,
   WorkerApiRunRestoreOutcomeResponseBody,
   WorkerApiSuspendRunResponseBody,
   WorkerApiRunSnapshotsSinceResponseBody,
 } from "./schemas.js";
 import type { SupervisorClientCommonOptions, SupervisorHttpRequestMetric } from "./types.js";
+import {
+  retryContinueWithinBudget,
+  type ContinueRetryBudget,
+  type ContinueRetrySummary,
+} from "./continueRetry.js";
 import { getDefaultWorkerHeaders } from "./util.js";
 import { wrapZodFetch, type ApiResult, type ZodFetchOptions } from "../../zodfetch.js";
 import { createHeaders } from "../util.js";
@@ -169,17 +176,21 @@ export class SupervisorHttpClient {
     runId: string,
     snapshotId: string,
     body: WorkerApiRunHeartbeatRequestBody,
-    runnerId?: string
+    runnerId?: string,
+    environmentId?: string,
+    sandboxRunId?: string
   ) {
     return this.request(
       "heartbeat_run",
       WorkerApiRunHeartbeatResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/heartbeat`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/heartbeat`,
       {
         method: "POST",
         headers: {
           ...this.defaultHeaders,
           ...this.runnerIdHeader(runnerId),
+          ...this.environmentIdHeader(environmentId),
+          ...createHeaders({ [WORKER_HEADERS.SANDBOX_RUN_ID]: sandboxRunId }),
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
@@ -192,18 +203,20 @@ export class SupervisorHttpClient {
     snapshotId: string,
     body: WorkerApiRunAttemptStartRequestBody,
     runnerId?: string,
-    environmentId?: string
+    environmentId?: string,
+    sandboxRunId?: string
   ) {
     return this.request(
       "start_run_attempt",
       WorkerApiRunAttemptStartResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/attempts/start`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/attempts/start`,
       {
         method: "POST",
         headers: {
           ...this.defaultHeaders,
           ...this.runnerIdHeader(runnerId),
           ...this.environmentIdHeader(environmentId),
+          ...createHeaders({ [WORKER_HEADERS.SANDBOX_RUN_ID]: sandboxRunId }),
         },
         body: JSON.stringify(body),
       }
@@ -220,7 +233,7 @@ export class SupervisorHttpClient {
     return this.request(
       "complete_run_attempt",
       WorkerApiRunAttemptCompleteResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/attempts/complete`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/attempts/complete`,
       {
         method: "POST",
         headers: {
@@ -237,7 +250,7 @@ export class SupervisorHttpClient {
     return this.request(
       "get_latest_snapshot",
       WorkerApiRunLatestSnapshotResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/latest`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/latest`,
       {
         method: "GET",
         headers: {
@@ -258,7 +271,7 @@ export class SupervisorHttpClient {
     return this.request(
       "get_snapshots_since",
       WorkerApiRunSnapshotsSinceResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/since/${snapshotId}`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/since/${encodeURIComponent(snapshotId)}`,
       {
         method: "GET",
         headers: {
@@ -279,7 +292,7 @@ export class SupervisorHttpClient {
       const res = await this.request(
         "send_debug_log",
         z.unknown(),
-        `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/logs/debug`,
+        `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/logs/debug`,
         {
           method: "POST",
           headers: {
@@ -303,36 +316,55 @@ export class SupervisorHttpClient {
     runId: string,
     snapshotId: string,
     runnerId?: string,
-    environmentId?: string
-  ) {
-    return this.request(
-      "continue_run_execution",
-      WorkerApiContinueRunExecutionRequestBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/continue`,
-      {
-        method: "GET",
-        headers: {
-          ...this.defaultHeaders,
-          ...this.runnerIdHeader(runnerId),
-          ...this.environmentIdHeader(environmentId),
+    environmentId?: string,
+    options?: {
+      retryBudget?: ContinueRetryBudget;
+      supportsSecretProxy?: boolean;
+      sandboxRunId?: string;
+    }
+  ): Promise<
+    ApiResult<WorkerApiContinueRunExecutionResponseBody> & { retry?: ContinueRetrySummary }
+  > {
+    const query = options?.supportsSecretProxy ? "?supportsSecretProxy=1" : "";
+    const continueRun = (retry: ZodFetchOptions["retry"], signal?: AbortSignal) =>
+      this.request(
+        "continue_run_execution",
+        WorkerApiContinueRunExecutionResponseBody,
+        `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/continue${query}`,
+        {
+          method: "GET",
+          headers: {
+            ...this.defaultHeaders,
+            ...this.runnerIdHeader(runnerId),
+            ...this.environmentIdHeader(environmentId),
+            ...createHeaders({ [WORKER_HEADERS.SANDBOX_RUN_ID]: options?.sandboxRunId }),
+          },
+          signal,
         },
-      },
-      {
-        // This is the hop that reaches the engine, so it's where a transient
-        // database outage during resume surfaces (as a retryable 5xx). Resuming
-        // is idempotent server-side (guarded by the snapshot id), so retry
-        // generously to ride out the outage rather than aborting the run.
-        // `randomize` jitters the delay so a fleet of runs resuming at once
-        // doesn't stampede the DB the moment it recovers.
-        retry: {
-          minTimeoutInMs: 500,
-          maxTimeoutInMs: 10_000,
-          maxAttempts: 8,
-          factor: 2,
-          randomize: true,
-        },
-      }
-    );
+        { retry }
+      );
+
+    if (options?.retryBudget) {
+      // Each attempt is a single request; the budget decides whether and when to try again.
+      return retryContinueWithinBudget(
+        (signal) => continueRun({ maxAttempts: 1 }, signal),
+        options.retryBudget
+      );
+    }
+
+    // This is the hop that reaches the engine, so it's where a transient
+    // database outage during resume surfaces (as a retryable 5xx). Resuming
+    // is idempotent server-side (guarded by the snapshot id), so retry
+    // generously to ride out the outage rather than aborting the run.
+    // `randomize` jitters the delay so a fleet of runs resuming at once
+    // doesn't stampede the DB the moment it recovers.
+    return continueRun({
+      minTimeoutInMs: 500,
+      maxTimeoutInMs: 10_000,
+      maxAttempts: 8,
+      factor: 2,
+      randomize: true,
+    });
   }
 
   async reportRestoreOutcome(
@@ -345,7 +377,7 @@ export class SupervisorHttpClient {
     return this.request(
       "report_restore_outcome",
       WorkerApiRunRestoreOutcomeResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/restore-outcome`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/restore-outcome`,
       {
         method: "POST",
         headers: {
@@ -359,26 +391,79 @@ export class SupervisorHttpClient {
     );
   }
 
+  /**
+   * Gives back a run this worker dequeued but never started. The platform requeues it with the
+   * engine's dequeue backoff and charges its dequeue budget, as the pending execution timeout
+   * would; once that budget is spent the run fails instead, and `requeued` is false.
+   */
+  async releaseRun(
+    runId: string,
+    snapshotId: string,
+    body: WorkerApiRunReleaseRequestBody,
+    runnerId?: string,
+    environmentId?: string
+  ): Promise<ApiResult<WorkerApiRunReleaseResponseBody>> {
+    return this.request(
+      "release_run",
+      WorkerApiRunReleaseResponseBody,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/release`,
+      {
+        method: "POST",
+        headers: {
+          ...this.defaultHeaders,
+          ...this.runnerIdHeader(runnerId),
+          ...this.environmentIdHeader(environmentId),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }
+    );
+  }
+
+  async preflightSuspend(
+    runId: string,
+    snapshotId: string,
+    runnerId?: string,
+    environmentId?: string
+  ) {
+    return this.request(
+      "preflight_suspend",
+      WorkerApiSuspendRunResponseBody,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/suspend/preflight`,
+      {
+        method: "POST",
+        headers: {
+          ...this.defaultHeaders,
+          ...this.runnerIdHeader(runnerId),
+          ...this.environmentIdHeader(environmentId),
+        },
+      }
+    );
+  }
+
   async submitSuspendCompletion({
     runId,
     snapshotId,
     runnerId,
+    environmentId,
     body,
   }: {
     runId: string;
     snapshotId: string;
     runnerId?: string;
     body: WorkerApiSuspendRunRequestBody;
+    environmentId?: string;
   }) {
     return this.request(
       "submit_suspend_completion",
       WorkerApiSuspendRunResponseBody,
-      `${this.apiUrl}/engine/v1/worker-actions/runs/${runId}/snapshots/${snapshotId}/suspend`,
+      `${this.apiUrl}/engine/v1/worker-actions/runs/${encodeURIComponent(runId)}/snapshots/${encodeURIComponent(snapshotId)}/suspend`,
       {
         method: "POST",
         headers: {
           ...this.defaultHeaders,
           ...this.runnerIdHeader(runnerId),
+          ...this.environmentIdHeader(environmentId),
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),

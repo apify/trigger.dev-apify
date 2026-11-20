@@ -5,6 +5,7 @@ import { mockChatAgent } from "../src/v3/test/index.js";
 import { describe, expect, it } from "vitest";
 import { chat, __buildManagedStreamTextOptionsForTests as buildManaged } from "../src/v3/ai.js";
 import { chat as chatServer } from "../src/v3/chat-server.js";
+import { definePrompt } from "../src/v3/prompt.js";
 import { simulateReadableStream, stepCountIs, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -114,9 +115,7 @@ describe("the streamText handed to run()", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "one" }] });
-      await new Promise((r) => setTimeout(r, 40));
       await harness.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "two" }] });
-      await new Promise((r) => setTimeout(r, 40));
 
       const system = JSON.stringify(
         model.doStreamCalls.at(-1)!.prompt.filter((m) => m.role === "system")
@@ -175,7 +174,6 @@ describe("the streamText handed to run()", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] });
-      await new Promise((r) => setTimeout(r, 60));
 
       const names = (model.doStreamCalls.at(-1)!.tools ?? []).map((t) => t.name).sort();
       expect(names).toEqual(["agentTool", "bash", "callerTool", "loadSkill", "readFile"].sort());
@@ -199,7 +197,6 @@ describe("the streamText handed to run()", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] });
-      await new Promise((r) => setTimeout(r, 60));
 
       const prompt = JSON.stringify(model.doStreamCalls.at(-1)!.prompt);
       expect(prompt).toContain("CALLER-SYSTEM");
@@ -230,9 +227,7 @@ describe("the streamText handed to run()", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "one" }] });
-      await new Promise((r) => setTimeout(r, 40));
       await harness.sendMessage({ id: "u2", role: "user", parts: [{ type: "text", text: "two" }] });
-      await new Promise((r) => setTimeout(r, 40));
 
       const system = JSON.stringify(
         model.doStreamCalls.at(-1)!.prompt.filter((m) => m.role === "system")
@@ -268,7 +263,6 @@ describe("the streamText handed to run()", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] });
-      await new Promise((r) => setTimeout(r, 60));
 
       expect((thrown as Error)?.message).toContain("already set");
       expect((thrown as Error)?.message).toContain("chat.agent({ system })");
@@ -401,6 +395,91 @@ describe("what the managed streamText passes through", () => {
     expect(merged.experimental_telemetry).toBe(callerTelemetry);
   });
 
+  it("turns AI SDK telemetry on when no prompt is stored, so model steps and tool calls are traced", () => {
+    const merged = buildManaged({ model: "m" }, {});
+    expect(merged.experimental_telemetry).toEqual({ isEnabled: true, metadata: {} });
+  });
+
+  it.each([
+    { name: "default telemetry", key: "default", prompt: undefined, metadata: {} },
+    {
+      name: "stored prompt telemetry",
+      key: "string-prompt",
+      prompt: async () => "You are terse.",
+      metadata: {},
+    },
+    {
+      name: "resolved prompt telemetry and its variables",
+      key: "resolved-prompt",
+      prompt: () =>
+        definePrompt({
+          id: "bound-streamtext-redacted",
+          content: "Help {{name}}.",
+        }).resolve({ name: "secret" }),
+      metadata: {
+        "prompt.slug": "bound-streamtext-redacted",
+        "prompt.id": "bound-streamtext-redacted",
+        "prompt.version": "0",
+        "prompt.labels": "local",
+      },
+    },
+  ])(
+    "keeps prompt and response content out of $name when recordUserMessage is off",
+    async ({ key, prompt, metadata }) => {
+      const stored = await prompt?.();
+      const seen: unknown[] = [];
+      const model = new MockLanguageModelV3({
+        doStream: async () => ({
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "text-start", id: "t" },
+              { type: "text-delta", id: "t", delta: "ok" },
+              { type: "text-end", id: "t" },
+              {
+                type: "finish",
+                finishReason: { unified: "stop", raw: "stop" },
+                usage: {
+                  inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 },
+                },
+              },
+            ] as LanguageModelV3StreamPart[],
+          }),
+        }),
+      });
+      const agent = chat.agent({
+        id: `bound-streamtext.redacted-telemetry-${key}`,
+        telemetry: { recordUserMessage: false },
+        run: async ({ messages, signal, streamText }) => {
+          if (stored) chat.prompt.set(stored);
+          seen.push(chat.toStreamTextOptions().experimental_telemetry);
+          return streamText({ model, messages, abortSignal: signal });
+        },
+      });
+      const harness = mockChatAgent(agent, { chatId: `bound-streamtext-redacted-${key}` });
+      try {
+        await harness.sendMessage({
+          id: "u1",
+          role: "user",
+          parts: [{ type: "text", text: "secret" }],
+        });
+        expect(seen[0]).toEqual({
+          isEnabled: true,
+          metadata,
+          recordInputs: false,
+          recordOutputs: false,
+        });
+      } finally {
+        await harness.close();
+      }
+    }
+  );
+
+  it("lets a caller turn telemetry off", () => {
+    const merged = buildManaged({ model: "m", experimental_telemetry: { isEnabled: false } }, {});
+    expect(merged.experimental_telemetry).toEqual({ isEnabled: false });
+  });
+
   it("carries the agent's system when the caller names none", () => {
     const merged = buildManaged({ model: "m" }, { system: "AGENT-SYSTEM" });
     expect(JSON.stringify(merged.system)).toContain("AGENT-SYSTEM");
@@ -482,9 +561,7 @@ describe("a turn started from an action", () => {
 
     try {
       await harness.sendMessage({ id: "u1", role: "user", parts: [{ type: "text", text: "ask" }] });
-      await new Promise((r) => setTimeout(r, 40));
       await harness.sendAction({ type: "regenerate" });
-      await new Promise((r) => setTimeout(r, 80));
 
       expect(prompts).toHaveLength(2);
       const regen = prompts[1]!;

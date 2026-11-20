@@ -3,7 +3,6 @@ import {
   investigationBlockSchema,
   safeParseTriggerUri,
   VIEW_BLOCK_VERSION,
-  WATCH_MAX_HOURS,
   type InvestigationAction,
   type InvestigationBlockBodyInput,
   type InvestigationCapabilities,
@@ -35,14 +34,11 @@ export function showCodeAskPrompt(args: { path: string; line: number; sha: strin
   const shortSha = args.sha.slice(0, 7);
   return (
     `Propose a fix. Reply with one fenced \`\`\`diff block holding the minimal change, ` +
-    `anchored to ${args.path}:${args.line}@${shortSha} — re-read that file at that commit if you need it. ` +
+    `anchored to ${args.path}:${args.line}@${shortSha} - re-read that file at that commit if you need it. ` +
     `If ${shortSha} isn't the branch head, or that version was built from a dirty tree, say so in one line. ` +
     `Don't restate the investigation.`
   );
 }
-
-/** Defaults the "Watch for a repeat" card shows, which the user can change. */
-const RECURRENCE_WATCH = { checkEveryMinutes: 15, maxHours: WATCH_MAX_HOURS } as const;
 
 /**
  * The card's typed next actions, decided here and never by the model. "Show code"
@@ -50,8 +46,7 @@ const RECURRENCE_WATCH = { checkEveryMinutes: 15, maxHours: WATCH_MAX_HOURS } as
  */
 function investigationCapabilities(
   state: InvestigationState,
-  reads: SourceReadLookup,
-  watchEnabled: boolean
+  reads: SourceReadLookup
 ): InvestigationCapabilities | null {
   if (state.outcome === "in_progress") return null;
 
@@ -81,38 +76,12 @@ function investigationCapabilities(
       label: "Keep digging",
       intent: {
         kind: "ask",
-        prompt: "Keep digging into this — what else can you check?",
+        prompt: "Keep digging into this - what else can you check?",
       },
     });
   }
 
   const errorUri = cited.find((evidence) => evidence.kind === "error")?.uri;
-
-  // "Watch for a repeat" needs a cited error fingerprint to pre-fill from, so without
-  // one it is left off.
-  const parsedError = errorUri ? safeParseTriggerUri(errorUri) : undefined;
-  if (
-    watchEnabled &&
-    state.outcome === "concluded" &&
-    parsedError?.success &&
-    parsedError.data.kind === "error"
-  ) {
-    actions.push({
-      kind: "watch_recurrence",
-      label: "Watch for a repeat",
-      intent: {
-        kind: "watch",
-        // A pre-fill only: emitting the spec creates nothing.
-        spec: {
-          kind: "error_recurrence",
-          fingerprint: parsedError.data.fingerprint,
-          checkEveryMinutes: RECURRENCE_WATCH.checkEveryMinutes,
-          maxHours: RECURRENCE_WATCH.maxHours,
-          note: `A repeat of: ${state.title}`,
-        },
-      },
-    });
-  }
 
   if (errorUri) {
     actions.push({
@@ -171,8 +140,6 @@ export type InvestigationRenderer = (
 export type InvestigationRendererContext = {
   projectRef?: string;
   environmentId?: string;
-  // Off by default: without the watch tool the card must not offer "Watch for a repeat".
-  watchEnabled?: boolean;
   investigations?: InvestigationsCapability;
   reads: SourceReadLookup;
 };
@@ -272,7 +239,7 @@ export function createInvestigationRenderer(
         console.error("investigation upsert failed", error);
         return {
           error:
-            "Couldn't save the investigation right now. Say what you found in prose, honestly — if a card is already open it will be closed as inconclusive when the turn ends.",
+            "Couldn't save the investigation right now. Say what you found in prose, honestly - if a card is already open it will be closed as inconclusive when the turn ends.",
         };
       }
 
@@ -290,7 +257,7 @@ export function createInvestigationRenderer(
       investigationId = result.id;
       revision = result.revision;
 
-      const capabilities = investigationCapabilities(state, reads, ctx.watchEnabled === true);
+      const capabilities = investigationCapabilities(state, reads);
 
       const parsed = investigationBlockSchema.safeParse({
         ...block,

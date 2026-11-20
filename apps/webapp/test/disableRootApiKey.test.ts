@@ -76,13 +76,21 @@ containerTest(
     expect(stored.rootApiKeyHiddenAt).toEqual(result.rootApiKeyHiddenAt);
     expect(stored.apiKey).not.toBe(oldRootApiKey);
     expect(stored.pkApiKey).not.toBe(oldPkApiKey);
-    await expect(findEnvironmentByApiKey(oldRootApiKey, undefined, prisma)).resolves.toMatchObject({
+    await expect(
+      findEnvironmentByApiKey(oldRootApiKey, { branchName: undefined, clientIp: null }, prisma)
+    ).resolves.toMatchObject({
       id: environment.id,
     });
     await expect(
-      findEnvironmentByApiKey(historicalRootApiKey, undefined, prisma)
+      findEnvironmentByApiKey(
+        historicalRootApiKey,
+        { branchName: undefined, clientIp: null },
+        prisma
+      )
     ).resolves.toMatchObject({ id: environment.id });
-    await expect(findEnvironmentByApiKey(stored.apiKey, undefined, prisma)).resolves.toMatchObject({
+    await expect(
+      findEnvironmentByApiKey(stored.apiKey, { branchName: undefined, clientIp: null }, prisma)
+    ).resolves.toMatchObject({
       id: environment.id,
     });
     expect(revokedRootApiKeys).toEqual(
@@ -163,6 +171,33 @@ containerTest("a hidden root API key cannot be regenerated and returned", async 
 });
 
 containerTest(
+  "disabling visibility of an already hidden root key is rejected without rotating it",
+  async ({ prisma }) => {
+    const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
+    const environment = await createRuntimeEnvironment(prisma, {
+      projectId: project.id,
+      organizationId: organization.id,
+      type: "PRODUCTION",
+      rootApiKeyHiddenAt: new Date(),
+    });
+
+    await expect(
+      disableRootApiKeyVisibility(
+        { environmentId: environment.id, userId: user.id },
+        { prismaClient: prisma }
+      )
+    ).rejects.toBeInstanceOf(RootApiKeyNotVisibleError);
+
+    await expect(
+      prisma.runtimeEnvironment.findFirstOrThrow({ where: { id: environment.id } })
+    ).resolves.toMatchObject({ apiKey: environment.apiKey, pkApiKey: environment.pkApiKey });
+    await expect(
+      prisma.revokedApiKey.count({ where: { runtimeEnvironmentId: environment.id } })
+    ).resolves.toBe(0);
+  }
+);
+
+containerTest(
   "root key mutations use the shared parent environment for branches",
   async ({ prisma }) => {
     const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
@@ -222,7 +257,7 @@ containerTest("visibility disable wins a race with root key regeneration", async
     type: "PRODUCTION",
   });
 
-  const [, disableResult] = await Promise.allSettled([
+  const [regenerateResult, disableResult] = await Promise.allSettled([
     regenerateApiKey({ environmentId: environment.id, userId: user.id }, { prismaClient: prisma }),
     disableRootApiKeyVisibility(
       { environmentId: environment.id, userId: user.id },
@@ -237,10 +272,16 @@ containerTest("visibility disable wins a race with root key regeneration", async
   });
 
   expect(disableResult.status).toBe("fulfilled");
+  if (regenerateResult.status === "fulfilled") {
+    expect(regenerateResult.value.rootApiKeyHiddenAt).toBeNull();
+    expect(regenerateResult.value.apiKey).not.toBe(stored.apiKey);
+  } else {
+    expect(regenerateResult.reason).toBeInstanceOf(RootApiKeyNotVisibleError);
+  }
   expect(stored.rootApiKeyHiddenAt).toBeInstanceOf(Date);
   expect(revokedCount).toBeGreaterThanOrEqual(1);
   await expect(
-    findEnvironmentByApiKey(environment.apiKey, undefined, prisma)
+    findEnvironmentByApiKey(environment.apiKey, { branchName: undefined, clientIp: null }, prisma)
   ).resolves.toMatchObject({ id: environment.id });
 });
 

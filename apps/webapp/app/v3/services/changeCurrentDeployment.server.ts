@@ -6,6 +6,7 @@ import { logger } from "~/services/logger.server";
 import { syncTaskIdentifiers } from "~/services/taskIdentifierRegistry.server";
 import {
   type TaskMetadataCache,
+  parseExecutionPolicy,
   parseTaskGates,
   type TaskMetadataEntry,
 } from "~/services/taskMetadataCache.server";
@@ -119,6 +120,7 @@ export class ChangeCurrentDeploymentService extends BaseService {
         select: {
           slug: true,
           triggerSource: true,
+          executionPolicy: true,
           ttl: true,
           gates: true,
           queue: { select: { id: true, name: true } },
@@ -157,6 +159,7 @@ export class ChangeCurrentDeploymentService extends BaseService {
         slug: t.slug,
         ttl: t.ttl,
         triggerSource: t.triggerSource,
+        executionPolicy: parseExecutionPolicy(t.executionPolicy),
         queueId: t.queue?.id ?? null,
         queueName: t.queue?.name ?? "",
         gates: parseTaskGates(t.gates),
@@ -166,20 +169,21 @@ export class ChangeCurrentDeploymentService extends BaseService {
       await this._taskMetaCache.populateByCurrentWorker(
         deployment.environmentId,
         deployment.workerId!,
-        metadataEntries
+        metadataEntries,
+        deployment.templateKey
       );
     }
 
-    const [scheduleSyncError] = await tryCatch(this.#syncSchedulesForDeployment(deployment));
+    const [declarativeSyncError] = await tryCatch(this.#syncDeclarativeResources(deployment));
 
-    if (scheduleSyncError) {
-      logger.error("Error syncing declarative schedules on deployment change", {
-        error: scheduleSyncError,
+    if (declarativeSyncError) {
+      logger.error("Error syncing declarative resources on deployment change", {
+        error: declarativeSyncError,
       });
     }
   }
 
-  async #syncSchedulesForDeployment(deployment: WorkerDeployment) {
+  async #syncDeclarativeResources(deployment: WorkerDeployment) {
     const worker = await this._prisma.backgroundWorker.findFirst({
       where: { id: deployment.workerId! },
     });
@@ -220,16 +224,35 @@ export class ChangeCurrentDeploymentService extends BaseService {
       return;
     }
 
-    await syncDeclarativeSchedules(parsed.data.tasks, worker, environment, this._prisma);
-    await syncDeclarativeWebhooks(
-      {
-        endpoints: parsed.data.webhookEndpoints,
-        subscribers: parsed.data.webhookSubscribers,
-      },
-      worker,
-      environment,
-      this._prisma,
-      webhookPrisma
+    const [schedulesError] = await tryCatch(
+      syncDeclarativeSchedules(parsed.data.tasks, worker, environment, this._prisma)
     );
+
+    if (schedulesError) {
+      logger.error("Error syncing declarative schedules on deployment change", {
+        deploymentId: deployment.id,
+        error: schedulesError,
+      });
+    }
+
+    const [webhooksError] = await tryCatch(
+      syncDeclarativeWebhooks(
+        {
+          endpoints: parsed.data.webhookEndpoints,
+          subscribers: parsed.data.webhookSubscribers,
+        },
+        worker,
+        environment,
+        this._prisma,
+        webhookPrisma
+      )
+    );
+
+    if (webhooksError) {
+      logger.error("Error syncing declarative webhooks on deployment change", {
+        deploymentId: deployment.id,
+        error: webhooksError,
+      });
+    }
   }
 }

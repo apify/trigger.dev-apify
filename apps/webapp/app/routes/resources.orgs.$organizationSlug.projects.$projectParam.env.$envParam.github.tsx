@@ -6,9 +6,10 @@ import {
   type AutosaveState,
 } from "~/components/deployments/gitSettingsAutosave";
 import { GitHubBranchTracking } from "~/components/deployments/GitHubBranchTracking";
+import { IgnoredPatternsEditor } from "~/components/deployments/IgnoredPatternsEditor";
 import { GitHubOnboardingConnection } from "~/components/deployments/GitHubOnboardingConnection";
 import { getFormProps, getInputProps, useForm } from "@conform-to/react";
-import { parseWithZod } from "@conform-to/zod/v4";
+import { parseWithZod } from "~/utils/conform";
 import {
   ArrowUpCircleIcon,
   ArrowUpRightIcon,
@@ -28,7 +29,7 @@ import {
 } from "@remix-run/react";
 import { type LoaderFunctionArgs, json } from "@remix-run/server-runtime";
 import { GitBranchIcon } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { typedjson, useTypedFetcher } from "remix-typedjson";
 import { z } from "zod";
 import { OctoKitty } from "~/components/GitHubLoginButton";
@@ -50,6 +51,8 @@ import {
   SettingsActions,
   SettingsBlock,
   SettingsRowDescription,
+  SettingsRowTitle,
+  SETTINGS_ROW_TITLE_GAP,
 } from "~/components/primitives/SettingsLayout";
 import {
   EnvironmentIcon,
@@ -65,11 +68,13 @@ import {
   redirectWithErrorMessage,
   redirectWithSuccessMessage,
 } from "~/models/message.server";
-import { resolveOrgIdFromSlug } from "~/models/organization.server";
+import { resolveProjectAuthScope } from "~/services/projectAuthScope.server";
 import { findProjectBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { env } from "~/env.server";
 import { GitHubSettingsPresenter } from "~/presenters/v3/GitHubSettingsPresenter.server";
+import { canConnectIntegration, resolveIntegrationAccess } from "~/v3/deploymentAccess.server";
+import { ignorePatternLimits } from "~/v3/github/ignorePatternLimits.server";
 import { logger } from "~/services/logger.server";
 import { triggerInitialDeployment } from "~/services/platform.v3.server";
 import { marketplaceInitialDeploymentOptions } from "~/v3/services/marketplaceInitialDeploymentOptions.server";
@@ -84,7 +89,12 @@ import {
   githubAppInstallPath,
   v3ProjectSettingsIntegrationsPath,
 } from "~/utils/pathBuilder";
-import { type BranchTrackingConfig } from "~/v3/github";
+import {
+  type BranchTrackingConfig,
+  type BuildFilters,
+  type IgnorePatternLimits,
+  ignorePatternsSchema,
+} from "~/v3/github";
 import { sanitizeGitHubSettingsRedirect } from "~/v3/github/githubSettingsRedirect.server";
 
 // ============================================================================
@@ -110,6 +120,10 @@ export type GitHubAppInstallation = {
 export type ConnectedGitHubRepo = {
   branchTracking: BranchTrackingConfig | undefined;
   previewDeploymentsEnabled: boolean;
+  supersedeProductionBuilds: boolean;
+  supersedeStagingBuilds: boolean;
+  supersedePreviewBuilds: boolean;
+  buildFilters: BuildFilters | undefined;
   createdAt: Date;
   repository: GitHubRepository;
 };
@@ -141,11 +155,28 @@ export const UpdateGitSettingsFormSchema = z.object({
   redirectUrl: z.string().optional(),
 });
 
-const GitHubActionSchema = z.discriminatedUnion("action", [
-  ConnectGitHubRepoFormSchema,
-  DisconnectGitHubRepoFormSchema,
-  UpdateGitSettingsFormSchema,
-]);
+const optionalOnOff = z
+  .enum(["on", "off"])
+  .optional()
+  .transform((val) => (val === undefined ? undefined : val === "on"));
+
+function gitSettingsWithBuildFiltersSchema(limits: IgnorePatternLimits) {
+  return UpdateGitSettingsFormSchema.extend({
+    ignoreBranches: ignorePatternsSchema("branches", limits),
+    ignorePaths: ignorePatternsSchema("paths", limits),
+    supersedeProductionBuilds: optionalOnOff,
+    supersedeStagingBuilds: optionalOnOff,
+    supersedePreviewBuilds: optionalOnOff,
+  });
+}
+
+function gitHubActionSchema(limits: IgnorePatternLimits) {
+  return z.discriminatedUnion("action", [
+    ConnectGitHubRepoFormSchema,
+    DisconnectGitHubRepoFormSchema,
+    gitSettingsWithBuildFiltersSchema(limits),
+  ]);
+}
 
 // ============================================================================
 // Loader
@@ -176,6 +207,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const resultOrFail = await presenter.call({
     projectId: project.id,
     organizationId: project.organizationId,
+    githubAvailable: (await resolveIntegrationAccess(project.organizationId, project.id)).github,
   });
 
   if (resultOrFail.isErr()) {
@@ -221,10 +253,7 @@ function redirectWithMessage(
 export const action = dashboardAction(
   {
     params: EnvironmentParamSchema,
-    context: async (params) => {
-      const organizationId = await resolveOrgIdFromSlug(params.organizationSlug);
-      return organizationId ? { organizationId } : {};
-    },
+    context: (params) => resolveProjectAuthScope(params.organizationSlug, params.projectParam),
     authorization: { action: "write", resource: { type: "github" } },
   },
   async ({ request, params, user }) => {
@@ -242,7 +271,9 @@ export const action = dashboardAction(
     }
 
     const formData = await request.formData();
-    const submission = parseWithZod(formData, { schema: GitHubActionSchema });
+    const submission = parseWithZod(formData, {
+      schema: gitHubActionSchema(ignorePatternLimits()),
+    });
 
     const autosave =
       new URL(request.url).searchParams.get("autosave") === "1" &&
@@ -282,6 +313,15 @@ export const action = dashboardAction(
     // Handle connect-repo action
     if (actionType === "connect-repo") {
       const { repositoryId, installationId } = submission.value;
+
+      if (!(await canConnectIntegration(organizationId, "github"))) {
+        return redirectWithMessage(
+          request,
+          redirectUrl,
+          "Failed to connect GitHub repository",
+          "error"
+        );
+      }
 
       const resultOrFail = await projectSettingsService.connectGitHubRepo(
         projectId,
@@ -370,13 +410,33 @@ export const action = dashboardAction(
 
     // Handle update-git-settings action
     if (actionType === "update-git-settings") {
-      const { productionBranch, stagingBranch, previewDeploymentsEnabled } = submission.value;
+      const {
+        productionBranch,
+        stagingBranch,
+        previewDeploymentsEnabled,
+        ignoreBranches,
+        ignorePaths,
+        supersedeProductionBuilds,
+        supersedeStagingBuilds,
+        supersedePreviewBuilds,
+      } = submission.value;
+      // Empty and omitted both parse to []; only forms that send a field may clear it.
+      const buildFilters = {
+        ...(formData.has("ignoreBranches") && { ignoreBranches }),
+        ...(formData.has("ignorePaths") && { ignorePaths }),
+      };
 
       const resultOrFail = await projectSettingsService.updateGitSettings(
         projectId,
         productionBranch,
         stagingBranch,
-        previewDeploymentsEnabled
+        previewDeploymentsEnabled,
+        {
+          buildFilters: Object.keys(buildFilters).length > 0 ? buildFilters : undefined,
+          supersedeProductionBuilds,
+          supersedeStagingBuilds,
+          supersedePreviewBuilds,
+        }
       );
 
       if (resultOrFail.isOk()) {
@@ -831,6 +891,8 @@ export function ConnectedGitHubRepoForm({
   billingPath,
   redirectUrl,
   canManageGithub = true,
+  vercelIntegrationConnected = false,
+  ignorePatternLimits,
 }: {
   connectedGitHubRepo: ConnectedGitHubRepo;
   previewEnvironmentEnabled?: boolean;
@@ -841,16 +903,40 @@ export function ConnectedGitHubRepoForm({
   billingPath: string;
   redirectUrl?: string;
   canManageGithub?: boolean;
+  vercelIntegrationConnected?: boolean;
+  ignorePatternLimits: IgnorePatternLimits;
 }) {
   const lastSubmission = useActionData() as any;
   const navigation = useNavigation();
 
+  const savedIgnoreBranches = connectedGitHubRepo.buildFilters?.ignoreBranches.join("\n") ?? "";
+  const savedIgnorePaths = connectedGitHubRepo.buildFilters?.ignorePaths.join("\n") ?? "";
   const [hasGitSettingsChanges, setHasGitSettingsChanges] = useState(false);
   const [gitSettingsValues, setGitSettingsValues] = useState({
     productionBranch: connectedGitHubRepo.branchTracking?.prod?.branch || "",
     stagingBranch: connectedGitHubRepo.branchTracking?.staging?.branch || "",
     previewDeploymentsEnabled: connectedGitHubRepo.previewDeploymentsEnabled,
+    supersedeProductionBuilds: connectedGitHubRepo.supersedeProductionBuilds,
+    supersedeStagingBuilds: connectedGitHubRepo.supersedeStagingBuilds,
+    supersedePreviewBuilds: connectedGitHubRepo.supersedePreviewBuilds,
+    ignoreBranches: savedIgnoreBranches,
+    ignorePaths: savedIgnorePaths,
   });
+  const [ignoreBranchesValid, setIgnoreBranchesValid] = useState(
+    () =>
+      ignorePatternsSchema("branches", ignorePatternLimits).safeParse(savedIgnoreBranches).success
+  );
+  const [ignorePathsValid, setIgnorePathsValid] = useState(
+    () => ignorePatternsSchema("paths", ignorePatternLimits).safeParse(savedIgnorePaths).success
+  );
+  const onIgnoreBranchesChange = useCallback((patterns: string[], valid: boolean) => {
+    setGitSettingsValues((prev) => ({ ...prev, ignoreBranches: patterns.join("\n") }));
+    setIgnoreBranchesValid(valid);
+  }, []);
+  const onIgnorePathsChange = useCallback((patterns: string[], valid: boolean) => {
+    setGitSettingsValues((prev) => ({ ...prev, ignorePaths: patterns.join("\n") }));
+    setIgnorePathsValid(valid);
+  }, []);
 
   useEffect(() => {
     const hasChanges =
@@ -858,10 +944,17 @@ export function ConnectedGitHubRepoForm({
         (connectedGitHubRepo.branchTracking?.prod?.branch || "") ||
       gitSettingsValues.stagingBranch !==
         (connectedGitHubRepo.branchTracking?.staging?.branch || "") ||
-      gitSettingsValues.previewDeploymentsEnabled !== connectedGitHubRepo.previewDeploymentsEnabled;
+      gitSettingsValues.previewDeploymentsEnabled !==
+        connectedGitHubRepo.previewDeploymentsEnabled ||
+      gitSettingsValues.supersedeProductionBuilds !==
+        connectedGitHubRepo.supersedeProductionBuilds ||
+      gitSettingsValues.supersedeStagingBuilds !== connectedGitHubRepo.supersedeStagingBuilds ||
+      gitSettingsValues.supersedePreviewBuilds !== connectedGitHubRepo.supersedePreviewBuilds ||
+      gitSettingsValues.ignoreBranches !== savedIgnoreBranches ||
+      gitSettingsValues.ignorePaths !== savedIgnorePaths;
     // oxlint-disable-next-line react/set-state-in-effect -- This effect intentionally synchronizes route state after an external or lifecycle change.
     setHasGitSettingsChanges(hasChanges);
-  }, [gitSettingsValues, connectedGitHubRepo]);
+  }, [gitSettingsValues, connectedGitHubRepo, savedIgnoreBranches, savedIgnorePaths]);
 
   const [gitSettingsForm, fields] = useForm({
     id: "update-git-settings",
@@ -869,7 +962,7 @@ export function ConnectedGitHubRepoForm({
     shouldRevalidate: "onSubmit",
     onValidate({ formData }) {
       return parseWithZod(formData, {
-        schema: UpdateGitSettingsFormSchema,
+        schema: gitSettingsWithBuildFiltersSchema(ignorePatternLimits),
       });
     },
   });
@@ -972,30 +1065,54 @@ export function ConnectedGitHubRepoForm({
       <Form method="post" action={actionUrl} {...getFormProps(gitSettingsForm)}>
         {redirectUrl && <input type="hidden" name="redirectUrl" value={redirectUrl} />}
 
-        <SettingsBlock size="sm">
+        <SettingsBlock size="sm" bordered={false}>
           <Hint>
-            Every push to the selected tracking branch creates a deployment in the corresponding
-            environment.
+            Pushes to a tracking branch deploy to its environment. With Skip superseded on, older
+            queued builds are dropped when a newer commit arrives.
           </Hint>
         </SettingsBlock>
 
+        <div className="flex gap-6 border-b border-grid-dimmed pb-2">
+          <Paragraph variant="extra-extra-small/caps" className="flex-1">
+            Environment
+          </Paragraph>
+          <Paragraph variant="extra-extra-small/caps" className="w-64 shrink-0">
+            Tracking branch
+          </Paragraph>
+          <Paragraph variant="extra-extra-small/caps" className="w-28 shrink-0 text-right">
+            Skip superseded
+          </Paragraph>
+        </div>
+
         <SettingsRow
           action={
-            <Input
-              {...getInputProps(fields.productionBranch, { type: "text" })}
-              defaultValue={connectedGitHubRepo.branchTracking?.prod?.branch}
-              placeholder="none"
-              variant="medium"
-              className="font-mono"
-              containerClassName="w-64"
-              icon={GitBranchIcon}
-              onChange={(e) => {
-                setGitSettingsValues((prev) => ({
-                  ...prev,
-                  productionBranch: e.target.value,
-                }));
-              }}
-            />
+            <div className="flex items-center gap-6">
+              <div className="w-64 shrink-0">
+                <Input
+                  {...getInputProps(fields.productionBranch, { type: "text" })}
+                  defaultValue={connectedGitHubRepo.branchTracking?.prod?.branch}
+                  placeholder="none"
+                  variant="medium"
+                  className="font-mono"
+                  icon={GitBranchIcon}
+                  onChange={(e) => {
+                    setGitSettingsValues((prev) => ({
+                      ...prev,
+                      productionBranch: e.target.value,
+                    }));
+                  }}
+                />
+              </div>
+              <SupersedeSwitch
+                name="supersedeProductionBuilds"
+                label="Skip superseded production builds"
+                checked={gitSettingsValues.supersedeProductionBuilds}
+                disabled={!canManageGithub}
+                onCheckedChange={(checked) => {
+                  setGitSettingsValues((prev) => ({ ...prev, supersedeProductionBuilds: checked }));
+                }}
+              />
+            </div>
           }
         >
           <EnvironmentRowLabel type="PRODUCTION" />
@@ -1003,32 +1120,44 @@ export function ConnectedGitHubRepoForm({
 
         <SettingsRow
           action={
-            stagingEnvironmentEnabled ? (
-              <Input
-                {...getInputProps(fields.stagingBranch, { type: "text" })}
-                defaultValue={connectedGitHubRepo.branchTracking?.staging?.branch}
-                placeholder="none"
-                variant="medium"
-                className="font-mono"
-                containerClassName="w-64"
-                icon={GitBranchIcon}
-                onChange={(e) => {
-                  setGitSettingsValues((prev) => ({
-                    ...prev,
-                    stagingBranch: e.target.value,
-                  }));
+            <div className="flex items-center gap-6">
+              <div className="w-64 shrink-0">
+                {stagingEnvironmentEnabled ? (
+                  <Input
+                    {...getInputProps(fields.stagingBranch, { type: "text" })}
+                    defaultValue={connectedGitHubRepo.branchTracking?.staging?.branch}
+                    placeholder="none"
+                    variant="medium"
+                    className="font-mono"
+                    icon={GitBranchIcon}
+                    onChange={(e) => {
+                      setGitSettingsValues((prev) => ({
+                        ...prev,
+                        stagingBranch: e.target.value,
+                      }));
+                    }}
+                  />
+                ) : (
+                  <LinkButton
+                    to={billingPath}
+                    variant="secondary/small"
+                    LeadingIcon={ArrowUpCircleIcon}
+                    leadingIconClassName="text-indigo-500"
+                  >
+                    Upgrade
+                  </LinkButton>
+                )}
+              </div>
+              <SupersedeSwitch
+                name="supersedeStagingBuilds"
+                label="Skip superseded staging builds"
+                checked={gitSettingsValues.supersedeStagingBuilds}
+                disabled={!canManageGithub || !stagingEnvironmentEnabled}
+                onCheckedChange={(checked) => {
+                  setGitSettingsValues((prev) => ({ ...prev, supersedeStagingBuilds: checked }));
                 }}
               />
-            ) : (
-              <LinkButton
-                to={billingPath}
-                variant="secondary/small"
-                LeadingIcon={ArrowUpCircleIcon}
-                leadingIconClassName="text-indigo-500"
-              >
-                Upgrade
-              </LinkButton>
-            )
+            </div>
           }
         >
           <EnvironmentRowLabel
@@ -1043,33 +1172,52 @@ export function ConnectedGitHubRepoForm({
 
         <SettingsRow
           action={
-            previewEnvironmentEnabled ? (
-              <Switch
-                name="previewDeploymentsEnabled"
-                defaultChecked={connectedGitHubRepo.previewDeploymentsEnabled}
-                variant="medium"
+            <div className="flex items-center gap-6">
+              <div className="w-64 shrink-0">
+                {previewEnvironmentEnabled ? (
+                  <Switch
+                    name="previewDeploymentsEnabled"
+                    defaultChecked={connectedGitHubRepo.previewDeploymentsEnabled}
+                    variant="medium"
+                    label="Deploy pull requests"
+                    labelPosition="right"
+                    onCheckedChange={(checked) => {
+                      setGitSettingsValues((prev) => ({
+                        ...prev,
+                        previewDeploymentsEnabled: checked,
+                      }));
+                    }}
+                  />
+                ) : (
+                  <>
+                    {connectedGitHubRepo.previewDeploymentsEnabled && (
+                      <input type="hidden" name="previewDeploymentsEnabled" value="on" />
+                    )}
+                    <LinkButton
+                      to={billingPath}
+                      variant="secondary/small"
+                      LeadingIcon={ArrowUpCircleIcon}
+                      leadingIconClassName="text-indigo-500"
+                    >
+                      Upgrade
+                    </LinkButton>
+                  </>
+                )}
+              </div>
+              <SupersedeSwitch
+                name="supersedePreviewBuilds"
+                label="Skip superseded preview builds"
+                checked={gitSettingsValues.supersedePreviewBuilds}
+                disabled={
+                  !canManageGithub ||
+                  !previewEnvironmentEnabled ||
+                  !gitSettingsValues.previewDeploymentsEnabled
+                }
                 onCheckedChange={(checked) => {
-                  setGitSettingsValues((prev) => ({
-                    ...prev,
-                    previewDeploymentsEnabled: checked,
-                  }));
+                  setGitSettingsValues((prev) => ({ ...prev, supersedePreviewBuilds: checked }));
                 }}
               />
-            ) : (
-              <>
-                {connectedGitHubRepo.previewDeploymentsEnabled && (
-                  <input type="hidden" name="previewDeploymentsEnabled" value="on" />
-                )}
-                <LinkButton
-                  to={billingPath}
-                  variant="secondary/small"
-                  LeadingIcon={ArrowUpCircleIcon}
-                  leadingIconClassName="text-indigo-500"
-                >
-                  Upgrade
-                </LinkButton>
-              </>
-            )
+            </div>
           }
         >
           <EnvironmentRowLabel
@@ -1080,9 +1228,56 @@ export function ConnectedGitHubRepoForm({
           />
         </SettingsRow>
 
+        <SettingsBlock className="flex flex-col gap-3">
+          <div className={SETTINGS_ROW_TITLE_GAP}>
+            <SettingsRowTitle>Ignored branches</SettingsRowTitle>
+            <SettingsRowDescription>
+              One glob per line. Pull requests from matching branches don't get preview deployments.
+            </SettingsRowDescription>
+            {vercelIntegrationConnected && (
+              <SettingsRowDescription className="text-warning">
+                Ignore the same branches in Vercel. A Vercel preview of a branch ignored here has no
+                task deployment to run against.
+              </SettingsRowDescription>
+            )}
+          </div>
+          <IgnoredPatternsEditor
+            kind="branches"
+            name={fields.ignoreBranches.name}
+            defaultPatterns={connectedGitHubRepo.buildFilters?.ignoreBranches ?? []}
+            limits={ignorePatternLimits}
+            onChange={onIgnoreBranchesChange}
+          />
+        </SettingsBlock>
+
+        <SettingsBlock className="flex flex-col gap-3">
+          <div className={SETTINGS_ROW_TITLE_GAP}>
+            <SettingsRowTitle>Ignored paths</SettingsRowTitle>
+            <SettingsRowDescription>
+              One glob per line, relative to the repo root. A push that only changes matching files
+              doesn't deploy.
+            </SettingsRowDescription>
+            {vercelIntegrationConnected && (
+              <SettingsRowDescription className="text-warning">
+                Ignored paths don't apply while the Vercel integration is connected, because Vercel
+                deployments wait on each build.
+              </SettingsRowDescription>
+            )}
+          </div>
+          <IgnoredPatternsEditor
+            kind="paths"
+            name={fields.ignorePaths.name}
+            defaultPatterns={connectedGitHubRepo.buildFilters?.ignorePaths ?? []}
+            limits={ignorePatternLimits}
+            onChange={onIgnorePathsChange}
+          />
+        </SettingsBlock>
+
         <FormError>{fields.productionBranch?.errors}</FormError>
         <FormError>{fields.stagingBranch?.errors}</FormError>
         <FormError>{fields.previewDeploymentsEnabled?.errors}</FormError>
+        <FormError>{fields.ignoreBranches?.errors}</FormError>
+        <FormError>{fields.ignorePaths?.errors}</FormError>
         <FormError>{gitSettingsForm.errors}</FormError>
 
         <SettingsActions>
@@ -1091,7 +1286,13 @@ export function ConnectedGitHubRepoForm({
             name="action"
             value="update-git-settings"
             variant="secondary/small"
-            disabled={isGitSettingsLoading || !hasGitSettingsChanges || !canManageGithub}
+            disabled={
+              isGitSettingsLoading ||
+              !hasGitSettingsChanges ||
+              !ignoreBranchesValid ||
+              !ignorePathsValid ||
+              !canManageGithub
+            }
             tooltip={
               canManageGithub
                 ? undefined
@@ -1123,6 +1324,33 @@ function EnvironmentRowLabel({
         </span>
       </div>
       {description ? <SettingsRowDescription>{description}</SettingsRowDescription> : null}
+    </div>
+  );
+}
+
+function SupersedeSwitch({
+  name,
+  label,
+  checked,
+  disabled,
+  onCheckedChange,
+}: {
+  name: string;
+  label: string;
+  checked: boolean;
+  disabled?: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex w-28 shrink-0 justify-end">
+      {!disabled && <input type="hidden" name={name} value={checked ? "on" : "off"} />}
+      <Switch
+        aria-label={label}
+        checked={checked}
+        disabled={disabled}
+        variant="medium"
+        onCheckedChange={onCheckedChange}
+      />
     </div>
   );
 }
@@ -1648,6 +1876,8 @@ export function GitHubSettingsPanel({
       <>
         {layout === "settings" && <GitHubAppInstalledRow />}
         <ConnectedGitHubRepoForm
+          // A new project or newly saved patterns start the form from the loaded values.
+          key={JSON.stringify([projectSlug, data.connectedRepository.buildFilters])}
           connectedGitHubRepo={data.connectedRepository}
           previewEnvironmentEnabled={data.isPreviewEnvironmentEnabled}
           stagingEnvironmentEnabled={data.isStagingEnvironmentEnabled}
@@ -1657,6 +1887,8 @@ export function GitHubSettingsPanel({
           billingPath={billingPath}
           redirectUrl={effectiveRedirectUrl}
           canManageGithub={data.canManageGithub}
+          vercelIntegrationConnected={data.isVercelIntegrationConnected}
+          ignorePatternLimits={data.ignorePatternLimits}
         />
       </>
     );

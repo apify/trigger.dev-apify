@@ -6,6 +6,7 @@ import {
 import type { Tracer } from "@opentelemetry/api";
 import { tryCatch } from "@trigger.dev/core/utils";
 import {
+  type RunExecutionPolicy,
   type TriggerTaskRequestBody,
   formatDurationMilliseconds,
   RunAnnotations,
@@ -40,11 +41,19 @@ import {
   type IdempotencyKeyConcern,
   type ClaimedIdempotency,
 } from "../concerns/idempotencyKeys.server";
-import { resolveScheduledQueueSplitEnabled } from "../concerns/workerQueueSplit.server";
-import { workerQueueForBirth } from "../concerns/workerQueueAssignment.server";
-import { resolveComputeMigration } from "../concerns/computeMigration.server";
-import { workerRegionRegistry, backingForQueue, regionForQueue } from "~/v3/workerRegions.server";
+import {
+  environmentWorkerQueueOverride,
+  workerQueueForBirth,
+} from "../concerns/workerQueueAssignment.server";
+import { allowsAnyCompat, resolveComputeMigration } from "../concerns/computeMigration.server";
+import {
+  workerRegionRegistry,
+  backingForQueue,
+  regionForQueue,
+  selfBackingWorkerGroups,
+} from "~/v3/workerRegions.server";
 import { globalFlagsRegistry } from "~/v3/globalFlagsRegistry.server";
+import { sandboxTasksEnabled } from "~/v3/sandboxTasksFlag.server";
 import {
   publishClaim as publishMollifierClaim,
   releaseClaim as releaseMollifierClaim,
@@ -443,11 +452,18 @@ export class RunEngineTriggerTaskService {
           const parkedOnExternalDeploymentId =
             externalDeploymentResolution?.outcome === "park" ? externalDeploymentId : undefined;
 
-          const { queueName, lockedQueueId, taskTtl, taskKind, gates } =
-            await this.queueConcern.resolveQueueProperties(
-              triggerRequest,
-              lockedToBackgroundWorker ?? undefined
-            );
+          const {
+            queueName,
+            lockedQueueId,
+            taskTtl,
+            taskKind,
+            gates,
+            templateKey,
+            executionPolicy,
+          } = await this.queueConcern.resolveQueueProperties(
+            triggerRequest,
+            lockedToBackgroundWorker ?? undefined
+          );
 
           // Resolve TTL with precedence: per-trigger > task-level > dev default
           let ttl: string | undefined;
@@ -510,8 +526,24 @@ export class RunEngineTriggerTaskService {
             ? regionForQueue(baseWorkerQueue, workerGroups)
             : undefined;
           const backing = baseWorkerQueue
-            ? backingForQueue(baseWorkerQueue, workerGroups)
+            ? backingForQueue(
+                baseWorkerQueue,
+                workerGroups,
+                selfBackingWorkerGroups(
+                  env.RUN_ENGINE_MIXED_RUNTIME_WORKER_GROUPS,
+                  env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1"
+                )
+              )
             : undefined;
+          const orgFeatureFlags = environment.organization.featureFlags as Record<
+            string,
+            unknown
+          > | null;
+          const environmentOverride = environmentWorkerQueueOverride({
+            orgFeatureFlags,
+            environmentId: environment.id,
+            environmentType: environment.type,
+          });
           const migrated = resolveComputeMigration({
             baseWorkerQueue,
             baseEnableFastPath: enableFastPath,
@@ -519,13 +551,36 @@ export class RunEngineTriggerTaskService {
             backing,
             planType,
             orgId: environment.organization.id,
-            orgFeatureFlags: environment.organization.featureFlags as Record<
-              string,
-              unknown
-            > | null,
+            orgFeatureFlags,
             flags: globalFlagsRegistry.current(),
             envType: environment.type,
+            // Sandboxes only run on microVMs, whatever the org's migration state.
+            environmentCompat: executionPolicy ? "compute" : environmentOverride.compat,
+            templateKey,
           });
+
+          if (executionPolicy && !sandboxTasksEnabled(orgFeatureFlags)) {
+            throw new ServiceValidationError(
+              `Task "${taskId}" is a sandbox, but sandbox tasks are not enabled for this organization.`
+            );
+          }
+
+          const onMicrovmGroup =
+            baseWorkerQueue !== undefined &&
+            workerGroups.find((group) => group.masterQueue === baseWorkerQueue)?.workloadType ===
+              "MICROVM";
+          if (
+            executionPolicy &&
+            environment.type !== "DEVELOPMENT" &&
+            !migrated.compute &&
+            !(onMicrovmGroup && templateKey)
+          ) {
+            throw new ServiceValidationError(
+              `Task "${taskId}" is a sandbox and needs microVM compute, which is not available ${
+                templateKey ? "in this region" : "for this deployment (no compute template)"
+              }.`
+            );
+          }
 
           const triggerSource = options.triggerSource ?? "api";
           const triggerAction = options.triggerAction ?? "trigger";
@@ -539,33 +594,34 @@ export class RunEngineTriggerTaskService {
             externalDeploymentId,
             webhookDeliveryId: options.webhookDeliveryId,
             webhookEndpointId: options.webhookEndpointId,
+            ...(executionPolicy
+              ? { executionMode: "SANDBOX" as const, executionPolicy, sessionId: options.sessionId }
+              : {}),
           };
 
-          // Preserve scheduled lineage independently of the queue-name version.
-          // Rollout decisions use already-loaded org flags and registry data.
-          const scheduledQueueSplitEnabled =
-            environment.type !== "DEVELOPMENT" &&
-            resolveScheduledQueueSplitEnabled({
-              orgFeatureFlags: environment.organization.featureFlags as Record<
-                string,
-                unknown
-              > | null,
-              globalDefault: env.TRIGGER_WORKER_QUEUE_SCHEDULED_SPLIT_ENABLED === "1",
-            });
           const workerQueue =
             migrated.workerQueue !== undefined
               ? workerQueueForBirth({
                   workerQueue: migrated.workerQueue,
                   region: migrated.region,
                   envType: environment.type,
-                  orgFeatureFlags: environment.organization.featureFlags as Record<
-                    string,
-                    unknown
-                  > | null,
-                  globalDefault: env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1",
+                  orgFeatureFlags,
+                  v2Enabled: env.TRIGGER_WORKER_QUEUE_V2_ENABLED === "1",
+                  splitEnabled: env.TRIGGER_WORKER_QUEUE_SCHEDULED_SPLIT_ENABLED === "1",
+                  environmentOverride: executionPolicy
+                    ? { ...environmentOverride, compat: "compute" }
+                    : environmentOverride,
                   workerGroups,
                   rootTriggerSource: annotations.rootTriggerSource,
-                  splitEnabled: scheduledQueueSplitEnabled,
+                  templateFallback: migrated.templateFallback,
+                  compute: migrated.compute,
+                  anyCompatAllowed: allowsAnyCompat({
+                    planType,
+                    orgId: environment.organization.id,
+                    orgFeatureFlags,
+                    flags: globalFlagsRegistry.current(),
+                    templateKey,
+                  }),
                 })
               : migrated.workerQueue;
 
@@ -786,7 +842,7 @@ export class RunEngineTriggerTaskService {
                     // bypasses ensure neither reaches the mollify branch.
                     onDebounced:
                       body.options?.debounce && body.options?.resumeParentOnCompletion
-                        ? async ({ existingRun, waitpoint, debounceKey }) => {
+                        ? async ({ existingRun, waitpoint, debounceKey, blockRun }) => {
                             return await this.traceEventConcern.traceDebouncedRun(
                               triggerRequest,
                               parentRun?.taskEventStore,
@@ -803,6 +859,7 @@ export class RunEngineTriggerTaskService {
                                     : spanEvent.traceparent?.spanId
                                       ? `${spanEvent.traceparent.spanId}:${spanEvent.spanId}`
                                       : spanEvent.spanId;
+                                if (blockRun) await blockRun(spanId);
                                 return spanId;
                               }
                             );
@@ -938,6 +995,9 @@ export class RunEngineTriggerTaskService {
       rootTriggerSource: string;
       rootScheduleId?: string | undefined;
       externalDeploymentId?: string | undefined;
+      executionMode?: "SANDBOX";
+      executionPolicy?: RunExecutionPolicy;
+      sessionId?: string;
     };
     parkedOnExternalDeploymentId?: string;
     planType?: string;
@@ -972,10 +1032,7 @@ export class RunEngineTriggerTaskService {
       // `string` on the API path, but the BatchQueue worker rebuilds
       // body.options from Redis-stored items (Record<string, unknown>),
       // which can still carry the pre-fix shape from in-flight batches.
-      concurrencyKey:
-        typeof args.body.options?.concurrencyKey === "number"
-          ? String(args.body.options.concurrencyKey)
-          : args.body.options?.concurrencyKey,
+      concurrencyKey: runConcurrencyKey(args.body.options?.concurrencyKey),
       queue: args.queueName,
       lockedQueueId: args.lockedQueueId,
       gates: args.gates,
@@ -1071,4 +1128,17 @@ export class RunEngineTriggerTaskService {
       },
     };
   }
+}
+
+/**
+ * The run's own key: the `default` of an object concurrencyKey, else the value as a
+ * string (batch items rebuilt from stored options can still carry a number).
+ */
+function runConcurrencyKey(
+  concurrencyKey: string | number | Record<string, string> | undefined
+): string | undefined {
+  if (typeof concurrencyKey === "object" && concurrencyKey !== null) {
+    return concurrencyKey.default;
+  }
+  return typeof concurrencyKey === "number" ? String(concurrencyKey) : concurrencyKey;
 }

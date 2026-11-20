@@ -11,11 +11,23 @@ import { describe, expect } from "vitest";
 import {
   edgeField,
   idempotencyKey,
+  parseEdgeField,
   runBlockKeys,
+  runContributionKey,
+  runContributionIndexKey,
+  runWithdrawalIndexKey,
+  organizationRunIndexKey,
+  fanoutPartition,
+  contributionMember,
+  runResultKey,
+  runWithdrawalKey,
+  runWithdrawalTargetsKey,
+  waitpointKeys,
   watcherField,
   WaitpointKeyTagError,
 } from "./keys.js";
-import { registerWaitpointCommands } from "./scripts.js";
+import { registerWaitpointCommands, RUN_CLEANUP_PAGE_SIZE } from "./scripts.js";
+import { StoreWaitpointCoordinator } from "./storeWaitpointCoordinator.js";
 import {
   encodeCompletionForDelivery,
   EncodedWaitpointCompletion,
@@ -347,7 +359,7 @@ describe("registerOrReport", () => {
     }
   });
 
-  redisTest("keeps the first registration's watcher on a re-register", async ({ redisOptions }) => {
+  redisTest("fills a watcher's first span and preserves it on retry", async ({ redisOptions }) => {
     const store = coordinator(redisOptions);
     try {
       await store.createIfAbsent({ record: record("w_a"), status: "PENDING" });
@@ -355,23 +367,36 @@ describe("registerOrReport", () => {
         blockId: BLOCK_ID,
         waitpointId: "w_a",
         runId: "run_1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      await store.registerOrReport({
+        blockId: BLOCK_ID,
+        waitpointId: "w_a",
+        runId: "run_1",
         spanIdToComplete: "span_first",
         createdAt: NOW,
       });
-      // Same run, same (absent) batch index, so the watcher field collides. HSETNX must
-      // not let this second registration overwrite the first one's span.
+      // Same watcher identity: neither a later span nor a bare recovery replay may replace
+      // the first actual span or its creation time, or add another queue entry.
       await store.registerOrReport({
         blockId: BLOCK_ID,
         waitpointId: "w_a",
         runId: "run_1",
         spanIdToComplete: "span_second",
-        createdAt: NOW,
+        createdAt: "2026-02-01T00:00:00.000Z",
+      });
+      await store.registerOrReport({
+        blockId: BLOCK_ID,
+        waitpointId: "w_a",
+        runId: "run_1",
+        createdAt: "2026-03-01T00:00:00.000Z",
       });
 
       await store.complete({ waitpointId: "w_a", completion: completion() });
       const watchers = await queuedWatchers(store, "w_a");
       expect(watchers).toHaveLength(1);
       expect(watchers[0]!.spanIdToComplete).toBe("span_first");
+      expect(watchers[0]!.createdAt).toBe(NOW);
     } finally {
       await store.quit();
     }
@@ -584,6 +609,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -597,7 +633,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           fieldB,
           "{}",
           "1",
-          envelope
+          envelope,
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         // Slots 2 and 3 are the superseded block id and its edge-field count, both empty here
@@ -625,6 +665,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -638,7 +689,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           fieldA,
           "{}",
           "0",
-          ""
+          "",
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         // Slots 2 and 3 are the superseded block id and its edge-field count, both empty here
@@ -662,6 +717,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
         keys.done,
         keys.edge,
         keys.state,
+        runContributionKey("run_1", "block_test", ""),
+        runResultKey("run_1"),
+        keys.refs,
+        keys.edgeIndex,
+        keys.doneOrder,
+        keys.early,
+        keys.earlyOrder,
+        runWithdrawalKey("run_1", ""),
+        runWithdrawalTargetsKey("run_1", ""),
+        runContributionIndexKey("run_1"),
+        runWithdrawalIndexKey("run_1"),
         BLOCK_ID,
         "0",
         "",
@@ -675,7 +741,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
         edgeField("w_b", 0),
         "{}",
         "0",
-        ""
+        "",
+        "",
+        "",
+        contributionMember("block_test", ""),
+        "raw-test-revision"
       );
 
       expect(reply).toEqual(["absorbed", "2", "2", "", "0"]);
@@ -698,6 +768,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -711,7 +792,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           edgeField("w_b", 0),
           "{}",
           "1",
-          envelope
+          envelope,
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         expect(reply).toEqual(["absorbed", "1", "1", "", "0", "w_b", envelope]);
@@ -737,6 +822,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -745,7 +841,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           edgeField("w_a", 0),
           "{}",
           "1",
-          ""
+          "",
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         expect(reply).toEqual(["absorbed", "0", "0", "", "0", "w_a", ""]);
@@ -769,6 +869,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -782,7 +893,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           edgeField("w_a", 1),
           "{}",
           "0",
-          ""
+          "",
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         expect(reply).toEqual(["absorbed", "1", "1", "", "0"]);
@@ -809,6 +924,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -817,7 +943,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           edgeField("w_a", 0),
           "{}",
           "0",
-          ""
+          "",
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         );
 
         expect(reply).toEqual(["absorbed", "0", "0", "", "0", "w_a", envelope]);
@@ -843,6 +973,17 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           keys.done,
           keys.edge,
           keys.state,
+          runContributionKey("run_1", "block_test", ""),
+          runResultKey("run_1"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalKey("run_1", ""),
+          runWithdrawalTargetsKey("run_1", ""),
+          runContributionIndexKey("run_1"),
+          runWithdrawalIndexKey("run_1"),
           BLOCK_ID,
           "0",
           "",
@@ -851,7 +992,11 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
           field,
           "{}",
           "0",
-          ""
+          "",
+          "",
+          "",
+          contributionMember("block_test", ""),
+          "raw-test-revision"
         )
       ).rejects.toThrow();
 
@@ -876,7 +1021,21 @@ describe("reply framing (direct Lua — pins the wire shape the coordinator deco
 
         // n says 2 fields but only one field is supplied.
         await expect(
-          client.runClear(keys.pend, keys.done, keys.edge, keys.state, "2", field)
+          client.runClear(
+            keys.pend,
+            keys.done,
+            keys.edge,
+            keys.state,
+            keys.refs,
+            keys.edgeIndex,
+            keys.doneOrder,
+            keys.early,
+            keys.earlyOrder,
+            BLOCK_ID,
+            "2",
+            field,
+            "raw-test-revision"
+          )
         ).rejects.toThrow();
 
         expect(await client.hexists(keys.edge, field)).toBe(1);
@@ -1380,6 +1539,571 @@ describe("absorbBlockers", () => {
       await store.quit();
     }
   });
+
+  redisTest(
+    "the cleanup-owed fence refuses a DIFFERENT block until it is cleared, but never a same-block retry",
+    async ({ redisOptions }) => {
+      const store = new WaitpointStoreCoordinator({ redisOptions });
+      try {
+        await store.createIfAbsent({ record: record("w_a"), status: "PENDING" });
+        await store.createIfAbsent({ record: record("w_b"), status: "PENDING" });
+
+        // B1 is installed.
+        const b1 = await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B1",
+          edges: [edge("w_a")],
+          absorptionId: "B1",
+        });
+        expect(b1.outcome).toBe("absorbed");
+
+        // B1's cross-store cleanup is owed (armed before its retry transition).
+        await store.armCleanupFence({ runId: RUN_ID, blockId: "B1" });
+
+        // A rollover to a DIFFERENT block B2 is REFUSED while B1's cleanup is owed — and it mutated nothing.
+        const b2 = await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B2",
+          edges: [edge("w_b")],
+          expectedPreviousBlockId: "B1",
+          absorptionId: "B2",
+        });
+        expect(b2.outcome).toBe("cleanupOwed");
+        expect(b2.currentBlockId).toBe("B1");
+        expect((await store.readBlockState(RUN_ID)).blockId).toBe("B1");
+
+        // A same-block (B1) retry is NOT blocked by the fence — idempotent.
+        const b1Retry = await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B1",
+          edges: [edge("w_a")],
+          absorptionId: "B1",
+        });
+        expect(b1Retry.outcome).toBe("absorbed");
+
+        // A stale clear for a DIFFERENT block does not lift B1's fence.
+        await store.clearCleanupFence({ runId: RUN_ID, blockId: "B_other" });
+        expect(
+          (
+            await store.absorbBlockers({
+              runId: RUN_ID,
+              blockId: "B2",
+              edges: [edge("w_b")],
+              expectedPreviousBlockId: "B1",
+              absorptionId: "B2",
+            })
+          ).outcome
+        ).toBe("cleanupOwed");
+
+        // Clearing the fence for B1 lets B2 finally install.
+        await store.clearCleanupFence({ runId: RUN_ID, blockId: "B1" });
+        const b2Ok = await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B2",
+          edges: [edge("w_b")],
+          expectedPreviousBlockId: "B1",
+          absorptionId: "B2",
+        });
+        expect(b2Ok.outcome).toBe("absorbed");
+        expect((await store.readBlockState(RUN_ID)).blockId).toBe("B2");
+      } finally {
+        await store.quit();
+      }
+    }
+  );
+
+  redisTest(
+    "finalizeRetainedWithdrawal atomically retires the record and the matching fence, is idempotent, and never lifts a different block's fence",
+    async ({ redisOptions }) => {
+      const store = new WaitpointStoreCoordinator({ redisOptions });
+      const probe = createRedisClient(redisOptions);
+      const stKey = `wp:v1:run:{${RUN_ID}}:st`;
+      try {
+        await store.createIfAbsent({ record: record("w_a"), status: "PENDING" });
+
+        // Establish withdrawal:B1 (via an abandon that retained it) AND co=B1.
+        await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B1",
+          edges: [edge("w_a")],
+          absorptionId: "B1",
+        });
+        await store.armCleanupFence({ runId: RUN_ID, blockId: "B1" });
+        await store.abandonRetainAndClear({ runId: RUN_ID, blockId: "B1" });
+        expect(await store.readWithdrawalPage({ runId: RUN_ID, blockId: "B1" })).toBeDefined();
+        expect(await probe.hget(stKey, "co")).toBe("B1");
+
+        // One atomic op retires BOTH.
+        await expect(
+          store.finalizeRetainedWithdrawal({ runId: RUN_ID, blockId: "B1" })
+        ).rejects.toThrow("unacknowledged");
+        await store.acknowledgeWithdrawalPage({ runId: RUN_ID, blockId: "B1", fields: ["w_a#"] });
+        const r1 = await store.finalizeRetainedWithdrawal({ runId: RUN_ID, blockId: "B1" });
+        expect(r1.fenceCleared).toBe(true);
+        expect(await store.readWithdrawalPage({ runId: RUN_ID, blockId: "B1" })).toBeUndefined();
+        expect(await probe.hget(stKey, "co")).toBeNull();
+
+        // Idempotent no-op when both are already absent.
+        const r2 = await store.finalizeRetainedWithdrawal({ runId: RUN_ID, blockId: "B1" });
+        expect(r2.fenceCleared).toBe(false);
+        expect(await store.readWithdrawalPage({ runId: RUN_ID, blockId: "B1" })).toBeUndefined();
+
+        // Fenced: with co=B2 owned by a newer block, finalizing B1 deletes ONLY B1's record and leaves co=B2.
+        await store.absorbBlockers({
+          runId: RUN_ID,
+          blockId: "B1",
+          edges: [edge("w_a")],
+          absorptionId: "B1",
+        });
+        await store.abandonRetainAndClear({ runId: RUN_ID, blockId: "B1" });
+        await store.armCleanupFence({ runId: RUN_ID, blockId: "B2" });
+        expect(await probe.hget(stKey, "co")).toBe("B2");
+        await store.acknowledgeWithdrawalPage({ runId: RUN_ID, blockId: "B1", fields: ["w_a#"] });
+        const r3 = await store.finalizeRetainedWithdrawal({ runId: RUN_ID, blockId: "B1" });
+        expect(r3.fenceCleared).toBe(false);
+        expect(await store.readWithdrawalPage({ runId: RUN_ID, blockId: "B1" })).toBeUndefined();
+        expect(await probe.hget(stKey, "co")).toBe("B2");
+      } finally {
+        probe.disconnect();
+        await store.quit();
+      }
+    }
+  );
+});
+
+redisTest(
+  "terminal empty withdrawal remains discoverable, while an invalid manifest retains its evidence and fence",
+  async ({ redisOptions }) => {
+    const store = coordinator(redisOptions);
+    const probe = createRedisClient(redisOptions);
+    const runId = "run_empty_terminal_withdrawal";
+    const blockId = "B1";
+    const key = runWithdrawalKey(runId, blockId);
+    try {
+      await store.absorbBlockers({
+        runId,
+        blockId,
+        absorptionId: "A1",
+        edges: [{ waitpointId: "w_a", type: "RUN", createdAt: NOW }],
+      });
+      await store.armCleanupFence({ runId, blockId });
+      await store.compensateAbsorption({ runId, blockId, absorptionId: "A1" });
+      await store.terminalRetainAndClear({ runId, blockId });
+      const raw = (await probe.get(key))!;
+      expect(raw).toBe(blockId);
+      expect(await store.readWithdrawalPage({ runId, blockId })).toEqual({
+        blockId,
+        fields: [],
+      });
+
+      await probe.set(key, "B2");
+      await expect(
+        store.releaseRunWatchers({ runId, blockId, reason: "terminal" })
+      ).rejects.toThrow();
+      expect(await probe.get(key)).toBe("B2");
+      expect(await probe.hget(runBlockKeys(runId).state, "co")).toBe(blockId);
+
+      await probe.set(key, raw);
+      expect(
+        (await store.releaseRunWatchers({ runId, blockId, reason: "terminal" })).unregistered
+      ).toBe(0);
+      expect(await probe.get(key)).toBeNull();
+      expect(await probe.hget(runBlockKeys(runId).state, "co")).toBeNull();
+      expect((await store.readBlockState(runId)).terminal).toBe(true);
+    } finally {
+      probe.disconnect();
+      await store.quit();
+    }
+  }
+);
+
+describe("bounded cleanup", () => {
+  redisTest(
+    "terminal adapter drains indexed contributions and detached withdrawals after state expiry, and refuses an active newer block",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions);
+      const redis = createRedisClient(redisOptions);
+      const adapter = new StoreWaitpointCoordinator({ store });
+      const runId = "terminal_registry_replay",
+        organizationId = "org_terminal_registry";
+      const registry = organizationRunIndexKey(organizationId, fanoutPartition(runId));
+      try {
+        await store.publishRunOwnership(runId, organizationId);
+        expect(
+          (
+            await store.absorbBlockers({
+              runId,
+              blockId: "old",
+              absorptionId: "old",
+              edges: [edge("w_old")],
+            })
+          ).outcome
+        ).toBe("absorbed");
+        // The supported store-only abandon primitive leaves a detached withdrawal, without co.
+        expect(await store.abandonRetainAndClear({ runId, blockId: "old" })).toEqual({
+          outcome: "retained",
+        });
+        // More than one declared page, including evidence from a prior block.
+        for (let i = 0; i <= RUN_CLEANUP_PAGE_SIZE; i++) {
+          expect(
+            (
+              await store.absorbBlockers({
+                runId,
+                blockId: "current",
+                absorptionId: `A${i}`,
+                edges: [edge(`w_${i}`)],
+              })
+            ).outcome
+          ).toBe("absorbed");
+        }
+        expect(await store.terminalRetainAndClear({ runId, blockId: "current" })).toEqual({
+          outcome: "retained",
+        });
+        // Ordinary state can expire while both durable indexes and detached targets survive.
+        await redis.unlink(...Object.values(runBlockKeys(runId)), runResultKey(runId));
+        expect(await redis.zcard(runContributionIndexKey(runId))).toBe(RUN_CLEANUP_PAGE_SIZE + 2);
+        expect(await redis.zcard(runWithdrawalIndexKey(runId))).toBe(2);
+        await adapter.releaseRunBlockers({ runId, organizationId, reason: "terminal" });
+        expect(await redis.zscore(registry, runId)).toBeNull();
+        expect(await redis.zcard(runContributionIndexKey(runId))).toBe(0);
+        expect(await redis.zcard(runWithdrawalIndexKey(runId))).toBe(0);
+        expect(
+          await redis.exists(
+            runWithdrawalTargetsKey(runId, "old"),
+            runWithdrawalTargetsKey(runId, "current"),
+            runContributionKey(runId, "current", "A0"),
+            runContributionKey(runId, "current", `A${RUN_CLEANUP_PAGE_SIZE}`)
+          )
+        ).toBe(0);
+        await adapter.releaseRunBlockers({ runId, organizationId, reason: "terminal" });
+        expect(await redis.zscore(registry, runId)).toBeNull();
+
+        const active = "active_registry_refusal";
+        await store.publishRunOwnership(active, organizationId);
+        expect(
+          (
+            await store.absorbBlockers({
+              runId: active,
+              blockId: "newer",
+              absorptionId: "A",
+              edges: [edge("w_active")],
+            })
+          ).outcome
+        ).toBe("absorbed");
+        await expect(store.finishTerminalRunCleanup(active)).rejects.toThrow(/terminal|cleanup/i);
+        expect(
+          await adapter.releaseRunBlockers({
+            runId: active,
+            organizationId,
+            reason: "terminal",
+            blockId: "stale",
+          })
+        ).toEqual({ count: 0 });
+        expect((await store.readBlockState(active)).pendingIds).toEqual(["w_active"]);
+        expect(await redis.zcard(runContributionIndexKey(active))).toBe(1);
+        expect(
+          await redis.zscore(
+            organizationRunIndexKey(organizationId, fanoutPartition(active)),
+            active
+          )
+        ).toBe("0");
+      } finally {
+        await store.quit();
+        redis.disconnect();
+      }
+    }
+  );
+
+  redisTest(
+    "retains admission evidence through cn/wd obligations and retires only terminal convergence or fully absent state",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions),
+        redis = createRedisClient(redisOptions),
+        runId = "registry_run",
+        org = "org_registry";
+      const index = organizationRunIndexKey(org, fanoutPartition(runId));
+      try {
+        await store.publishRunOwnership(runId, org);
+        // A producer can die immediately after admission: the registry alone still discovers it.
+        expect(await redis.zscore(index, runId)).toBe("0");
+        await store.absorbBlockers({
+          runId,
+          blockId: "B",
+          absorptionId: "A",
+          edges: [edge("w_registry")],
+        });
+        expect(await store.retireRunOwnership(runId, org)).toBe(false);
+        await store.terminalRetainAndClear({ runId, blockId: "B" });
+        expect(await store.retireRunOwnership(runId, org)).toBe(false);
+        const page = await store.readWithdrawalPage({ runId, blockId: "B" });
+        await store.acknowledgeWithdrawalPage({ runId, blockId: "B", fields: page!.fields });
+        await store.finalizeRetainedWithdrawal({ runId, blockId: "B" });
+        // The terminal fence alone does not hide surviving contribution recovery.
+        expect(await store.retireRunOwnership(runId, org)).toBe(false);
+        await store.deleteContribution({ runId, blockId: "B", absorptionId: "A" });
+        expect(await store.retireRunOwnership(runId, org)).toBe(true);
+        expect(await redis.zscore(index, runId)).toBeNull();
+        await store.publishRunOwnership("compensated", org);
+        expect(await store.retireRunOwnership("compensated", org)).toBe(true);
+      } finally {
+        await store.quit();
+        redis.disconnect();
+      }
+    }
+  );
+
+  redisTest(
+    "retains large additive blocks without enumerating them and replays acknowledged pages across a newer cycle",
+    async ({ redisOptions }) => {
+      let store = coordinator(redisOptions);
+      const probe = createRedisClient(redisOptions);
+      registerWaitpointCommands(probe);
+      const runId = "run_paged_withdrawal";
+      const blockId = "B1";
+      const count = RUN_CLEANUP_PAGE_SIZE * 3 + 7;
+      const keys = runBlockKeys(runId);
+      const wd = runWithdrawalKey(runId, blockId);
+      const targets = runWithdrawalTargetsKey(runId, blockId);
+      try {
+        await store.createIfAbsent({ record: record("w_shared"), status: "PENDING" });
+        // Several independently bounded additive calls accumulate an unbounded logical block.
+        for (let start = 0; start < count; start += RUN_CLEANUP_PAGE_SIZE) {
+          const edges = Array.from(
+            { length: Math.min(RUN_CLEANUP_PAGE_SIZE, count - start) },
+            (_, i) => edge("w_shared", { batchIndex: start + i })
+          );
+          await store.registerBlocks({ runId, blockId, edges });
+        }
+        const statsBefore = await probe.info("commandstats");
+        const reply = await probe.runAbandonRetainAndClear(
+          keys.pend,
+          keys.done,
+          keys.edge,
+          keys.state,
+          wd,
+          targets,
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalIndexKey(runId),
+          blockId,
+          contributionMember("block_test", ""),
+          "raw-test-revision"
+        );
+        expect(reply).toEqual(["retained"]);
+        expect(await probe.hlen(targets)).toBe(count);
+        expect(await probe.pttl(wd)).toBe(-1);
+        expect(await probe.pttl(targets)).toBe(-1);
+        await expect(store.finalizeRetainedWithdrawal({ runId, blockId })).rejects.toThrow(
+          "unacknowledged"
+        );
+        const first = (await store.readWithdrawalPage({ runId, blockId }))!;
+        expect(first.fields).toHaveLength(RUN_CLEANUP_PAGE_SIZE);
+        // A crash after a watcher withdrawal but before acknowledgement retains the target for replay.
+        const firstIndex = parseEdgeField(first.fields[0]!)!.batchIndex!;
+        await store.unregisterWatcher({
+          waitpointId: "w_shared",
+          runId,
+          blockId,
+          batchIndex: firstIndex,
+        });
+        await store.quit();
+        store = coordinator(redisOptions);
+        await store.registerBlocks({
+          runId,
+          blockId: "B2",
+          edges: [edge("w_shared", { batchIndex: firstIndex })],
+        });
+        let acknowledged = 0;
+        for (let pages = 0; pages < 5; pages++) {
+          const page = (await store.readWithdrawalPage({ runId, blockId }))!;
+          expect(page.fields.length).toBeLessThanOrEqual(RUN_CLEANUP_PAGE_SIZE);
+          if (!page.fields.length) break;
+          for (const field of page.fields) {
+            await store.unregisterWatcher({
+              waitpointId: "w_shared",
+              runId,
+              blockId,
+              batchIndex: parseEdgeField(field)!.batchIndex,
+            });
+          }
+          await store.acknowledgeWithdrawalPage({ runId, blockId, fields: page.fields });
+          acknowledged += page.fields.length;
+        }
+        expect(acknowledged).toBe(count);
+        await store.finalizeRetainedWithdrawal({ runId, blockId });
+        expect(await probe.exists(wd, targets)).toBe(0);
+        expect(await probe.hget(keys.state, "blk")).toBe("B2");
+        expect(await probe.hlen(waitpointKeys("w_shared").watchers)).toBe(1);
+        expect(
+          await probe.hexists(
+            waitpointKeys("w_shared").watchers,
+            watcherField(runId, "B2", firstIndex)
+          )
+        ).toBe(1);
+        // Terminal detach is equally constant-sized; its targets survive ordinary terminal-key expiry.
+        const terminal = await probe.runTerminalRetainAndClear(
+          keys.pend,
+          keys.done,
+          keys.edge,
+          keys.state,
+          runWithdrawalKey(runId, "B2"),
+          runResultKey(runId),
+          runWithdrawalTargetsKey(runId, "B2"),
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runWithdrawalIndexKey(runId),
+          "B2",
+          String(Date.now()),
+          "10000",
+          "raw-test-revision"
+        );
+        expect(terminal).toEqual(["retained"]);
+        await probe.unlink(keys.state);
+        await store.releaseRunWatchers({ runId, blockId: "B2", reason: "terminal" });
+        expect(await probe.hlen(waitpointKeys("w_shared").watchers)).toBe(0);
+        expect(await store.readWithdrawalPage({ runId, blockId: "B2" })).toBeUndefined();
+        // Exercise the actual terminal release loop across several pages, including its default
+        // block lookup. These targets have no watcher, so absent is successful convergence.
+        const terminalRunId = `${runId}_terminal`;
+        for (let start = 0; start < count; start += RUN_CLEANUP_PAGE_SIZE) {
+          await store.absorbBlockers({
+            runId: terminalRunId,
+            blockId,
+            edges: Array.from({ length: Math.min(RUN_CLEANUP_PAGE_SIZE, count - start) }, (_, i) =>
+              edge("w_shared", { batchIndex: start + i })
+            ),
+          });
+        }
+        await store.releaseRunWatchers({ runId: terminalRunId, reason: "terminal" });
+        expect(await store.readWithdrawalPage({ runId: terminalRunId, blockId })).toBeUndefined();
+        // No full-collection command is used by either retain, paging, finalization, or release's target lookup.
+        const statsAfter = await probe.info("commandstats");
+        const calls = (stats: string, command: string) => {
+          const line = stats.split("\n").find((line) => line.startsWith(`cmdstat_${command}:`));
+          return line ? Number(line.split("calls=")[1]!.split(",")[0]) : 0;
+        };
+        expect(calls(statsAfter, "hget")).toBeGreaterThan(calls(statsBefore, "hget"));
+        for (const command of ["hkeys", "hgetall", "smembers"]) {
+          expect(calls(statsAfter, command)).toBe(calls(statsBefore, command));
+        }
+      } finally {
+        probe.disconnect();
+        await store.quit();
+      }
+    }
+  );
+
+  redisTest(
+    "compensates bounded contribution pages while preserving concurrent additions, duplicate references, and stale generations",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions);
+      const probe = createRedisClient(redisOptions);
+      registerWaitpointCommands(probe);
+      const runId = "run_paged_compensation";
+      const blockId = "B1";
+      const keys = runBlockKeys(runId);
+      const contrib = runContributionKey(runId, blockId, "A1");
+      const count = RUN_CLEANUP_PAGE_SIZE * 3 + 7;
+      try {
+        await store.absorbBlockers({
+          runId,
+          blockId,
+          absorptionId: "kept",
+          edges: [edge("w_shared", { batchIndex: count + 1 })],
+        });
+        for (let start = 0; start < count; start += RUN_CLEANUP_PAGE_SIZE) {
+          await store.absorbBlockers({
+            runId,
+            blockId,
+            absorptionId: "A1",
+            edges: Array.from({ length: Math.min(RUN_CLEANUP_PAGE_SIZE, count - start) }, (_, i) =>
+              edge("w_shared", { batchIndex: start + i })
+            ),
+          });
+        }
+        // HSETNX retries cannot increment the refcount twice.
+        await store.absorbBlockers({
+          runId,
+          blockId,
+          absorptionId: "A1",
+          edges: [edge("w_shared", { batchIndex: 0 })],
+        });
+        await store.deliverCompletion({
+          runId,
+          blockId,
+          waitpointId: "w_shared",
+          completion: completion(),
+        });
+        await store.deliverCompletion({
+          runId,
+          blockId,
+          waitpointId: "w_early",
+          completion: completion(),
+        });
+        const first = await probe.runCompensateAbsorption(
+          keys.pend,
+          keys.done,
+          keys.edge,
+          keys.state,
+          contrib,
+          keys.refs,
+          keys.edgeIndex,
+          keys.doneOrder,
+          keys.early,
+          keys.earlyOrder,
+          runContributionIndexKey(runId),
+          blockId,
+          "A1",
+          contributionMember(blockId, "A1"),
+          "raw-test-revision"
+        );
+        expect(first).toHaveLength(4);
+        expect(Number(first[2])).toBeGreaterThan(0);
+        expect(Number(first[2])).toBeLessThanOrEqual(RUN_CLEANUP_PAGE_SIZE);
+        expect(Number(first[3])).toBeGreaterThanOrEqual(count - RUN_CLEANUP_PAGE_SIZE);
+        expect(Number(first[3])).toBeLessThan(count);
+        // New independent same-block registration while an interrupted compensation has pages left.
+        await store.absorbBlockers({
+          runId,
+          blockId,
+          absorptionId: "A2",
+          edges: [edge("w_shared", { batchIndex: count }), edge("w_early")],
+        });
+        const result = await store.compensateAbsorption({ runId, blockId, absorptionId: "A1" });
+        expect(result).toEqual({
+          outcome: "retained",
+          surviving: 3,
+          removed: count - Number(first[2]),
+        });
+        expect(await probe.hget(keys.refs, "w_shared")).toBe("2");
+        expect(await probe.hexists(keys.done, "w_shared")).toBe(1);
+        expect(await probe.hexists(keys.done, "w_early")).toBe(1);
+        expect(await probe.scard(keys.pend)).toBe(0);
+        await store.compensateAbsorption({ runId, blockId, absorptionId: "A2" });
+        expect(await probe.hget(keys.refs, "w_shared")).toBe("1");
+        expect(await probe.hexists(keys.done, "w_shared")).toBe(1);
+        await store.compensateAbsorption({ runId, blockId, absorptionId: "kept" });
+        expect(await probe.exists(keys.edge, keys.refs, keys.done, keys.pend)).toBe(0);
+        expect(await store.currentBlockId(runId)).toBeUndefined();
+        await store.absorbBlockers({ runId, blockId: "B2", edges: [edge("w_shared")] });
+        await probe.sadd(contrib, "w_shared#");
+        expect(
+          (await store.compensateAbsorption({ runId, blockId, absorptionId: "A1" })).outcome
+        ).toBe("stale");
+        expect(await probe.hget(keys.refs, "w_shared")).toBe("1");
+        expect(await probe.hexists(keys.edge, "w_shared#")).toBe(1);
+      } finally {
+        probe.disconnect();
+        await store.quit();
+      }
+    }
+  );
 });
 
 describe("deliverCompletion", () => {
@@ -3616,6 +4340,31 @@ describe("cancellation fences delivery before withdrawal", () => {
       await store.quit();
     }
   });
+
+  redisTest(
+    "a terminal release on a run with no coordination state writes neither a tombstone nor a withdrawal record",
+    async ({ redisOptions }) => {
+      const store = new WaitpointStoreCoordinator({ redisOptions });
+      const probe = createRedisClient(redisOptions);
+      try {
+        const released = await store.releaseRunWatchers({
+          runId: "run_never_blocked",
+          reason: "terminal",
+        });
+        expect(released.unregistered).toBe(0);
+        expect(released.cleanup).toMatchObject({ outcome: "armed", state: "absent" });
+
+        // No terminal tombstone on the run-state shard, and no withdrawal record.
+        expect(await probe.exists(`wp:v1:run:{run_never_blocked}:st`)).toBe(0);
+        expect(
+          await store.readWithdrawalPage({ runId: "run_never_blocked", blockId: "any" })
+        ).toBeUndefined();
+      } finally {
+        probe.disconnect();
+        await store.quit();
+      }
+    }
+  );
 });
 
 /**
@@ -3797,6 +4546,24 @@ describe("block clears are fenced on their block", () => {
         expect(await probe.hgetall(`wp:v1:run:{${RUN_ID}}:edge`)).toEqual({});
       } finally {
         probe.disconnect();
+        await store.quit();
+      }
+    }
+  );
+});
+
+describe("probeWaitpointPresence (bounded association discovery)", () => {
+  redisTest(
+    "reports present for an existing record and absent for an unknown id",
+    async ({ redisOptions }) => {
+      const store = coordinator(redisOptions);
+      try {
+        const id = generateWaitpointId("RUN");
+        await store.createIfAbsent({ record: record(id, { type: "RUN" }), status: "PENDING" });
+
+        expect(await store.probeWaitpointPresence(id)).toBe("present");
+        expect(await store.probeWaitpointPresence(generateWaitpointId("RUN"))).toBe("absent");
+      } finally {
         await store.quit();
       }
     }

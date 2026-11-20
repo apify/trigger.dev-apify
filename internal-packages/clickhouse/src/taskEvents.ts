@@ -86,7 +86,6 @@ export const TaskEventDetailedSummaryV1Result = z.object({
   kind: z.string(),
   metadata: z.string(),
   message: z.string(),
-  attributes_text: z.string(),
 });
 
 export type TaskEventDetailedSummaryV1Result = z.output<typeof TaskEventDetailedSummaryV1Result>;
@@ -108,7 +107,6 @@ export function getTraceDetailedSummaryQueryBuilder(
       "kind",
       "metadata",
       { name: "message", expression: "LEFT(message, 256)" },
-      "attributes_text",
     ],
     settings,
   });
@@ -306,7 +304,6 @@ export function getTraceDetailedSummaryQueryBuilderV2(
       "kind",
       "metadata",
       { name: "message", expression: "LEFT(message, 256)" },
-      "attributes_text",
     ],
     settings,
   });
@@ -353,11 +350,34 @@ export function buildTraceChunkCursorPredicate(cursor: TraceChunkCursor): {
 } {
   return {
     clause:
-      "(toUnixTimestamp64Nano(start_time) > {cursorStartTime: Int64} OR (toUnixTimestamp64Nano(start_time) = {cursorStartTime: Int64} AND span_id > {cursorSpanId: String}))",
+      // Repeats the cursor on the sort key's toUnixTimestamp(start_time) so earlier granules are skipped.
+      "toUnixTimestamp(start_time) >= intDiv({cursorStartTime: Int64}, 1000000000) AND (toUnixTimestamp64Nano(start_time) > {cursorStartTime: Int64} OR (toUnixTimestamp64Nano(start_time) = {cursorStartTime: Int64} AND span_id > {cursorSpanId: String}))",
     params: {
       cursorStartTime: cursor.startTime,
       cursorSpanId: cursor.spanId,
     },
+  };
+}
+
+// The sort key's form of the exact start_time bounds, so granules outside them are skipped.
+// Implied by the exact bounds; ClickHouse doesn't always derive it from a string literal.
+export function buildTraceStartTimeSortKeyPredicate({
+  startNs,
+  endNs,
+}: {
+  startNs: string;
+  endNs?: string;
+}): {
+  clause: string;
+  params: { windowStartNs: string; windowEndNs?: string };
+} {
+  const lower = "toUnixTimestamp(start_time) >= intDiv({windowStartNs: Int64}, 1000000000)";
+  if (!endNs) {
+    return { clause: lower, params: { windowStartNs: startNs } };
+  }
+  return {
+    clause: `${lower} AND toUnixTimestamp(start_time) <= intDiv({windowEndNs: Int64}, 1000000000)`,
+    params: { windowStartNs: startNs, windowEndNs: endNs },
   };
 }
 
@@ -408,30 +428,6 @@ export function getTraceChunkQueryBuilderV2(ch: ClickhouseReader, settings?: Cli
     name: "getTraceChunkV2",
     table: "trigger_dev.task_events_v2",
     columns: [...TRACE_CHUNK_COLUMNS_V2],
-    settings,
-  });
-}
-
-export type TraceSpanCountResult = { count: string };
-const TRACE_SPAN_COUNT_COLUMNS = [{ name: "count", expression: "uniqExact(span_id)" }] as const;
-
-export function getTraceSpanCountQueryBuilder(ch: ClickhouseReader, settings?: ClickHouseSettings) {
-  return ch.queryBuilderFast<TraceSpanCountResult>({
-    name: "getTraceSpanCount",
-    table: "trigger_dev.task_events_v1",
-    columns: [...TRACE_SPAN_COUNT_COLUMNS],
-    settings,
-  });
-}
-
-export function getTraceSpanCountQueryBuilderV2(
-  ch: ClickhouseReader,
-  settings?: ClickHouseSettings
-) {
-  return ch.queryBuilderFast<TraceSpanCountResult>({
-    name: "getTraceSpanCountV2",
-    table: "trigger_dev.task_events_v2",
-    columns: [...TRACE_SPAN_COUNT_COLUMNS],
     settings,
   });
 }
@@ -504,7 +500,7 @@ export const LogsSearchListResult = z.object({
   status: z.string(),
   duration: z.number().or(z.string()),
   triggered_timestamp: z.string(),
-  projection_fingerprint_string: z.string().optional(),
+  projection_fingerprint_string: z.string(),
 });
 
 export type LogsSearchListResult = z.output<typeof LogsSearchListResult>;
@@ -536,8 +532,6 @@ export function getLogsSearchListQueryBuilder(ch: ClickhouseReader) {
     ],
     settings: {
       use_query_condition_cache: 1,
-      // The ngram text index covers every organization's rows in a part, so reading it costs more
-      // than scanning one environment's time range, often by seconds when it is not cached.
       ignore_data_skipping_indices: "idx_search_text",
       // Hold the response until the query finishes so a limit error arrives as an HTTP error the
       // client turns into a QueryError, not mid-stream. Pages are a few hundred small rows.

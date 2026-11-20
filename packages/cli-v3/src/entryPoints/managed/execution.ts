@@ -10,6 +10,7 @@ import {
   type TaskRunFailedExecutionResult,
 } from "@trigger.dev/core/v3";
 import {
+  type RunTokenRefreshTrigger,
   type WorkloadRunAttemptStartResponseBody,
   type WorkloadHttpClient,
 } from "@trigger.dev/core/v3/workers";
@@ -21,10 +22,17 @@ import { RunExecutionSnapshotPoller } from "./poller.js";
 import { assertExhaustive, tryCatch } from "@trigger.dev/core/utils";
 import { type Metadata, MetadataClient } from "./overrides.js";
 import { randomBytes } from "node:crypto";
-import { type SnapshotState, SnapshotManager } from "./snapshot.js";
+import { type SnapshotState, SnapshotManager, snapshotStatusForAttemptStatus } from "./snapshot.js";
+import { measureExecutionMetrics } from "./executionMetrics.js";
 import type { SupervisorSocket } from "./controller.js";
 import { RunNotifier } from "./notifier.js";
-import type { TaskRunProcessProvider } from "./taskRunProcessProvider.js";
+import { forkEnvFromRunEnv, type TaskRunProcessProvider } from "./taskRunProcessProvider.js";
+import { RunTokenRefresher, type RunTokenUpdate } from "./runTokenRefresh.js";
+import { SecretEnv } from "./secretEnv.js";
+import { UsageJwtRefresher } from "./usageJwtRefresh.js";
+import { redactSecrets } from "./redact.js";
+
+const USAGE_JWT_RESUME_RETRY_DELAYS_MS = [0, 1_000, 3_000];
 
 class ExecutionAbortError extends Error {
   constructor(message: string) {
@@ -51,6 +59,7 @@ type RunExecutionRunOptions = {
   snapshotFriendlyId: string;
   dequeuedAt?: Date;
   podScheduledAt?: Date;
+  supervisorWait?: { startedAt: Date; durationMs: number };
   isWarmStart?: boolean;
 };
 
@@ -60,11 +69,15 @@ export class RunExecution {
 
   private _runFriendlyId?: string;
   private currentAttemptNumber?: number;
+  public requiresRunnerExit = false;
+  // Only the non-secret part of the run env, used to fork the task process.
   private currentTaskRunEnv?: Record<string, string>;
+  private attemptEnv?: SecretEnv;
   private snapshotManager?: SnapshotManager;
 
   private dequeuedAt?: Date;
   private podScheduledAt?: Date;
+  private supervisorWait?: { startedAt: Date; durationMs: number };
   private readonly workerManifest: WorkerManifest;
   private readonly env: RunnerEnv;
   private readonly httpClient: WorkloadHttpClient;
@@ -72,6 +85,9 @@ export class RunExecution {
   private restoreCount: number;
 
   private taskRunProcess?: TaskRunProcess;
+  private runToken?: RunTokenRefresher;
+  private usageJwt?: UsageJwtRefresher;
+  private heartbeatInFlight?: ReturnType<RunExecution["performHeartbeat"]>;
   private snapshotPoller?: RunExecutionSnapshotPoller;
 
   private lastHeartbeat?: Date;
@@ -368,6 +384,7 @@ export class RunExecution {
           return;
         }
 
+        await this.refreshBeforeResume();
         for (const waitpoint of completedWaitpoints) {
           this.taskRunProcess.waitpointCompleted(waitpoint);
         }
@@ -414,8 +431,10 @@ export class RunExecution {
     const start = await this.httpClient.startRunAttempt(
       this.runFriendlyId,
       this.snapshotManager.snapshotId,
-      { isWarmStart }
+      { isWarmStart, supportsRunTokenRefresh: true, supportsUsageJwtRefresh: true }
     );
+
+    if (!start.success && start.shouldRetry === false) this.requiresRunnerExit = true;
 
     if (this.executionAbortController.signal.aborted) {
       throw new ExecutionAbortError("Execution aborted after start");
@@ -435,19 +454,52 @@ export class RunExecution {
     const attemptNumber = start.data.run.attemptNumber;
     if (attemptNumber && attemptNumber > 0) {
       this.currentAttemptNumber = attemptNumber;
+      // Replaced per attempt, so late refreshes for an earlier attempt can't reach this one.
+      this.usageJwt = new UsageJwtRefresher({
+        runId: this.runFriendlyId,
+        attemptNumber,
+        usageOptions: {
+          jwt: start.data.envVars.TRIGGER_JWT,
+          url: start.data.envVars.USAGE_EVENT_URL,
+          heartbeatIntervalMs: Number.parseInt(
+            start.data.envVars.USAGE_HEARTBEAT_INTERVAL_MS ?? "",
+            10
+          ),
+        },
+        install: (update) => this.taskRunProcess?.installUsageJwt(update) ?? Promise.resolve(false),
+      });
+      if (this.usageJwt.fallbackReason) {
+        this.sendDebugLog("billing JWT fallback", { reason: this.usageJwt.fallbackReason });
+      }
+      this.runToken = new RunTokenRefresher({
+        runId: this.runFriendlyId,
+        attemptNumber,
+        initialToken: start.data.envVars.TRIGGER_RUN_TOKEN,
+        install: (update) => this.installRunToken(update),
+      });
     } else {
       this.sendDebugLog("error: invalid attempt number returned from start attempt", {
         attemptNumber: String(attemptNumber),
       });
     }
 
-    const metrics = this.measureExecutionMetrics({
+    const metrics = measureExecutionMetrics({
       attemptCreatedAt: attemptStartedAt,
       dequeuedAt: this.dequeuedAt?.getTime(),
       podScheduledAt: this.podScheduledAt?.getTime(),
+      supervisorWait: this.supervisorWait && {
+        startedAt: this.supervisorWait.startedAt.getTime(),
+        durationMs: this.supervisorWait.durationMs,
+      },
     });
 
-    this.sendDebugLog("started attempt", { start: start.data });
+    this.sendDebugLog("started attempt", {
+      start: { ...start.data, envVars: redactSecrets(start.data.envVars) },
+    });
+
+    this.currentTaskRunEnv = forkEnvFromRunEnv(start.data.envVars);
+    this.attemptEnv?.zero();
+    this.attemptEnv = SecretEnv.takeFrom(start.data.envVars);
 
     return { ...start.data, metrics };
   }
@@ -479,6 +531,7 @@ export class RunExecution {
 
     this.dequeuedAt = runOpts.dequeuedAt;
     this.podScheduledAt = runOpts.podScheduledAt;
+    this.supervisorWait = runOpts.supervisorWait;
 
     // Create and start services
     this.snapshotPoller = new RunExecutionSnapshotPoller({
@@ -535,8 +588,6 @@ export class RunExecution {
     isWarmStart?: boolean;
     isImmediateRetry?: boolean;
   }) {
-    this.currentTaskRunEnv = envVars;
-
     const [executeError] = await tryCatch(
       this.executeRun({
         run,
@@ -549,7 +600,7 @@ export class RunExecution {
       })
     );
 
-    if (!executeError) {
+    if (!executeError || this.requiresRunnerExit) {
       return;
     }
 
@@ -596,7 +647,6 @@ export class RunExecution {
   private async executeRun({
     run,
     snapshot,
-    envVars,
     execution,
     metrics,
     isWarmStart,
@@ -606,11 +656,15 @@ export class RunExecution {
     isWarmStart?: boolean;
     isImmediateRetry?: boolean;
   }) {
+    if (!this.currentTaskRunEnv || !this.attemptEnv) {
+      throw new Error("Cannot execute run: missing attempt env");
+    }
+
     if (isImmediateRetry) {
       await this.taskRunProcessProvider.handleImmediateRetry();
     }
 
-    const taskRunEnv = this.currentTaskRunEnv ?? envVars;
+    const taskRunEnv = this.currentTaskRunEnv;
 
     if (!this.taskRunProcess || this.taskRunProcess.isBeingKilled) {
       this.sendDebugLog("getting new task run process", { runId: execution.run.id });
@@ -639,6 +693,9 @@ export class RunExecution {
     // Set up an abort handler that will cleanup the task run process
     this.executionAbortController.signal.addEventListener("abort", abortHandler);
 
+    const env = this.attemptEnv.toRecord();
+    this.attemptEnv.zero();
+
     const completion = await this.taskRunProcess.execute(
       {
         payload: {
@@ -647,7 +704,7 @@ export class RunExecution {
           metrics,
         },
         messageId: run.friendlyId,
-        env: envVars,
+        env,
       },
       isWarmStart
     );
@@ -685,7 +742,7 @@ export class RunExecution {
     const completionResult = await this.httpClient.completeRunAttempt(
       this.runFriendlyId,
       this.snapshotManager.snapshotId,
-      { completion }
+      { completion, attemptNumber: this.currentAttemptNumber }
     );
 
     if (!completionResult.success) {
@@ -712,7 +769,7 @@ export class RunExecution {
       runId: result.run.friendlyId,
     });
 
-    const snapshotStatus = this.convertAttemptStatusToSnapshotStatus(result.attemptStatus);
+    const snapshotStatus = snapshotStatusForAttemptStatus(result.attemptStatus);
 
     // Update our snapshot ID to match the completion result to ensure any subsequent API calls use the correct snapshot
     this.updateSnapshotAfterCompletion(result.snapshot.friendlyId, snapshotStatus);
@@ -750,62 +807,6 @@ export class RunExecution {
   private updateSnapshotAfterCompletion(snapshotId: string, status: TaskRunExecutionStatus) {
     this.snapshotManager?.updateSnapshot(snapshotId, status);
     this.snapshotPoller?.updateSnapshotId(snapshotId);
-  }
-
-  private convertAttemptStatusToSnapshotStatus(
-    attemptStatus: CompleteRunAttemptResult["attemptStatus"]
-  ): TaskRunExecutionStatus {
-    switch (attemptStatus) {
-      case "RUN_FINISHED":
-        return "FINISHED";
-      case "RUN_PENDING_CANCEL":
-        return "PENDING_CANCEL";
-      case "RETRY_QUEUED":
-        return "QUEUED";
-      case "RETRY_IMMEDIATELY":
-        return "EXECUTING";
-      default:
-        assertExhaustive(attemptStatus);
-    }
-  }
-
-  private measureExecutionMetrics({
-    attemptCreatedAt,
-    dequeuedAt,
-    podScheduledAt,
-  }: {
-    attemptCreatedAt: number;
-    dequeuedAt?: number;
-    podScheduledAt?: number;
-  }): TaskRunExecutionMetrics {
-    const metrics: TaskRunExecutionMetrics = [
-      {
-        name: "start",
-        event: "create_attempt",
-        timestamp: attemptCreatedAt,
-        duration: Date.now() - attemptCreatedAt,
-      },
-    ];
-
-    if (dequeuedAt) {
-      metrics.push({
-        name: "start",
-        event: "dequeue",
-        timestamp: dequeuedAt,
-        duration: 0,
-      });
-    }
-
-    if (podScheduledAt) {
-      metrics.push({
-        name: "start",
-        event: "pod_scheduled",
-        timestamp: podScheduledAt,
-        duration: 0,
-      });
-    }
-
-    return metrics;
   }
 
   private async retryImmediately({ retryOpts }: { retryOpts: TaskRunExecutionRetry }) {
@@ -869,6 +870,11 @@ export class RunExecution {
 
     // Process any env overrides
     await this.processEnvOverrides("restore");
+
+    // Continue assigns the restored runner to a new EXECUTING snapshot. Billing renewal checks
+    // that ownership before the EXECUTING handler below releases any waitpoints to user code.
+    // No billing report here: the restored runner does not own the suspended snapshot yet.
+    if (this.runToken?.isDue) await this.sendHeartbeat("restore", { reportUsageJwt: false });
 
     const continuationResult = await this.httpClient.continueRunExecution(
       this.runFriendlyId,
@@ -950,8 +956,8 @@ export class RunExecution {
     }
 
     this.sendDebugLog(`[override] processing: ${reason}`, {
-      overrides,
-      currentEnv: this.env.rawForLogging,
+      overrides: redactSecrets(overrides),
+      currentEnv: redactSecrets(this.env.rawForLogging),
     });
 
     // Override the env with the new values
@@ -1006,10 +1012,7 @@ export class RunExecution {
 
     this.sendDebugLog("heartbeat");
 
-    const response = await this.httpClient.heartbeatRun(
-      this.runFriendlyId,
-      this.snapshotManager.snapshotId
-    );
+    const response = await this.sendHeartbeat("heartbeat");
 
     if (!response.success) {
       this.sendDebugLog("heartbeat: failed", { error: response.error });
@@ -1022,6 +1025,75 @@ export class RunExecution {
     }
 
     this.lastHeartbeat = new Date();
+  }
+
+  private async refreshBeforeResume() {
+    if (!this.usageJwt?.isDue) return;
+    for (const delayMs of USAGE_JWT_RESUME_RETRY_DELAYS_MS) {
+      if (delayMs) await sleep(delayMs);
+      await this.sendHeartbeat("restore");
+      if (!this.usageJwt.isDue) return;
+    }
+    // Rejected usage is retained and sent once a later heartbeat installs a credential, so a
+    // billing outage must not fail the customer's run.
+    this.sendDebugLog("resuming with a due billing JWT; heartbeats will keep retrying the refresh");
+  }
+
+  private sendHeartbeat(trigger: RunTokenRefreshTrigger, opts?: { reportUsageJwt?: boolean }) {
+    if (this.heartbeatInFlight) return this.heartbeatInFlight;
+    this.heartbeatInFlight = this.performHeartbeat(trigger, opts).finally(() => {
+      this.heartbeatInFlight = undefined;
+    });
+    return this.heartbeatInFlight;
+  }
+
+  private async performHeartbeat(
+    trigger: RunTokenRefreshTrigger,
+    { reportUsageJwt = true }: { reportUsageJwt?: boolean } = {}
+  ) {
+    const runId = this.runFriendlyId;
+    const snapshotId = this.snapshotManager?.snapshotId;
+    if (!runId || !snapshotId) {
+      return { success: false as const, error: "missing run or snapshot" };
+    }
+
+    const runToken = this.runToken;
+    const report = runToken?.report(trigger);
+    const usageJwt = this.usageJwt;
+    const usageReport = reportUsageJwt ? usageJwt?.report() : undefined;
+    const response = await this.httpClient.heartbeatRun(runId, snapshotId, {
+      runToken: report,
+      usageJwt: usageReport,
+    });
+
+    if (usageReport && usageJwt) {
+      const installed =
+        response.success && response.data.usageJwt
+          ? await usageJwt.installReplacement(response.data.usageJwt)
+          : false;
+      if (!installed) {
+        this.sendDebugLog("billing JWT refresh/install failed; will retry on next heartbeat", {
+          trigger,
+        });
+        console.error("Billing JWT refresh/install failed; usage rejections retained for retry");
+      }
+    }
+
+    if (response.success && runToken) {
+      const outcome = await runToken.handleHeartbeatResponse(report, response.data.runToken);
+      if (outcome) {
+        this.sendDebugLog("run token refresh", { trigger, ...outcome });
+      }
+    }
+
+    return response;
+  }
+
+  private installRunToken(update: RunTokenUpdate) {
+    if (!this.taskRunProcess) {
+      return Promise.resolve({ result: "failure" as const, reason: "no_child" as const });
+    }
+    return this.taskRunProcess.installRunToken(update);
   }
 
   private sendDebugLog(
@@ -1131,6 +1203,7 @@ export class RunExecution {
     this.snapshotPoller?.stop();
     this.snapshotManager?.stop();
     this.notifier?.stop();
+    this.attemptEnv?.zero();
 
     this.taskRunProcess?.unsafeDetachEvtHandlers();
   }
@@ -1178,6 +1251,8 @@ export class RunExecution {
       this.abortExecution();
       return;
     }
+
+    this.attemptEnv?.zero();
 
     // Call the suspend API with the current snapshot ID
     const suspendResult = await this.httpClient.suspendRun(

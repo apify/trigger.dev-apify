@@ -320,6 +320,8 @@ Migration from the old Bitnami subchart to the official `clickhouse/clickhouse-s
   ClickHouse externally for a clustered or replicated setup.
 </Note>
 
+The optional `LOGS_SEARCH_INSERT_ASYNC` setting defaults to `false` and requires ClickHouse 26.2 or newer when enabled. Leave it disabled on ClickHouse 25.8.
+
 **Direct configuration:**
 
 ```yaml
@@ -678,6 +680,8 @@ webapp:
 ```
 
 This only affects new runs; existing runs continue to read from wherever their events were originally stored.
+
+If you set `EVENT_REPOSITORY_DEFAULT_STORE` to the legacy `clickhouse` store, switch it to `clickhouse_v2`. To keep events recorded before the switch, follow [Move from the legacy clickhouse store](/self-hosting/docker#move-from-the-legacy-clickhouse-store) and run the queries with `kubectl exec` against your ClickHouse pod.
 
 ### Realtime streams
 

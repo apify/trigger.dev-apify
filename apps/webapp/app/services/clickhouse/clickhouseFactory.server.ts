@@ -1,4 +1,4 @@
-import { ClickHouse, type ClickHouseSettings } from "@internal/clickhouse";
+import { ClickHouse, setQueryObserver, type ClickHouseSettings } from "@internal/clickhouse";
 import { createHash } from "crypto";
 import {
   ClickhouseEventRepository,
@@ -9,7 +9,13 @@ import { env } from "~/env.server";
 import { clampToEmergencySpanCap } from "~/v3/eventRepository/emergencySpanCap.server";
 import { singleton } from "~/utils/singleton";
 import type { OrganizationDataStoresRegistry } from "~/services/dataStores/organizationDataStoresRegistry.server";
+import type { ParsedDataStore } from "~/services/dataStores/organizationDataStoreConfigSchemas.server";
 import { type IEventRepository } from "~/v3/eventRepository/eventRepository.types";
+import { effectiveEventStore } from "~/v3/eventRepository/effectiveEventStore";
+import { requestFeatureQueryObserver } from "~/services/requestFeature.server";
+
+// Labels and totals ClickHouse queries made inside a feature-labelled request.
+setQueryObserver(requestFeatureQueryObserver);
 
 // Declared before the singletons below, which initialize clients at module load.
 const LOGS_LIST_REQUEST_TIMEOUT_MARGIN_SECONDS = 5;
@@ -43,24 +49,6 @@ const defaultLogsClickhouseClient = singleton(
   "logsClickhouseClient",
   initializeLogsClickhouseClient
 );
-
-function initializeLogsSearchProjectorClickhouseClient() {
-  const url = new URL(env.LOGS_SEARCH_WRITER_CLICKHOUSE_URL ?? env.CLICKHOUSE_URL);
-  url.searchParams.delete("secure");
-
-  return new ClickHouse({
-    url: url.toString(),
-    name: "logs-search-projector",
-    keepAlive: {
-      enabled: env.CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
-      idleSocketTtl: env.CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
-    },
-    logLevel: env.CLICKHOUSE_LOG_LEVEL,
-    compression: { request: true },
-    maxOpenConnections: Math.min(env.CLICKHOUSE_MAX_OPEN_CONNECTIONS, 2),
-    requestTimeoutMs: (env.LOGS_SEARCH_PROJECTOR_MAX_EXECUTION_TIME_SECONDS + 30) * 1000,
-  });
-}
 
 function getLogsListClickhouseSettings() {
   return {
@@ -441,6 +429,23 @@ const defaultEventsClickhouseClient = singleton(
   initializeEventsClickhouseClient
 );
 
+function getEventsReaderClickhouseSettings(): ClickHouseSettings {
+  return {
+    ...(env.EVENTS_READER_CLICKHOUSE_MAX_EXECUTION_TIME && {
+      max_execution_time: env.EVENTS_READER_CLICKHOUSE_MAX_EXECUTION_TIME,
+    }),
+    ...(env.EVENTS_READER_CLICKHOUSE_MAX_THREADS && {
+      max_threads: env.EVENTS_READER_CLICKHOUSE_MAX_THREADS,
+    }),
+    ...(env.EVENTS_READER_CLICKHOUSE_MAX_MEMORY_USAGE && {
+      max_memory_usage: env.EVENTS_READER_CLICKHOUSE_MAX_MEMORY_USAGE.toString(),
+    }),
+    ...(env.EVENTS_READER_CLICKHOUSE_READONLY && {
+      readonly: env.EVENTS_READER_CLICKHOUSE_READONLY,
+    }),
+  };
+}
+
 function initializeEventsClickhouseClient(): ClickHouse {
   if (!env.EVENTS_CLICKHOUSE_URL) {
     throw new Error("EVENTS_CLICKHOUSE_URL is not set");
@@ -473,6 +478,8 @@ function initializeEventsClickhouseClient(): ClickHouse {
         writerUrl: writerUrl.toString(),
         readerName: "task-events-reader",
         readerUrl: readerUrl.toString(),
+        readerClickhouseSettings: getEventsReaderClickhouseSettings(),
+        readerRequestTimeoutMs: env.EVENTS_READER_CLICKHOUSE_REQUEST_TIMEOUT_MS,
       });
     }
   }
@@ -521,9 +528,9 @@ function initializeLogsSearchClickhouseClient(): ClickHouse | undefined {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function hashHostname(url: string): string {
-  const parsed = new URL(url);
-  return createHash("sha256").update(parsed.hostname).digest("hex");
+/** Cache keys hash the whole URL so a credential, port or database change yields a new client. */
+function hashUrl(url: string): string {
+  return createHash("sha256").update(url).digest("hex");
 }
 
 export type ClientType =
@@ -550,16 +557,29 @@ export type ClientType =
  */
 const SHARED_WAREHOUSE_CLIENT_TYPES = new Set<ClientType>(["queueMetrics"]);
 
-function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHouse {
-  const parsed = new URL(url);
+/** Cache key for everything built from a data store; changes when its primary or mirror URL does. */
+function dataStoreCacheKey(dataStore: ParsedDataStore): string {
+  const mirrorHash = dataStore.mirrorUrl ? hashUrl(dataStore.mirrorUrl) : "-";
+  return `${hashUrl(dataStore.url)}:${mirrorHash}`;
+}
+
+function buildOrgClickhouseClient(dataStore: ParsedDataStore, clientType: ClientType): ClickHouse {
+  const parsed = new URL(dataStore.url);
   parsed.searchParams.delete("secure");
   const name = `org-clickhouse-${clientType}`;
+  let mirrorUrl: string | undefined;
+  if (dataStore.mirrorUrl) {
+    const mirror = new URL(dataStore.mirrorUrl);
+    mirror.searchParams.delete("secure");
+    mirrorUrl = mirror.toString();
+  }
 
   switch (clientType) {
     case "events":
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.EVENTS_CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.EVENTS_CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -574,6 +594,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.RUN_REPLICATION_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.RUN_REPLICATION_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -589,6 +610,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.SESSION_REPLICATION_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.SESSION_REPLICATION_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -601,6 +623,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -615,6 +638,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.RUN_ENGINE_CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.RUN_ENGINE_CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -629,6 +653,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.QUEUE_METRICS_CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.QUEUE_METRICS_CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -643,6 +668,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.REALTIME_BACKEND_NATIVE_CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.REALTIME_BACKEND_NATIVE_CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -657,6 +683,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.RUNS_LIST_CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.RUNS_LIST_CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -675,6 +702,7 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
       return new ClickHouse({
         url: parsed.toString(),
         name,
+        mirrorUrl,
         keepAlive: {
           enabled: env.CLICKHOUSE_KEEP_ALIVE_ENABLED === "1",
           idleSocketTtl: env.CLICKHOUSE_KEEP_ALIVE_IDLE_SOCKET_TTL_MS,
@@ -691,12 +719,15 @@ function buildOrgClickhouseClient(url: string, clientType: ClientType): ClickHou
 // ---------------------------------------------------------------------------
 
 export class ClickhouseFactory {
-  /** ClickHouse clients keyed by hostname hash + clientType. */
+  /** ClickHouse clients keyed by data store (primary + mirror URL) + clientType. */
   private readonly _clientCache = new Map<string, ClickHouse>();
-  /** Event repositories keyed by hostname hash (stateful, must be reused). */
+  /** Event repositories keyed by data store (stateful, must be reused). */
   private readonly _eventRepositoryCache = new Map<string, ClickhouseEventRepository>();
 
-  constructor(private readonly _registry: OrganizationDataStoresRegistry) {}
+  constructor(
+    private readonly _registry: OrganizationDataStoresRegistry,
+    private readonly _v1RerouteEnabled: boolean = env.EVENT_REPOSITORY_V1_REROUTE_ENABLED
+  ) {}
 
   async isReady(): Promise<boolean> {
     if (!this._registry.isLoaded) {
@@ -750,12 +781,11 @@ export class ClickhouseFactory {
       }
     }
 
-    const hostnameHash = hashHostname(dataStore.url);
-    const cacheKey = `${hostnameHash}:${clientType}`;
+    const cacheKey = `${dataStoreCacheKey(dataStore)}:${clientType}`;
     let client = this._clientCache.get(cacheKey);
 
     if (!client) {
-      client = buildOrgClickhouseClient(dataStore.url, clientType);
+      client = buildOrgClickhouseClient(dataStore, clientType);
       this._clientCache.set(cacheKey, client);
     }
 
@@ -774,9 +804,11 @@ export class ClickhouseFactory {
   }
 
   getEventRepositoryForOrganizationSync(
-    store: string,
+    requestedStore: string,
     organizationId: string
   ): { key: string; repository: IEventRepository } {
+    // Normalized before the cache key, so "clickhouse" and "clickhouse_v2" share one repository
+    const store = effectiveEventStore(requestedStore, this._v1RerouteEnabled);
     const dataStore = this._registry.get(organizationId, "CLICKHOUSE");
 
     if (!dataStore) {
@@ -794,8 +826,7 @@ export class ClickhouseFactory {
       return { key: defaultKey, repository: defaultRepo };
     }
 
-    const hostnameHash = hashHostname(dataStore.url);
-    const cacheKey = `${hostnameHash}:events:${store}`;
+    const cacheKey = `${dataStoreCacheKey(dataStore)}:events:${store}`;
     let repository = this._eventRepositoryCache.get(cacheKey);
 
     if (!repository) {
@@ -814,13 +845,6 @@ export class ClickhouseFactory {
  */
 export function getAdminClickhouse(): ClickHouse {
   return defaultAdminClickhouseClient;
-}
-
-export function getLogsSearchProjectorClickhouseClient(): ClickHouse {
-  return singleton(
-    "logsSearchProjectorClickhouseClient",
-    initializeLogsSearchProjectorClickhouseClient
-  );
 }
 
 /** Queue-metrics client for callers with no organization in scope (the ingestion consumer). */
@@ -862,6 +886,9 @@ function buildEventRepository(
         ),
         maximumLiveReloadingSetting: env.EVENTS_CLICKHOUSE_MAX_LIVE_RELOADING_SETTING,
         traceChunkSize: env.EVENTS_CLICKHOUSE_TRACE_CHUNK_SIZE,
+        exportMaxExecutionTime: clickhouse.hasSeparateReader
+          ? env.EVENTS_READER_CLICKHOUSE_EXPORT_MAX_EXECUTION_TIME
+          : undefined,
         maximumTraceViewCount: env.EVENTS_CLICKHOUSE_MAX_TRACE_VIEW_COUNT,
         maximumErrorMatches: clampToEmergencySpanCap(DEFAULT_MAX_ERROR_MATCHES),
         maximumKeyRows: clampToEmergencySpanCap(DEFAULT_MAX_KEY_ROWS),
@@ -898,6 +925,9 @@ function buildEventRepository(
         ),
         maximumLiveReloadingSetting: env.EVENTS_CLICKHOUSE_MAX_LIVE_RELOADING_SETTING,
         traceChunkSize: env.EVENTS_CLICKHOUSE_TRACE_CHUNK_SIZE,
+        exportMaxExecutionTime: clickhouse.hasSeparateReader
+          ? env.EVENTS_READER_CLICKHOUSE_EXPORT_MAX_EXECUTION_TIME
+          : undefined,
         maximumTraceViewCount: env.EVENTS_CLICKHOUSE_MAX_TRACE_VIEW_COUNT,
         maximumErrorMatches: clampToEmergencySpanCap(DEFAULT_MAX_ERROR_MATCHES),
         maximumKeyRows: clampToEmergencySpanCap(DEFAULT_MAX_KEY_ROWS),
@@ -914,6 +944,7 @@ function buildEventRepository(
         otlpMetricsFlushInterval: env.METRICS_CLICKHOUSE_FLUSH_INTERVAL_MS,
         otlpMetricsMaxConcurrency: env.METRICS_CLICKHOUSE_MAX_CONCURRENCY,
         logsSearchDualWriteActive: env.LOGS_SEARCH_DUAL_WRITE_ACTIVE,
+        logsSearchInsertAsync: env.LOGS_SEARCH_INSERT_ASYNC,
         logsSearchDualWriteOrganizationIds,
         logsSearchDualWriteMaxConcurrency: env.LOGS_SEARCH_DUAL_WRITE_MAX_CONCURRENCY,
         logsSearchDualWriteMaxPending: env.LOGS_SEARCH_DUAL_WRITE_MAX_PENDING,

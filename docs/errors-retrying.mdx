@@ -15,8 +15,8 @@ You can configure retrying in two ways:
 <Note>Task-level retry settings override the defaults in your `trigger.config` file.</Note>
 
 <Note>
-  By default when you create your project using the CLI init command we disabled retrying in the DEV
-  environment. You can enable it in your [trigger.config file](/config/config-file).
+  By default when you create your project using the CLI init command, retrying is enabled in the DEV
+  environment. You can disable it by setting `enabledInDev: false` in your [trigger.config file](/config/config-file).
 </Note>
 
 ## A simple example with OpenAI
@@ -112,7 +112,7 @@ import { task, logger, retry } from "@trigger.dev/sdk";
 
 export const taskWithFetchRetries = task({
   id: "task-with-fetch-retries",
-  run: async ({ payload, ctx }) => {
+  run: async (payload: any, { ctx }) => {
     //if the Response is a 429 (too many requests), it will retry using the data from the response. A lot of good APIs send these headers.
     const headersResponse = await retry.fetch("http://my.host/test-headers", {
       retry: {
@@ -182,7 +182,7 @@ export const taskWithFetchRetries = task({
 
 ## Advanced error handling and retrying
 
-We provide a `catchError` callback on the task and in your `trigger.config` file. This gets called when an uncaught error is thrown in your task.
+We provide a `catchError` callback on the task, and you can register one globally with `tasks.catchError()`. This gets called when an uncaught error is thrown in your task.
 
 You can
 
@@ -216,7 +216,7 @@ export const openaiTask = task({
   run: async (payload: { prompt: string }) => {
     const chatCompletion = await openai.chat.completions.create({
       messages: [{ role: "user", content: payload.prompt }],
-      model: "gpt-3.5-turbo",
+      model: "gpt-6-luna",
     });
 
     return chatCompletion.choices[0].message.content;
@@ -319,7 +319,7 @@ export const openaiTask = task({
     //if this fails, it will throw an error and stop retrying
     const chatCompletion = await openai.chat.completions.create({
       messages: [{ role: "user", content: payload.prompt }],
-      model: "gpt-3.5-turbo",
+      model: "gpt-6-luna",
     });
 
     if (chatCompletion.choices[0]?.message.content === undefined) {
@@ -334,10 +334,15 @@ export const openaiTask = task({
 
 ### Using try/catch
 
-Sometimes you want to catch an error and don't want to retry the task. You can use try/catch as you normally would. In this example we fallback to using Replicate if OpenAI fails.
+Sometimes you want to catch an error and don't want to retry the task. You can use try/catch as you normally would. In this example we fall back to using Anthropic if OpenAI fails.
 
 ```ts /trigger/myTasks.ts
 import { task } from "@trigger.dev/sdk";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+
+const openai = new OpenAI();
+const anthropic = new Anthropic();
 
 export const openaiTask = task({
   id: "openai-task",
@@ -346,7 +351,7 @@ export const openaiTask = task({
       //if this fails, it will throw an error and retry
       const chatCompletion = await openai.chat.completions.create({
         messages: [{ role: "user", content: payload.prompt }],
-        model: "gpt-3.5-turbo",
+        model: "gpt-6-luna",
       });
 
       if (chatCompletion.choices[0]?.message.content === undefined) {
@@ -356,23 +361,25 @@ export const openaiTask = task({
 
       return chatCompletion.choices[0].message.content;
     } catch (error) {
-      //use Replicate if OpenAI fails
-      const prediction = await replicate.run(
-        "meta/llama-2-70b-chat:02e509c789964a7ea8736978a43525956ef40397be9033abf9fd2badfe68c9e3",
-        {
-          input: {
-            prompt: payload.prompt,
-            max_new_tokens: 250,
-          },
-        }
-      );
+      //use Anthropic if OpenAI fails
+      const message = await anthropic.messages.create({
+        model: "claude-haiku-5-5",
+        max_tokens: 16000,
+        messages: [{ role: "user", content: payload.prompt }],
+      });
 
-      if (prediction.output === undefined) {
-        //retry if Replicate fails
-        throw new Error("Replicate call failed");
+      //the response can include thinking blocks, so only read the text blocks
+      const text = message.content
+        .filter((block) => block.type === "text")
+        .map((block) => block.text)
+        .join("");
+
+      if (!text) {
+        //retry if Anthropic fails
+        throw new Error("Anthropic call failed");
       }
 
-      return prediction.output;
+      return text;
     }
   },
 });

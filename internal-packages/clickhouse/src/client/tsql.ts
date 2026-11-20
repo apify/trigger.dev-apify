@@ -17,6 +17,7 @@ import {
   type TableSchema,
   type TimeRange,
   type WhereClauseCondition,
+  type WindowCondition,
 } from "@internal/tsql";
 import { Logger } from "@trigger.dev/core/logger";
 import { z } from "zod";
@@ -119,6 +120,8 @@ export interface ExecuteTSQLOptions<TOut extends z.ZodSchema> {
    * would pick, for series whose samples are too sparse to read at that width.
    */
   minBucketSeconds?: number;
+  /** Per-table [from, to) windows enforced at every reference to the table. */
+  windowConditions?: WindowCondition[];
   /**
    * Set when `query` was written by whoever made the request rather than by us.
    * A rejection of their SQL is then their mistake, not a bug on our side.
@@ -209,9 +212,13 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
       timeRange: options.timeRange,
       fillGaps: options.fillGaps,
       minBucketSeconds: options.minBucketSeconds,
+      windowConditions: options.windowConditions,
     });
 
     generatedSql = sql;
+
+    // A correlated subquery could read outer-row columns the printer never resolved
+    const settings = { ...options.clickhouseSettings, allow_experimental_correlated_subqueries: 0 };
 
     // 2. Execute the query (or EXPLAIN) with stats
     const queryToExecute = isExplain ? `EXPLAIN indexes = 1 ${sql}` : sql;
@@ -222,7 +229,7 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
       params: z.record(z.string(), z.any()),
       // EXPLAIN returns rows with an 'explain' column
       schema: isExplain ? z.object({ explain: z.string() }) : options.schema,
-      settings: options.clickhouseSettings,
+      settings,
       userAuthoredQuery: options.userAuthoredQuery,
     });
 
@@ -256,7 +263,7 @@ export async function executeTSQL<TOut extends z.ZodSchema>(
             query: explainType.query,
             params: z.record(z.string(), z.any()),
             schema: z.object({ explain: z.string() }),
-            settings: options.clickhouseSettings,
+            settings,
             userAuthoredQuery: options.userAuthoredQuery,
           });
 

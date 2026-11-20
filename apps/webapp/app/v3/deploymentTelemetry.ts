@@ -37,9 +37,10 @@ export const DeploymentTelemetryAttributes = {
   RUNTIME: "deployment.runtime",
   // Set at indexing; null for pre-index failures
   RUNTIME_VERSION: "deployment.runtime_version",
-  // From x-trigger-cli-version at init; null for pre-column history
+  // Header at init; finished events fall back to the manifest's version
   CLI_VERSION: "deployment.cli_version",
   TRIGGERED_VIA: "deployment.triggered_via",
+  TRUSTED_PUBLISHING: "deployment.trusted_publishing",
   COMMIT_SHA: "deployment.commit_sha",
   // error.* only on FAILED/TIMED_OUT; CANCELED uses canceled_reason
   ERROR_NAME: "deployment.error.name",

@@ -1,6 +1,22 @@
+import { tryCatch } from "@trigger.dev/core/utils";
+import type { RoleAssignmentResult } from "@trigger.dev/plugins";
 import { $transaction, Prisma, prisma } from "~/db.server";
-import { deleteOrgMember } from "./deleteOrgMember.server";
-import type { MembershipSource } from "~/models/member.server";
+import { deleteOrgMember, prepareMemberRemovalKeys } from "./deleteOrgMember.server";
+import { findOrCreateDirectoryUser } from "./directoryUser.server";
+import {
+  auditRoleName,
+  type MemberAuditAttribution,
+  memberAuditTarget,
+  recordMemberAuditEventInBackground,
+} from "./memberAudit.server";
+import type { MembershipSource, OrgMemberJoinMethod } from "~/models/member.server";
+import { isOrganizationJoinAllowed } from "~/services/accessPolicy.server";
+import { auditLogs } from "~/services/auditLogs/auditLogs.server";
+import {
+  recordMemberRemovalCredentials,
+  SYSTEM_ACTOR,
+} from "~/services/credentialFingerprints.server";
+import { enqueueAttioMemberSync } from "~/services/attio.server";
 import { logger } from "~/services/logger.server";
 import { enqueueMemberDevelopmentEnvironments } from "~/services/memberDevEnvironments.server";
 import { rbac } from "~/services/rbac.server";
@@ -10,12 +26,158 @@ import {
 } from "~/services/personalAccessToken.server";
 
 async function deleteMembership(memberId: string, organizationId: string) {
+  const member = { id: memberId, organizationId };
+  // The new development keys' fingerprints are saved first: a failed save fails the removal.
+  const newKeys = await prepareMemberRemovalKeys(prisma, member, SYSTEM_ACTOR);
   const result = await $transaction(prisma, "delete org member", (tx) =>
-    deleteOrgMember(tx, { id: memberId, organizationId })
+    deleteOrgMember(tx, member, newKeys)
   );
   if (!result) {
     throw new Error("Failed to delete organization member");
   }
+  recordMemberRemovalCredentials(result.credentials, SYSTEM_ACTOR);
+}
+
+/** The member a role change event names: their membership and email. */
+function findAuditMember(userId: string, organizationId: string) {
+  return prisma.orgMember.findFirst({
+    where: { userId, organizationId },
+    select: { id: true, user: { select: { email: true } } },
+  });
+}
+
+/**
+ * Whether the user was still a member when their role was written, read right after the write and
+ * before the change returns, so a removal after the change can't drop its event. The RBAC plugin
+ * writes a role for a user who isn't a member, so a removal between the member read and the write
+ * would otherwise record a change to a membership that no longer exists.
+ *
+ * Best-effort: if this read fails, the change is recorded anyway, since the write succeeded and the
+ * member read before it saw a member.
+ *
+ * TODO: https://linear.app/triggerdotdev/issue/TRI-16185 makes `setUserRole` refuse a non-member in
+ * its own transaction. Then the write's result (`result.ok`) replaces this inline read, and the
+ * member lookup after a failed member read can go too.
+ */
+async function wasMemberAtWrite(userId: string, organizationId: string): Promise<boolean> {
+  const [error, member] = await tryCatch(
+    prisma.orgMember.findFirst({ where: { userId, organizationId }, select: { id: true } })
+  );
+  if (error) {
+    logger.warn("setOrgMemberRole: failed to check the member after the change", {
+      userId,
+      organizationId,
+      error,
+    });
+    return true;
+  }
+  return member !== null;
+}
+
+/**
+ * Sets a member's org-wide role and records `member.role_changed`. The RBAC plugin commits the
+ * change in its own transaction and retries it on serialization failures, so the event is recorded
+ * after the call returns: once per change however many attempts it took, and never for a change
+ * that failed. Setting the role a member already has, or a role for a user who isn't a member,
+ * records nothing. While recording is off, it reads nothing for the event.
+ *
+ * "after" is the role this call wrote. "before" is read before the write, outside the plugin's
+ * transaction, so it is best-effort: a concurrent change between the read and the write can make it
+ * stale, or skip the event when the stale role equals the new one. The proper fix (the plugin
+ * returning the previous role from its transaction) is
+ * https://linear.app/triggerdotdev/issue/TRI-16184. The member is read before the write too, so the
+ * event can name them after a later removal. Whether they were still a member at the write is
+ * checked right after it, before this returns (see `wasMemberAtWrite`). Auditing never blocks the
+ * role change: a failed read is logged and the change goes ahead.
+ *
+ * `attribution` is for callers with no user behind them, such as the directory sync worker.
+ */
+export async function setOrgMemberRole(
+  params: { userId: string; organizationId: string; roleId: string },
+  attribution?: MemberAuditAttribution
+): Promise<RoleAssignmentResult> {
+  const result = await writeOrgMemberRole(params, attribution);
+  if (result.ok) {
+    await enqueueAttioMemberSync({ organizationId: params.organizationId, userId: params.userId });
+  }
+  return result;
+}
+
+async function writeOrgMemberRole(
+  params: { userId: string; organizationId: string; roleId: string },
+  attribution?: MemberAuditAttribution
+): Promise<RoleAssignmentResult> {
+  const { userId, organizationId, roleId } = params;
+
+  if (!auditLogs.isRecordingEnabled()) {
+    return rbac.setUserRole({ userId, organizationId, roleId });
+  }
+
+  // Both reads run together, so the change waits for one round trip, not two. The role is read even
+  // for a user who turns out not to be a member, where it goes unused.
+  const [[memberReadError, memberBeforeWrite], [roleBeforeError, roleBefore]] = await Promise.all([
+    // Read before the write, so a later removal can't leave the event with nobody to name. If this
+    // read fails, the member is looked up after the write instead.
+    tryCatch(findAuditMember(userId, organizationId)),
+    // If this read fails, the change is recorded with an unknown "before".
+    tryCatch(rbac.getUserRole({ userId, organizationId })),
+  ]);
+  if (memberReadError) {
+    logger.warn("setOrgMemberRole: failed to read the member before the change", {
+      userId,
+      organizationId,
+      error: memberReadError,
+    });
+  } else if (!memberBeforeWrite) {
+    // Not a member: the plugin still writes the role, but there's no membership change to record.
+    return rbac.setUserRole({ userId, organizationId, roleId });
+  }
+
+  if (roleBeforeError) {
+    logger.warn("setOrgMemberRole: failed to read the role before the change", {
+      userId,
+      organizationId,
+      error: roleBeforeError,
+    });
+  }
+
+  const result = await rbac.setUserRole({ userId, organizationId, roleId });
+  if (!result.ok || (!roleBeforeError && roleBefore?.id === roleId)) {
+    return result;
+  }
+
+  // Removed between the member read and the write: there's no membership change to record.
+  if (memberBeforeWrite && !(await wasMemberAtWrite(userId, organizationId))) {
+    return result;
+  }
+
+  // The role has changed. The reads below run after this returns, so they never delay the change;
+  // a missing role name is recorded as null.
+  recordMemberAuditEventInBackground(
+    async () => {
+      let member = memberBeforeWrite;
+      if (!member) {
+        // The read before the write failed. Nobody now: there's no membership to record.
+        member = await findAuditMember(userId, organizationId);
+        if (!member) return null;
+      }
+      return {
+        category: "members",
+        action: "member.role_changed",
+        organizationId,
+        target: memberAuditTarget(member),
+        changes: {
+          role: {
+            before: roleBefore?.name ?? null,
+            after: await auditRoleName(organizationId, roleId),
+          },
+        },
+        ...attribution,
+      };
+    },
+    { action: "member.role_changed", organizationId }
+  );
+  return result;
 }
 
 export type EnsureOrgMemberParams = {
@@ -27,6 +189,13 @@ export type EnsureOrgMemberParams = {
   roleId: string | null;
   source: MembershipSource;
 };
+
+export class OrganizationNotAcceptingMembersError extends Error {
+  constructor() {
+    super("This organization is not accepting new members.");
+    this.name = "OrganizationNotAcceptingMembersError";
+  }
+}
 
 export type EnsureOrgMemberResult = {
   created: boolean;
@@ -41,6 +210,7 @@ export type EnsureOrgMemberResult = {
 // in the gap left by an interrupted provision (see `ensureOrgMember`). Always
 // best-effort: a valid membership already exists, so a failure here is logged
 // and swallowed rather than thrown.
+// Not audited: it repairs a half-provisioned row rather than changing anyone's access.
 async function healMissingRoleAssignment(params: {
   userId: string;
   organizationId: string;
@@ -53,7 +223,9 @@ async function healMissingRoleAssignment(params: {
   if (currentRole !== null) return;
 
   const result = await rbac.setUserRole({ userId, organizationId, roleId });
-  if (!result.ok) {
+  if (result.ok) {
+    await enqueueAttioMemberSync({ organizationId, userId });
+  } else {
     logger.warn("ensureOrgMember.setUserRole failed while healing unassigned membership", {
       source,
       userId,
@@ -73,8 +245,13 @@ async function healMissingRoleAssignment(params: {
 // OrgMember insert in the codebase does its own seat check before
 // calling in. This helper deliberately does none (SSO JIT and
 // invite-accept are exempt by policy).
+//
+// A new membership records `member.added` once its role is applied; an existing one, a lost
+// create race or a rolled-back create records nothing. `attribution` is for callers the request
+// context can't describe: the directory sync worker and SSO sign-in.
 export async function ensureOrgMember(
-  params: EnsureOrgMemberParams
+  params: EnsureOrgMemberParams,
+  attribution?: MemberAuditAttribution
 ): Promise<EnsureOrgMemberResult> {
   const { userId, organizationId, roleId, source } = params;
 
@@ -107,19 +284,24 @@ export async function ensureOrgMember(
     return { created: false, orgMemberId: existing.id, devEnvironmentsQueued: enqueued };
   }
 
+  if (!(await isOrganizationJoinAllowed({ organizationId }))) {
+    throw new OrganizationNotAcceptingMembersError();
+  }
+
   // Two concurrent JIT/invite flows can both miss the findFirst above and
   // race to create the same (userId, organizationId) row; the unique
   // constraint makes one lose with P2002. Treat that as the idempotent
   // "already a member" case rather than letting it break sign-in.
-  let member: { id: string };
+  let member: { id: string; user: { email: string } };
   try {
     member = await prisma.orgMember.create({
       data: {
         userId,
         organizationId,
         role: "MEMBER",
+        joinMethod: source satisfies OrgMemberJoinMethod,
       },
-      select: { id: true },
+      select: { id: true, user: { select: { email: true } } },
     });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
@@ -165,6 +347,34 @@ export async function ensureOrgMember(
     }
   }
 
+  const addedMember = member;
+  if (roleId !== null) {
+    recordMemberAuditEventInBackground(
+      async () => ({
+        category: "members",
+        action: "member.added",
+        organizationId,
+        target: memberAuditTarget(addedMember),
+        changes: { role: await auditRoleName(organizationId, roleId) },
+        ...attribution,
+      }),
+      { action: "member.added", organizationId }
+    );
+  } else {
+    auditLogs.record({
+      category: "members",
+      action: "member.added",
+      organizationId,
+      target: memberAuditTarget(member),
+      // Null role: the legacy MEMBER placeholder, whose effective role is the RBAC plugin's call.
+      changes: null,
+      ...attribution,
+    });
+  }
+
+  // Only once the role has applied: a failed role rolls the membership back above.
+  await enqueueAttioMemberSync({ organizationId, userId });
+
   const { enqueued } = await enqueueMemberDevelopmentEnvironments({
     userId,
     organizationId,
@@ -174,52 +384,21 @@ export async function ensureOrgMember(
   return { created: true, orgMemberId: member.id, devEnvironmentsQueued: enqueued };
 }
 
-// Find-or-create a User for a directory-provisioned member. Directory Sync
-// can provision a user before they have ever logged in, so the User row may
-// not exist yet. Email is the natural key (lowercased). New rows are marked
-// SSO since the user will authenticate via the org's IdP.
+// Directory Sync can provision a user before they have ever logged in, so
+// the User row may not exist yet.
 export async function ensureUserForDirectory(params: {
   email: string;
   firstName: string | null;
   lastName: string | null;
 }): Promise<{ userId: string }> {
-  const email = params.email.toLowerCase().trim();
-  const existing = await prisma.user.findFirst({ where: { email }, select: { id: true } });
-  if (existing) return { userId: existing.id };
-
-  const name = [params.firstName, params.lastName].filter(Boolean).join(" ").trim() || null;
-  // `User.email` is unique, so two concurrent directory events for the same
-  // email can both miss the lookup above and race on create; the loser gets
-  // P2002. Treat that as the idempotent "already exists" case (same pattern as
-  // `ensureOrgMember`) rather than throwing and burning a webhook retry.
-  try {
-    const created = await prisma.user.create({
-      data: {
-        email,
-        authenticationMethod: "SSO",
-        name,
-        displayName: name,
-      },
-      select: { id: true },
-    });
-    return { userId: created.id };
-  } catch (error) {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      const existingAfterConflict = await prisma.user.findFirst({
-        where: { email },
-        select: { id: true },
-      });
-      if (existingAfterConflict) return { userId: existingAfterConflict.id };
-    }
-    throw error;
-  }
+  return findOrCreateDirectoryUser(prisma, params);
 }
 
 // Whether the user holds the Owner system role in this org. Owner is the one
 // role Directory Sync must never strip (it can't be auto-granted and is the
 // org's recovery anchor), so deprovision is guarded against removing the last
 // one. Identified by the RBAC system role; OSS-safe (no plugin → not Owner).
-function isOwnerRole(role: { name: string; isSystem: boolean } | null): boolean {
+export function isOwnerRole(role: { name: string; isSystem: boolean } | null): boolean {
   return !!role && role.isSystem && role.name === "Owner";
 }
 
@@ -232,15 +411,18 @@ export type RemoveOrgMemberForDirectoryResult =
 // the user's personal access tokens ONLY when this was their last org (PATs
 // are user-global, so revoking on a single-org removal would break their CLI
 // access to other orgs). Refuses to remove the org's last Owner.
-export async function removeOrgMemberForDirectory(params: {
-  userId: string;
-  organizationId: string;
-}): Promise<RemoveOrgMemberForDirectoryResult> {
+export async function removeOrgMemberForDirectory(
+  params: {
+    userId: string;
+    organizationId: string;
+  },
+  attribution?: MemberAuditAttribution
+): Promise<RemoveOrgMemberForDirectoryResult> {
   const { userId, organizationId } = params;
 
   const member = await prisma.orgMember.findFirst({
     where: { userId, organizationId },
-    select: { id: true },
+    select: { id: true, user: { select: { email: true } } },
   });
   if (!member) return { removed: false, reason: "not_a_member" };
 
@@ -268,6 +450,14 @@ export async function removeOrgMemberForDirectory(params: {
   }
 
   await deleteMembership(member.id, organizationId);
+  await enqueueAttioMemberSync({ organizationId, userId });
+  auditLogs.record({
+    category: "members",
+    action: "member.removed",
+    organizationId,
+    target: memberAuditTarget(member),
+    ...attribution,
+  });
   const removeRole = await rbac.removeUserRole({ userId, organizationId });
   if (!removeRole.ok) {
     logger.warn("removeOrgMemberForDirectory: failed to remove RBAC role", {
@@ -304,7 +494,10 @@ export async function removeOrgMemberForDirectory(params: {
       const tokens = await getValidPersonalAccessTokens(userId);
       for (const token of tokens) {
         try {
-          await revokePersonalAccessToken(token.id, userId);
+          await revokePersonalAccessToken(token.id, userId, {
+            reason: "member_removed",
+            revokedBy: SYSTEM_ACTOR,
+          });
         } catch (error) {
           logger.warn("removeOrgMemberForDirectory: failed to revoke PAT", {
             userId,

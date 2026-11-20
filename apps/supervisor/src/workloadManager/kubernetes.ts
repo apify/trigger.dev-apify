@@ -18,10 +18,12 @@ import {
   nodetypeNodeSelector,
   runPodTolerations,
   runnerSecurityContext,
+  withReservedSourcePorts,
   withRunnerSeccompProfile,
   withNodeSelector,
 } from "./kubernetesPodSpec.js";
 import { rewriteImageRegistry } from "./imageRegistry.js";
+import { k8sCreateRefused, k8sErrorMessage, WorkloadNotCreatedError } from "./createErrors.js";
 
 type ResourceQuantities = {
   [K in "cpu" | "memory" | "ephemeral-storage"]?: string;
@@ -137,12 +139,15 @@ export class KubernetesWorkloadManager implements WorkloadManager {
           );
         }
       }
-      const podSpec = withRunnerSeccompProfile(basePodSpec, {
-        profilePath: env.KUBERNETES_RUNNER_SECCOMP_PROFILE_PATH,
-        runtimes: env.KUBERNETES_RUNNER_SECCOMP_PROFILE_RUNTIMES,
-        runtime: opts.runtime,
-        checkpointsEnabled: this.opts.checkpointsEnabled,
-      });
+      const podSpec = withReservedSourcePorts(
+        withRunnerSeccompProfile(basePodSpec, {
+          profilePath: env.KUBERNETES_RUNNER_SECCOMP_PROFILE_PATH,
+          runtimes: env.KUBERNETES_RUNNER_SECCOMP_PROFILE_RUNTIMES,
+          runtime: opts.runtime,
+          checkpointsEnabled: this.opts.checkpointsEnabled,
+        }),
+        env.KUBERNETES_POD_RESERVED_SOURCE_PORTS
+      );
 
       await this.k8s.core.createNamespacedPod({
         namespace: this.namespace,
@@ -328,6 +333,11 @@ export class KubernetesWorkloadManager implements WorkloadManager {
 
   #handleK8sError(err: unknown) {
     this.#throwUnlessRecord(err);
+
+    if (this.opts.releaseUnstartedRuns && k8sCreateRefused(err)) {
+      this.logger.error("[KubernetesWorkloadManager] Create refused", { rawError: err.body });
+      throw new WorkloadNotCreatedError(k8sErrorMessage(err), { cause: err });
+    }
 
     if ("body" in err && err.body) {
       this.logger.error("[KubernetesWorkloadManager] Create failed", { rawError: err.body });

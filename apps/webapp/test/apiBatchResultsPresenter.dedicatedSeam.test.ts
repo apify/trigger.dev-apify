@@ -7,6 +7,7 @@ import { heteroRunOpsPostgresTest, makeNShardRunOpsPostgresTest } from "@interna
 import type { RunOpsPrismaClient } from "@internal/run-ops-database";
 import type { PrismaClient } from "@trigger.dev/database";
 import { generateRunOpsId, generateRunOpsIdV2 } from "@trigger.dev/core/v3/isomorphic";
+import { PostgresRunStore } from "@internal/run-store";
 import { describe, expect, vi } from "vitest";
 import type { PrismaReplicaClient } from "~/db.server";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
@@ -74,6 +75,8 @@ type MemberSeed = {
   status: "COMPLETED_SUCCESSFULLY" | "COMPLETED_WITH_ERRORS";
   output?: string;
   error?: unknown;
+  /** Run-engine shape: result on the TaskRun row, no TaskRunAttempt row. */
+  noAttempt?: boolean;
 };
 
 // Drop the TaskRunAttempt worker/queue FKs so attempts can be seeded without standing up
@@ -155,8 +158,11 @@ async function seedNewMember(
       isTest: false,
       taskEventStore: "taskEvent",
       depth: 0,
+      ...(m.noAttempt ? { output: m.output, error: m.error as any } : {}),
     },
   });
+
+  if (m.noAttempt) return;
 
   await prisma17.taskRunAttempt.create({
     data: {
@@ -475,4 +481,79 @@ describe("ApiBatchResultsPresenter split mode — real run-ops dedicated schema 
     },
     180_000
   );
+
+  // A gen-2 BATCH id is minted onto its shard, so the batch row (not just its members) lives
+  // only there. Both read paths must route the row by its own id; before this, the gen-1
+  // probes missed and the endpoint 404'd for a batch that `batch.retrieve` found. The batch is
+  // seeded in the run-engine shape (members in `runIds`, no item rows, results on the run rows
+  // with no attempt rows), which the presenter used to answer with an empty list.
+  for (const splitEnabled of [true, false]) {
+    oneShardTest(
+      `a gen-2 batch whose row lives only on its shard returns its members (split ${
+        splitEnabled ? "on" : "off"
+      })`,
+      async ({ legacyPrisma, newPrisma, shardPrismas }) => {
+        const shardPrisma = shardPrismas[0]!;
+        const ctx = await seedLegacyEnv(legacyPrisma, `gen2-batch-row-${splitEnabled}`);
+
+        const memberIds = [generateRunOpsIdV2("a"), generateRunOpsIdV2("a")];
+        for (const [i, id] of memberIds.entries()) {
+          await seedNewMember(
+            shardPrisma,
+            { envId: ctx.environment.id, orgId: ctx.organization.id, projectId: ctx.project.id },
+            {
+              id,
+              // Real shape: the friendly id carries the internal id, so it routes to the shard too.
+              friendlyId: `run_${id}`,
+              status: "COMPLETED_SUCCESSFULLY",
+              output: JSON.stringify({ i }),
+              noAttempt: true,
+            }
+          );
+        }
+
+        // Run-engine shape: no item rows, members are the run friendly ids in `runIds`, in order.
+        const batchFriendlyId = `batch_${generateRunOpsIdV2("a")}`;
+        await shardPrisma.batchTaskRun.create({
+          data: {
+            friendlyId: batchFriendlyId,
+            runtimeEnvironmentId: ctx.environment.id,
+            runCount: memberIds.length,
+            runIds: memberIds.map((id) => `run_${id}`),
+            batchVersion: "runengine:v2",
+          },
+        });
+
+        const shardReplicas = new Map([["a", shardPrisma as unknown as PrismaReplicaClient]]);
+        const presenter = splitEnabled
+          ? new ApiBatchResultsPresenter(throwingPrisma, throwingPrisma, {
+              splitEnabled: true,
+              newClient: newPrisma as unknown as PrismaReplicaClient,
+              legacyReplica: legacyPrisma as unknown as PrismaReplicaClient,
+              shardReplicas,
+            })
+          : // Passthrough hydrates members through the primary handle; the REPLICA (where the row
+            // is read without the fix) is the gen-1 store, which does not hold this batch.
+            new ApiBatchResultsPresenter(
+              shardPrisma as unknown as PrismaReplicaClient,
+              newPrisma as unknown as PrismaReplicaClient,
+              { splitEnabled: false, shardReplicas },
+              new PostgresRunStore({
+                prisma: shardPrisma as any,
+                readOnlyPrisma: shardPrisma as any,
+              })
+            );
+
+        const result = await presenter.call(batchFriendlyId, env(ctx));
+
+        expect(result).toBeDefined();
+        expect(result!.id).toBe(batchFriendlyId);
+        expect(result!.items.map((item) => (item as { output?: string }).output)).toEqual([
+          JSON.stringify({ i: 0 }),
+          JSON.stringify({ i: 1 }),
+        ]);
+      },
+      180_000
+    );
+  }
 });

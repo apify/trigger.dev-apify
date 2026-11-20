@@ -1,13 +1,23 @@
 import { json } from "@remix-run/server-runtime";
 import { type WaitForWaitpointTokenResponseBody } from "@trigger.dev/core/v3";
-import { RunId, WaitpointId } from "@trigger.dev/core/v3/isomorphic";
+import { parseWaitpointId, RunId, WaitpointId } from "@trigger.dev/core/v3/isomorphic";
 import { z } from "zod";
 import { prisma, type PrismaReplicaClient } from "~/db.server";
 import { resolveWaitpointThroughReadThrough } from "~/runEngine/concerns/resolveWaitpointThroughReadThrough.server";
 import { logger } from "~/services/logger.server";
-import { createActionApiRoute } from "~/services/routeBuilders/apiBuilder.server";
+import {
+  createActionApiRoute,
+  scopeAuthorizationError,
+} from "~/services/routeBuilders/apiBuilder.server";
 import { engine } from "~/v3/runEngine.server";
 import { runStore } from "~/v3/runStore.server";
+import { globalFlagsRegistry } from "~/v3/globalFlagsRegistry.server";
+import { createWaitpointStoreEnabledResolver } from "~/v3/utils/waitpointStoreEnabled.server";
+
+const waitpointStoreEnabled = createWaitpointStoreEnabledResolver(
+  () => globalFlagsRegistry.current(),
+  prisma
+);
 
 const { action } = createActionApiRoute(
   {
@@ -17,8 +27,17 @@ const { action } = createActionApiRoute(
     }),
     maxContentLength: 1024 * 10, // 10KB
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: (params) => ({ type: "runs", id: params.runFriendlyId }),
+    },
   },
-  async ({ authentication, params }) => {
+  async ({ authentication, params, ability }) => {
+    const waitpointResource = { type: "waitpoints", id: params.waitpointFriendlyId };
+    if (!ability.can("read", waitpointResource)) {
+      return json({ error: scopeAuthorizationError("read", waitpointResource) }, { status: 403 });
+    }
+
     // Resume tokens are actually just waitpoints
     const waitpointId = WaitpointId.toId(params.waitpointFriendlyId);
     const runId = RunId.toId(params.runFriendlyId);
@@ -37,18 +56,35 @@ const { action } = createActionApiRoute(
         throw new Response("You don't have permissions for this run", { status: 401 });
       }
 
-      const waitpoint = await resolveWaitpointThroughReadThrough({
-        waitpointId,
-        environmentId: authentication.environment.id,
-        read: (client: PrismaReplicaClient) =>
-          client.waitpoint.findFirst({
-            // runops-routed-ok: resolveWaitpointThroughReadThrough legacy leg
-            where: {
-              id: waitpointId,
-              environmentId: authentication.environment.id,
-            },
-          }),
-      });
+      const parsed = (await waitpointStoreEnabled(authentication.environment.organization.id))
+        ? parseWaitpointId(waitpointId)
+        : undefined;
+      const storeDateTime =
+        parsed !== undefined &&
+        parsed.format !== "legacy" &&
+        (parsed.type === "DATETIME" || parsed.type === "MANUAL");
+      let waitpoint;
+      if (storeDateTime) {
+        waitpoint = await engine.getStoreDateTimeWaitpoint({
+          waitpointId,
+          environmentId: authentication.environment.id,
+          projectId: authentication.environment.project.id,
+          organizationId: authentication.environment.organization.id,
+        });
+      } else {
+        waitpoint = await resolveWaitpointThroughReadThrough({
+          waitpointId,
+          environmentId: authentication.environment.id,
+          read: (client: PrismaReplicaClient) =>
+            // runops-exception(legacy-teardown): wait-for-token legacy read, removed with the legacy database
+            client.waitpoint.findFirst({
+              where: {
+                id: waitpointId,
+                environmentId: authentication.environment.id,
+              },
+            }),
+        });
+      }
 
       if (!waitpoint) {
         // Retryable: a miss here can be replica lag. resolveWaitpointThroughReadThrough
@@ -61,11 +97,21 @@ const { action } = createActionApiRoute(
         );
       }
 
+      const blockOperation = storeDateTime
+        ? await engine.waitpointSystem.buildStoreBlockOperation({
+            runId: run.id,
+            waitpointId,
+            organizationId: authentication.environment.organization.id,
+          })
+        : undefined;
       const _result = await engine.blockRunWithWaitpoint({
         runId: run.id,
         waitpoints: [waitpointId],
         projectId: authentication.environment.project.id,
         organizationId: authentication.environment.organization.id,
+        ...(storeDateTime
+          ? { blockOperation, expectedEnvironmentId: authentication.environment.id }
+          : {}),
       });
 
       return json<WaitForWaitpointTokenResponseBody>(

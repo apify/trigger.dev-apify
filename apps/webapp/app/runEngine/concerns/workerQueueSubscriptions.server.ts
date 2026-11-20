@@ -1,11 +1,13 @@
 import {
   formatWorkerQueue,
+  legacyScheduledWorkerQueue,
+  parseWorkerQueue,
   WORKER_QUEUE_VERSION,
   WorkerQueueSubscriptions,
   type WeightedWorkerQueueSubscription,
   type WorkerQueueSubscription,
 } from "@trigger.dev/core/v3/workers";
-import type { WorkloadType } from "@trigger.dev/database";
+import type { WorkerInstanceGroupType, WorkloadType } from "@trigger.dev/database";
 import { z } from "zod";
 import { ServiceValidationError } from "~/v3/services/common.server";
 import { baseWorkerQueue } from "./workerQueueSplit.server";
@@ -26,13 +28,20 @@ export const WorkerQueueSubscriptionPolicyEnv = z
 export type WorkerQueueConsumerOptions = {
   workerGroupId: string;
   workerInstanceId: string;
+  /** An UNMANAGED group consumes only its own legacy queues, whatever its allowlist says. */
+  type: WorkerInstanceGroupType;
   masterQueue: string;
   region: string | null;
   workloadType: WorkloadType;
   allowedSubscriptions: WorkerQueueSubscription[];
+  /** The group carries container and compute consumers side by side. */
+  mixedRuntime?: boolean;
 };
 
-export type WorkerQueueConsumer = Omit<WorkerQueueConsumerOptions, "allowedSubscriptions"> & {
+export type WorkerQueueConsumer = Omit<
+  WorkerQueueConsumerOptions,
+  "allowedSubscriptions" | "mixedRuntime"
+> & {
   allowedQueues: Map<string, string | undefined>;
 };
 
@@ -41,7 +50,7 @@ export type ResolvedWorkerQueueSubscription = {
   weight: number;
 };
 
-function subscriptionKey({
+export function subscriptionKey({
   class: queueClass,
   phase,
   compat,
@@ -50,29 +59,44 @@ function subscriptionKey({
   return `${queueClass}:${phase}:${compat}:${channel}`;
 }
 
-export function createWorkerQueueConsumer({
+/**
+ * A compute runner given a container lane would take runs that have no template. A MICROVM group's
+ * consumers are compute unless the group is marked mixed, so its container lanes are refused.
+ */
+export function refusedSubscriptions({
   allowedSubscriptions,
-  ...worker
-}: WorkerQueueConsumerOptions): WorkerQueueConsumer {
+  workloadType,
+  mixedRuntime,
+}: WorkerQueueConsumerOptions): WorkerQueueSubscription[] {
+  if (workloadType !== "MICROVM" || mixedRuntime) return [];
+  return allowedSubscriptions.filter((subscription) => subscription.compat === "container");
+}
+
+export function createWorkerQueueConsumer(
+  options: WorkerQueueConsumerOptions
+): WorkerQueueConsumer {
+  const { allowedSubscriptions, mixedRuntime: _, ...worker } = options;
+  const refused = new Set(refusedSubscriptions(options));
   const allowedQueues = new Map<string, string | undefined>(
-    allowedSubscriptions.map((subscription) => [subscriptionKey(subscription), undefined])
+    allowedSubscriptions
+      .filter((subscription) => !refused.has(subscription))
+      .map((subscription) => [subscriptionKey(subscription), undefined])
   );
   return { ...worker, allowedQueues };
 }
 
+// The group's allowlist, less any lanes refusedSubscriptions drops, is the whole gate: a region's
+// group can carry container and compute cells side by side, each consuming the lanes its own runtime
+// serves, so the group's workloadType says nothing about which compat a given consumer may take.
 export function resolveWorkerQueueSubscriptions(
   worker: WorkerQueueConsumer,
   subscriptions: WeightedWorkerQueueSubscription[]
 ): ResolvedWorkerQueueSubscription[] {
-  const runtime = worker.workloadType === "MICROVM" ? "compute" : "container";
   const workerQueues = new Map<string, ResolvedWorkerQueueSubscription>();
 
   for (const subscription of subscriptions) {
     const key = subscriptionKey(subscription);
-    if (
-      !worker.allowedQueues.has(key) ||
-      (subscription.compat !== "any" && subscription.compat !== runtime)
-    ) {
+    if (worker.type === "UNMANAGED" || !worker.allowedQueues.has(key)) {
       throw new ServiceValidationError(
         `Worker group ${worker.workerGroupId} is not authorized to consume ${key}`,
         403
@@ -97,4 +121,29 @@ export function resolveWorkerQueueSubscriptions(
   }
 
   return [...workerQueues.values()];
+}
+
+/**
+ * Whether the worker's group serves `workerQueue`: the group's own legacy queue of either class,
+ * or a v2 queue in its region that its allowed subscriptions cover.
+ */
+export function workerServesQueue(worker: WorkerQueueConsumer, workerQueue: string): boolean {
+  if (
+    workerQueue === worker.masterQueue ||
+    workerQueue === legacyScheduledWorkerQueue(worker.masterQueue)
+  ) {
+    return true;
+  }
+  let parsed;
+  try {
+    parsed = parseWorkerQueue(workerQueue);
+  } catch {
+    return false;
+  }
+  return (
+    worker.type !== "UNMANAGED" &&
+    parsed.version === WORKER_QUEUE_VERSION &&
+    parsed.region === (worker.region ?? baseWorkerQueue(worker.masterQueue)) &&
+    worker.allowedQueues.has(subscriptionKey(parsed))
+  );
 }

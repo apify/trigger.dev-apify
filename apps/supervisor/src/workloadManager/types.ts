@@ -18,6 +18,8 @@ export interface WorkloadManagerOptions {
   dockerAutoremove?: boolean;
   // Whether CRIU checkpoint/restore is enabled for this deployment
   checkpointsEnabled?: boolean;
+  /** Report a create that left nothing running as WorkloadNotCreatedError, so its run is released. */
+  releaseUnstartedRuns?: boolean;
 }
 
 export interface WorkloadManager {
@@ -26,6 +28,8 @@ export interface WorkloadManager {
 
 export interface WorkloadManagerCreateOptions {
   image: string;
+  // A prebuilt template of the image, as the deployment recorded it; unvalidated.
+  templateKey?: string;
   machine: MachinePreset;
   version: string;
   nextAttemptNumber?: number;

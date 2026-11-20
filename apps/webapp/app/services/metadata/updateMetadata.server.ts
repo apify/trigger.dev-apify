@@ -12,28 +12,127 @@ import {
   MetadataTooLargeError,
 } from "~/utils/packets";
 import { ServiceValidationError } from "~/v3/services/common.server";
-import { Effect, Schedule, Duration, Fiber } from "effect";
+import { Cause, Effect, Either, Option, Schedule, Duration, Fiber } from "effect";
 import { type RuntimeFiber } from "effect/Fiber";
 import { setTimeout } from "timers/promises";
 import type { LogLevel } from "@trigger.dev/core/logger";
 import { Logger } from "@trigger.dev/core/logger";
 import type { RunStore } from "@internal/run-store";
+import type { RbacAbility } from "@trigger.dev/plugins";
+import { authorizeMetadataTargets } from "./metadataAuthorization.server";
+import { getMeter, type Counter, type Meter } from "@internal/tracing";
+import {
+  InMemoryMetadataOperationBuffer,
+  MetadataBufferFullError,
+  type BufferedRunMetadataChangeOperation,
+  type MetadataBufferClaim,
+  type MetadataOperationBuffer,
+} from "./operationBuffer.server";
 
 const RUN_UPDATABLE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
-type BufferedRunMetadataChangeOperation = {
-  runId: string;
-  timestamp: number;
-  operation: RunMetadataChangeOperation;
-};
+const MAX_DRAIN_BATCHES_PER_TICK = 100;
+const MAX_DROPS_LOGGED = 20;
+const MAX_LOGGED_CHARS = 200;
+
+class MetadataClaimLostError extends Error {
+  constructor(runId: string) {
+    super(`Lost the buffer claim for run ${runId}`);
+  }
+}
+
+class MetadataWriteNotSentError extends Error {
+  constructor(runId: string, cause: unknown) {
+    super(`Metadata write for run ${runId} never reached the database`, { cause });
+  }
+}
+
+class MetadataWriteOutcomeUnknownError extends Error {
+  constructor(runId: string, cause: unknown) {
+    super(`Metadata write for run ${runId} failed with an unknown outcome`, { cause });
+  }
+}
+
+type DroppedOperation = { operation: RunMetadataChangeOperation; error: unknown };
+
+// A dropped operation may not be well formed.
+function loggedKey(operation: RunMetadataChangeOperation): string | undefined {
+  const key = (operation as { key?: unknown }).key;
+  return typeof key === "string" ? key.slice(0, MAX_LOGGED_CHARS) : undefined;
+}
+
+function applyOrSalvage(
+  metadata: Record<string, unknown>,
+  operations: RunMetadataChangeOperation[],
+  budgetMs: number
+): { newMetadata: Record<string, unknown>; applied: number; dropped: DroppedOperation[] } {
+  let newMetadata = metadata;
+  let applied = 0;
+  let deadline: number | undefined;
+  const dropped: DroppedOperation[] = [];
+  const apply = (segment: RunMetadataChangeOperation[]): void => {
+    try {
+      // Copies: a value enters the metadata by reference, so a failed attempt may have mutated it.
+      const result = applyMetadataOperations(newMetadata, structuredClone(segment));
+      newMetadata = result.newMetadata;
+      applied += segment.length - result.unappliedOperations.length;
+    } catch (error) {
+      deadline ??= performance.now() + budgetMs;
+      if (segment.length <= 1 || performance.now() >= deadline) {
+        dropped.push(...segment.map((operation) => ({ operation, error })));
+        return;
+      }
+      const half = Math.ceil(segment.length / 2);
+      apply(segment.slice(0, half));
+      apply(segment.slice(half));
+    }
+  };
+  apply(operations);
+  return { newMetadata, applied, dropped };
+}
+
+function isClaimLost(error: unknown): boolean {
+  return error instanceof MetadataClaimLostError;
+}
+
+function isWriteOutcomeUnknown(error: unknown): boolean {
+  return error instanceof MetadataWriteOutcomeUnknownError;
+}
+
+function isWriteNotSent(error: unknown): boolean {
+  return error instanceof MetadataWriteNotSentError;
+}
+
+/**
+ * True when the query never reached the database (pool exhaustion or engine initialization), so it
+ * cannot have committed. A dropped connection (P1001, P1017) can follow a commit, so it is not here.
+ */
+function writeNeverReachedDatabase(error: unknown): boolean {
+  const { name, code, message } = (error ?? {}) as {
+    name?: unknown;
+    code?: unknown;
+    message?: unknown;
+  };
+  if (name === "PrismaClientInitializationError") return true;
+  if (code === "P2024") return true;
+  return typeof message === "string" && /timed out fetching a new connection/i.test(message);
+}
 
 export type UpdateMetadataServiceOptions = {
   prisma: PrismaClientOrTransaction;
   runStore: RunStore;
+  /** Where buffered parent/root operations wait between flushes. Defaults to an in-process buffer. */
+  buffer?: MetadataOperationBuffer;
   flushIntervalMs?: number;
   flushEnabled?: boolean;
   flushLoggingEnabled?: boolean;
+  /** Runs claimed per drain batch. */
+  drainBatchSize?: number;
+  /** Retries of one run's flush before its operations go back to the buffer for a later tick. */
+  flushMaxRetries?: number;
   maximumSize?: number;
+  /** How long after a batch's first throw the flusher keeps splitting it; after that a failing segment is dropped whole. */
+  salvageBudgetMs?: number;
   logger?: Logger;
   logLevel?: LogLevel;
   /** Called after the batched flusher writes a run's buffered operations, with everything
@@ -46,30 +145,70 @@ export type UpdateMetadataServiceOptions = {
     batchId: string | null;
     updatedAtMs: number;
   }) => void;
+  meter?: Meter;
   // Testing hooks
   onBeforeUpdate?: (runId: string) => Promise<void>;
   onAfterRead?: (runId: string, metadataVersion: number) => Promise<void>;
 };
 
+type RequeueReason =
+  | "retries_exhausted"
+  | "unknown_outcome"
+  | "not_sent"
+  | "claim_lost"
+  | "read_failed";
+
+type DropReason = "apply_failed" | "too_large" | "run_missing" | "invalid_packet" | "defect";
+
 export class UpdateMetadataService {
-  private _bufferedOperations: Map<string, BufferedRunMetadataChangeOperation[]> = new Map();
+  private readonly _buffer: MetadataOperationBuffer;
   private _flushFiber: RuntimeFiber<void> | null = null;
   private readonly _prisma: PrismaClientOrTransaction;
   private readonly _runStore: RunStore;
   private readonly flushIntervalMs: number;
   private readonly flushEnabled: boolean;
   private readonly flushLoggingEnabled: boolean;
+  private readonly drainBatchSize: number;
+  private readonly flushMaxRetries: number;
   private readonly maximumSize: number;
+  private readonly salvageBudgetMs: number;
   private readonly logger: Logger;
+  private readonly requeueCounter: Counter;
+  private readonly dropCounter: Counter;
+  private runsPending: number | undefined;
 
   constructor(private readonly options: UpdateMetadataServiceOptions) {
     this._prisma = options.prisma;
     this._runStore = options.runStore;
+    this._buffer = options.buffer ?? new InMemoryMetadataOperationBuffer();
     this.flushIntervalMs = options.flushIntervalMs ?? 5000;
     this.flushEnabled = options.flushEnabled ?? true;
     this.flushLoggingEnabled = options.flushLoggingEnabled ?? true;
+    this.drainBatchSize = options.drainBatchSize ?? 10;
+    this.flushMaxRetries = options.flushMaxRetries ?? 5;
     this.maximumSize = options.maximumSize ?? 1024 * 1024 * 1; // 1MB
+    this.salvageBudgetMs = options.salvageBudgetMs ?? 50;
     this.logger = options.logger ?? new Logger("UpdateMetadataService", options.logLevel ?? "info");
+
+    const meter = options.meter ?? getMeter("metadata-flush");
+    this.requeueCounter = meter.createCounter("metadata.buffer.requeues", {
+      description:
+        "Runs whose buffered metadata operations were not written on this attempt, by reason",
+      unit: "runs",
+    });
+    this.dropCounter = meter.createCounter("metadata.buffer.drops", {
+      description: "Buffered metadata operations the flusher dropped, by reason",
+      unit: "operations",
+    });
+    meter
+      .createObservableGauge("metadata.buffer.runs_pending", {
+        description:
+          "Runs with buffered metadata operations after the last drain. With the redis backend every process reports the shared total.",
+        unit: "runs",
+      })
+      .addCallback((result) => {
+        if (this.runsPending !== undefined) result.observe(this.runsPending);
+      });
 
     this._startFlushing();
   }
@@ -90,27 +229,17 @@ export class UpdateMetadataService {
         // Wait for flushIntervalMs before flushing again
         yield* _(Effect.sleep(Duration.millis(this.flushIntervalMs)));
 
-        // Atomically get and clear current operations
-        const currentOperations = new Map(this._bufferedOperations);
-        this._bufferedOperations.clear();
-
-        yield* Effect.sync(() => {
-          if (this.flushLoggingEnabled && currentOperations.size > 0) {
-            const operationCount = Array.from(currentOperations.values()).reduce(
-              (sum, ops) => sum + ops.length,
-              0
-            );
-            this.logger.debug(`[UpdateMetadataService] Flushing operations`, {
-              runCount: currentOperations.size,
-              operationCount,
-            });
-          }
-        });
-
-        // If we have operations, process them
-        if (currentOperations.size > 0) {
-          yield* _(this._processBufferedOperations(currentOperations));
-        }
+        yield* _(
+          this._drainBufferedOperations().pipe(
+            Effect.catchAllCause((cause) =>
+              Effect.sync(() => {
+                this.logger.error("[UpdateMetadataService] Failed to drain buffered operations", {
+                  error: Cause.squash(cause),
+                });
+              })
+            )
+          )
+        );
       }
     }).pipe(
       // Handle any unexpected errors, ensuring program does not fail
@@ -131,69 +260,239 @@ export class UpdateMetadataService {
     }
   }
 
-  private _processBufferedOperations = (
-    operations: Map<string, BufferedRunMetadataChangeOperation[]>
-  ) => {
+  private _drainBufferedOperations = (includeNotYetDue = false) => {
     return Effect.gen(this, function* (_) {
-      for (const [runId, ops] of operations) {
-        // Process and cull operations
-        const processedOps = this._cullOperations(ops);
+      for (let i = 0; i < MAX_DRAIN_BATCHES_PER_TICK; i++) {
+        const claims = yield* _(
+          Effect.tryPromise(() => this._buffer.claimDue(this.drainBatchSize, { includeNotYetDue }))
+        );
 
-        // If there are no operations to process, skip
-        if (processedOps.length === 0) {
-          continue;
+        if (claims.length === 0) {
+          break;
         }
 
-        yield* Effect.sync(() => {
-          if (this.flushLoggingEnabled) {
-            this.logger.debug(`[UpdateMetadataService] Processing operations for run`, {
-              runId,
-              operationsCount: processedOps.length,
-            });
-          }
-        });
-
-        // Update run with retry
-        yield* _(
-          this._updateRunWithOperations(runId, processedOps).pipe(
-            // Catch MetadataTooLargeError before retry logic
-            Effect.catchIf(
-              (error) => error instanceof MetadataTooLargeError,
-              (error) =>
-                Effect.sync(() => {
-                  // Log the error but don't return operations to buffer
-                  console.error(
-                    `[UpdateMetadataService] Dropping operations for run ${runId} due to metadata size limit:`,
-                    error.message
-                  );
-                  if (this.flushLoggingEnabled) {
-                    this.logger.warn(`[UpdateMetadataService] Metadata too large for run`, {
-                      runId,
-                      operationsCount: processedOps.length,
-                      error: error.message,
-                    });
+        for (const claim of claims) {
+          yield* _(
+            this._processClaim(claim).pipe(
+              Effect.catchAllDefect((defect) => {
+                this.logger.error(
+                  "[UpdateMetadataService] Dropping a claim whose processing threw",
+                  {
+                    runId: claim.runId,
+                    error: defect,
                   }
-                })
-            ),
-            Effect.retry(Schedule.exponential(Duration.millis(100), 1.4)),
-            Effect.catchAll((error) =>
-              Effect.sync(() => {
-                // On complete failure, return ops to buffer
-                const existingOps = this._bufferedOperations.get(runId) ?? [];
-                this._bufferedOperations.set(runId, [...existingOps, ...ops]);
-                console.error(`Failed to process run ${runId}:`, error);
+                );
+                return this.#ackWithDrops(claim, "defect");
               })
             )
-          )
-        );
+          );
+        }
+
+        if (claims.length < this.drainBatchSize) {
+          break;
+        }
+      }
+
+      const pending = yield* _(Effect.tryPromise(() => this._buffer.size()).pipe(Effect.option));
+      if (Option.isSome(pending)) {
+        this.runsPending = pending.value;
       }
     });
   };
 
+  private _processClaim = (claim: MetadataBufferClaim) => {
+    return Effect.gen(this, function* (_) {
+      const runId = claim.runId;
+      const processedOps = this._cullOperations(claim.operations);
+
+      if (processedOps.length === 0) {
+        yield* _(this._ackClaim(claim));
+        return;
+      }
+
+      yield* Effect.sync(() => {
+        if (this.flushLoggingEnabled) {
+          this.logger.debug(`[UpdateMetadataService] Processing operations for run`, {
+            runId,
+            operationsCount: processedOps.length,
+          });
+        }
+      });
+
+      if (claim.pendingWrite) {
+        const pendingWrite = claim.pendingWrite;
+        const current = yield* _(
+          Effect.tryPromise(() =>
+            this._runStore.findRun(
+              { id: runId },
+              { select: { metadataVersion: true } },
+              this._prisma
+            )
+          ).pipe(Effect.either)
+        );
+
+        if (Either.isLeft(current)) {
+          this.#recordRequeue("read_failed");
+          yield* _(this._requeueClaim(claim, { keepPendingWrite: true }));
+          return;
+        }
+
+        if (!current.right) {
+          yield* _(this.#ackWithDrops(claim, "run_missing"));
+          return;
+        }
+
+        if (current.right.metadataVersion > pendingWrite.metadataVersion) {
+          yield* Effect.sync(() => {
+            this.logger.info(
+              `[UpdateMetadataService] Skipping operations already written for run`,
+              {
+                runId,
+                operationsCount: pendingWrite.count,
+                metadataVersion: pendingWrite.metadataVersion,
+              }
+            );
+          });
+          yield* _(this._ackClaim(claim, { count: pendingWrite.count }));
+          return;
+        }
+      }
+
+      const dropped: DroppedOperation[] = [];
+      yield* _(
+        this._updateRunWithOperations(claim, processedOps, dropped).pipe(
+          // Catch MetadataTooLargeError before retry logic
+          Effect.catchIf(
+            (error) => error instanceof MetadataTooLargeError,
+            (error) =>
+              Effect.sync(() => {
+                console.error(
+                  `[UpdateMetadataService] Dropping operations for run ${runId} due to metadata size limit:`,
+                  error.message
+                );
+                if (this.flushLoggingEnabled) {
+                  this.logger.warn(`[UpdateMetadataService] Metadata too large for run`, {
+                    runId,
+                    operationsCount: claim.operations.length,
+                    error: error.message,
+                  });
+                }
+                return "too_large" as const;
+              })
+          ),
+          Effect.retry({
+            schedule: Schedule.exponential(Duration.millis(100), 1.4).pipe(
+              Schedule.intersect(Schedule.recurs(this.flushMaxRetries))
+            ),
+            while: (error) =>
+              !isClaimLost(error) && !isWriteOutcomeUnknown(error) && !isWriteNotSent(error),
+          }),
+          Effect.matchEffect({
+            onSuccess: (wholeReason) => this.#ackWithDrops(claim, wholeReason, dropped),
+            onFailure: (error) =>
+              Effect.gen(this, function* (__) {
+                if (isClaimLost(error)) {
+                  yield* __(
+                    Effect.sync(() => {
+                      this.#recordRequeue("claim_lost");
+                      this.logger.warn(`[UpdateMetadataService] Lost the claim for run`, {
+                        runId,
+                      });
+                      this._buffer.abandon(claim);
+                    })
+                  );
+                  return;
+                }
+
+                yield* __(
+                  Effect.sync(() => {
+                    this.#recordRequeue(
+                      isWriteOutcomeUnknown(error)
+                        ? "unknown_outcome"
+                        : isWriteNotSent(error)
+                          ? "not_sent"
+                          : "retries_exhausted"
+                    );
+                    this.logger.warn(`[UpdateMetadataService] Requeueing operations for run`, {
+                      runId,
+                      operationsCount: claim.operations.length,
+                      error,
+                    });
+                  })
+                );
+                yield* __(
+                  this._requeueClaim(claim, {
+                    keepPendingWrite: isWriteOutcomeUnknown(error),
+                  })
+                );
+              }),
+          })
+        )
+      );
+    });
+  };
+
+  #recordRequeue(reason: RequeueReason) {
+    this.requeueCounter.add(1, { reason });
+  }
+
+  #recordDrop(reason: DropReason, count: number) {
+    this.dropCounter.add(count, { reason });
+  }
+
+  #ackWithDrops(
+    claim: MetadataBufferClaim,
+    wholeReason?: DropReason,
+    dropped: DroppedOperation[] = []
+  ) {
+    if (wholeReason) {
+      this.#recordDrop(wholeReason, claim.operations.length - dropped.length);
+    }
+    if (dropped.length > 0) {
+      this.#recordDrop("apply_failed", dropped.length);
+      this.logger.warn(`[UpdateMetadataService] Dropped operations that could not be applied`, {
+        runId: claim.runId,
+        droppedCount: dropped.length,
+        dropped: dropped.slice(0, MAX_DROPS_LOGGED).map(({ operation, error }) => ({
+          type: operation.type,
+          key: loggedKey(operation),
+          error: String(error).slice(0, MAX_LOGGED_CHARS),
+        })),
+      });
+    }
+    return this._ackClaim(claim);
+  }
+
+  private _ackClaim = (claim: MetadataBufferClaim, options?: { count?: number }) =>
+    Effect.tryPromise(() => this._buffer.ack(claim, options)).pipe(
+      Effect.catchAll((error) =>
+        Effect.sync(() => {
+          this.logger.error(`[UpdateMetadataService] Failed to ack buffered operations`, {
+            runId: claim.runId,
+            error,
+          });
+        })
+      )
+    );
+
+  private _requeueClaim = (claim: MetadataBufferClaim, options?: { keepPendingWrite?: boolean }) =>
+    Effect.tryPromise(() => this._buffer.requeue(claim, options)).pipe(
+      Effect.catchAll((error) =>
+        Effect.sync(() => {
+          this.logger.error(`[UpdateMetadataService] Failed to requeue buffered operations`, {
+            runId: claim.runId,
+            error,
+          });
+        })
+      )
+    );
+
   private _updateRunWithOperations = (
-    runId: string,
-    operations: BufferedRunMetadataChangeOperation[]
+    claim: MetadataBufferClaim,
+    operations: BufferedRunMetadataChangeOperation[],
+    dropped: DroppedOperation[]
   ) => {
+    const runId = claim.runId;
     return Effect.gen(this, function* (_) {
       // Fetch current run (+ the realtime membership keys, so a flush can publish)
       const run = yield* _(
@@ -217,7 +516,11 @@ export class UpdateMetadataService {
       );
 
       if (!run) {
-        return yield* _(Effect.fail(new Error(`Run ${runId} not found`)));
+        this.logger.warn(`[UpdateMetadataService] Dropping operations for missing run`, {
+          runId,
+          operationsCount: claim.operations.length,
+        });
+        return "run_missing" as const;
       }
 
       // Testing hook after read
@@ -233,15 +536,14 @@ export class UpdateMetadataService {
         )
       );
 
-      // Apply operations and update
-      const applyResult = applyMetadataOperations(
-        metadata,
-        operations.map((op) => op.operation)
-      );
-
-      if (applyResult.unappliedOperations.length === operations.length) {
+      const skip = new Set(dropped.map(({ operation }) => operation));
+      const attempted = operations
+        .map((op) => op.operation)
+        .filter((operation) => !skip.has(operation));
+      const applyResult = applyOrSalvage(metadata, attempted, this.salvageBudgetMs);
+      dropped.push(...applyResult.dropped);
+      if (applyResult.applied === 0) {
         this.logger.warn(`No operations applied for run ${runId}`);
-        // If no operations were applied, return
         return;
       }
 
@@ -263,7 +565,7 @@ export class UpdateMetadataService {
       if (!newMetadataPacket) {
         // Log and skip if metadata is invalid
         this.logger.warn(`Invalid metadata after operations, skipping update`);
-        return;
+        return "invalid_packet" as const;
       }
 
       // Testing hook before update
@@ -273,20 +575,33 @@ export class UpdateMetadataService {
 
       // Stamp updatedAt explicitly so the realtime publish can carry the exact committed
       // value without a follow-up read (updateMany can't RETURNING).
+      const stillClaimed = yield* _(
+        Effect.tryPromise(() => this._buffer.recordPendingWrite(claim, run.metadataVersion))
+      );
+
+      if (!stillClaimed) {
+        return yield* _(Effect.fail(new MetadataClaimLostError(runId)));
+      }
+
       const writeTime = new Date();
       const result = yield* _(
-        Effect.tryPromise(() =>
-          this._runStore.updateMetadata(
-            runId,
-            {
-              metadata: newMetadataPacket.data!,
-              metadataVersion: { increment: 1 },
-              updatedAt: writeTime,
-            },
-            { expectedMetadataVersion: run.metadataVersion },
-            this._prisma
-          )
-        )
+        Effect.tryPromise({
+          try: () =>
+            this._runStore.updateMetadata(
+              runId,
+              {
+                metadata: newMetadataPacket.data!,
+                metadataVersion: { increment: 1 },
+                updatedAt: writeTime,
+              },
+              { expectedMetadataVersion: run.metadataVersion },
+              this._prisma
+            ),
+          catch: (cause) =>
+            writeNeverReachedDatabase(cause)
+              ? new MetadataWriteNotSentError(runId, cause)
+              : new MetadataWriteOutcomeUnknownError(runId, cause),
+        })
       );
 
       if (result.count === 0) {
@@ -300,16 +615,21 @@ export class UpdateMetadataService {
       }
 
       yield* Effect.sync(() => {
-        this.options.onRunFlushed?.({
-          runId,
-          environmentId: run.runtimeEnvironmentId,
-          tags: run.runTags,
-          batchId: run.batchId,
-          updatedAtMs: writeTime.getTime(),
-        });
+        try {
+          this.options.onRunFlushed?.({
+            runId,
+            environmentId: run.runtimeEnvironmentId,
+            tags: run.runTags,
+            batchId: run.batchId,
+            updatedAtMs: writeTime.getTime(),
+          });
+        } catch (error) {
+          this.logger.error("[UpdateMetadataService] onRunFlushed threw after the write", {
+            runId,
+            error,
+          });
+        }
       });
-
-      return result;
     });
   };
 
@@ -337,11 +657,21 @@ export class UpdateMetadataService {
     return resultOps;
   }
 
+  /**
+   * `requestIdempotencyKey` is the SDK's per-request key, reused across its automatic retries.
+   * Buffered operations ingested under it are recorded once, so a retried request is not buffered twice.
+   */
   public async call(
     runId: string,
     body: UpdateMetadataRequestBody,
-    environment?: AuthenticatedEnvironment
+    environment?: AuthenticatedEnvironment,
+    options?: { requestIdempotencyKey?: string; ability?: RbacAbility }
   ) {
+    const ingestId = (kind: "parent" | "root" | "self", targetRunId: string) =>
+      options?.requestIdempotencyKey
+        ? `${options.requestIdempotencyKey}:${kind}:${targetRunId}`
+        : undefined;
+
     const runIdType = runId.startsWith("run_") ? "friendly" : "internal";
 
     const taskRun = await this._runStore.findRun(
@@ -356,6 +686,7 @@ export class UpdateMetadataService {
       {
         select: {
           id: true,
+          friendlyId: true,
           batchId: true,
           runTags: true,
           completedAt: true,
@@ -366,12 +697,16 @@ export class UpdateMetadataService {
           parentTaskRun: {
             select: {
               id: true,
+              friendlyId: true,
+              runtimeEnvironmentId: true,
               status: true,
             },
           },
           rootTaskRun: {
             select: {
               id: true,
+              friendlyId: true,
+              runtimeEnvironmentId: true,
               status: true,
             },
           },
@@ -384,21 +719,45 @@ export class UpdateMetadataService {
       return;
     }
 
+    if (options?.ability) {
+      authorizeMetadataTargets(options.ability, body, {
+        runId: taskRun.friendlyId,
+        parentRunId: taskRun.parentTaskRun?.friendlyId,
+        rootRunId: taskRun.rootTaskRun?.friendlyId,
+      });
+    }
+    if (environment) {
+      const targets = [
+        ...(body.parentOperations?.length ? [taskRun.parentTaskRun] : []),
+        ...(body.rootOperations?.length ? [taskRun.rootTaskRun] : []),
+      ];
+      if (targets.some((target) => target && target.runtimeEnvironmentId !== environment.id)) {
+        throw new ServiceValidationError("Task Run not found", 404);
+      }
+    }
+
     if (!this.#isRunUpdatable(taskRun)) {
       throw new ServiceValidationError("Cannot update metadata for a completed run");
     }
 
     if (body.parentOperations && body.parentOperations.length > 0) {
-      this.#ingestRunOperations(taskRun.parentTaskRun?.id ?? taskRun.id, body.parentOperations);
+      const parentRunId = taskRun.parentTaskRun?.id ?? taskRun.id;
+      await this.#ingestRunOperations(
+        parentRunId,
+        body.parentOperations,
+        ingestId("parent", parentRunId)
+      );
     }
 
     if (body.rootOperations && body.rootOperations.length > 0) {
-      this.#ingestRunOperations(taskRun.rootTaskRun?.id ?? taskRun.id, body.rootOperations);
+      const rootRunId = taskRun.rootTaskRun?.id ?? taskRun.id;
+      await this.#ingestRunOperations(rootRunId, body.rootOperations, ingestId("root", rootRunId));
     }
 
     const result = await this.#updateRunMetadata({
       runId: taskRun.id,
       body,
+      ingestId: ingestId("self", taskRun.id),
       existingMetadata: {
         data: taskRun.metadata ?? undefined,
         dataType: taskRun.metadataType,
@@ -420,14 +779,16 @@ export class UpdateMetadataService {
   async #updateRunMetadata({
     runId,
     body,
+    ingestId,
     existingMetadata,
   }: {
     runId: string;
     body: UpdateMetadataRequestBody;
+    ingestId?: string;
     existingMetadata: IOPacket;
   }): Promise<{ metadata: Record<string, unknown> | undefined; updatedAtMs?: number }> {
     if (Array.isArray(body.operations)) {
-      return this.#updateRunMetadataWithOperations(runId, body.operations);
+      return this.#updateRunMetadataWithOperations(runId, body.operations, ingestId);
     } else {
       return this.#updateRunMetadataDirectly(runId, body, existingMetadata);
     }
@@ -435,7 +796,8 @@ export class UpdateMetadataService {
 
   async #updateRunMetadataWithOperations(
     runId: string,
-    operations: RunMetadataChangeOperation[]
+    operations: RunMetadataChangeOperation[],
+    ingestId?: string
   ): Promise<{ metadata: Record<string, unknown> | undefined; updatedAtMs?: number }> {
     const MAX_RETRIES = 3;
     let attempts = 0;
@@ -517,7 +879,7 @@ export class UpdateMetadataService {
         // If this was our last attempt, buffer the operations and return optimistically
         // (no watermark — the flusher writes later and publishes itself).
         if (attempts === MAX_RETRIES) {
-          this.#ingestRunOperations(runId, operations);
+          await this.#ingestRunOperations(runId, operations, ingestId);
           return { metadata: applyResults.newMetadata };
         }
 
@@ -606,7 +968,30 @@ export class UpdateMetadataService {
     return { metadata: newMetadata, updatedAtMs };
   }
 
-  #ingestRunOperations(runId: string, operations: RunMetadataChangeOperation[]) {
+  async #ingestRunOperations(
+    runId: string,
+    operations: RunMetadataChangeOperation[],
+    ingestId?: string
+  ) {
+    const fitting = operations.filter((operation) => {
+      const value = (operation as { value?: unknown }).value;
+      return value === undefined || Buffer.byteLength(JSON.stringify(value)) <= this.maximumSize;
+    });
+
+    if (fitting.length < operations.length) {
+      this.logger.warn(
+        `[UpdateMetadataService] Dropping metadata operations larger than the limit`,
+        {
+          runId,
+          droppedCount: operations.length - fitting.length,
+          maximumSize: this.maximumSize,
+        }
+      );
+    }
+
+    if (fitting.length === 0) return;
+    operations = fitting;
+
     const bufferedOperations: BufferedRunMetadataChangeOperation[] = operations.map((operation) => {
       return {
         runId,
@@ -622,18 +1007,18 @@ export class UpdateMetadataService {
       });
     }
 
-    const existingBufferedOperations = this._bufferedOperations.get(runId) ?? [];
-
-    this._bufferedOperations.set(runId, [...existingBufferedOperations, ...bufferedOperations]);
+    try {
+      await this._buffer.ingest(runId, bufferedOperations, { ingestId });
+    } catch (error) {
+      if (error instanceof MetadataBufferFullError) {
+        throw new ServiceValidationError(error.message, 429);
+      }
+      throw error;
+    }
   }
 
-  // Testing method to manually trigger flush
+  /** Drains every buffered run now, ignoring the flush schedule. */
   async flushOperations() {
-    const currentOperations = new Map(this._bufferedOperations);
-    this._bufferedOperations.clear();
-
-    if (currentOperations.size > 0) {
-      await Effect.runPromise(this._processBufferedOperations(currentOperations));
-    }
+    await Effect.runPromise(this._drainBufferedOperations(true));
   }
 }

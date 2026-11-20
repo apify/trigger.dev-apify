@@ -22,7 +22,7 @@ import { x } from "tinyexec";
 import { z } from "zod";
 import chalk from "chalk";
 import type { CliApiClient } from "../apiClient.js";
-import { buildWorker } from "../build/buildWorker.js";
+import { buildWorker, writeContainerfile } from "../build/buildWorker.js";
 import { resolveAlwaysExternal } from "../build/externals.js";
 import { createContextArchive, getArchiveSize } from "../deploy/archiveContext.js";
 import { createBundleArchive } from "../deploy/bundleArchive.js";
@@ -50,7 +50,15 @@ import {
 } from "../cli/common.js";
 import { loadConfig } from "../config.js";
 import { authenticateForDeploy, userIdForDeploy } from "../deploy/auth.js";
+import {
+  archivePreviewBranch,
+  runTrustedDeploy,
+  shouldUseGithubOidc,
+  validateTrustedDeployOptions,
+  type NativeBuildClient,
+} from "../deploy/trustedDeploy.js";
 import { buildImage } from "../deploy/buildImage.js";
+import { type DeployEnvironment, resolveDeployEnvironment } from "../deploy/environment.js";
 import {
   checkLogsForErrors,
   checkLogsForWarnings,
@@ -77,13 +85,14 @@ import { getProjectClient, upsertBranch } from "../utilities/session.js";
 import { getTmpDir } from "../utilities/tempDirectories.js";
 import { spinner } from "../utilities/windows.js";
 import { login } from "./login.js";
-import { archivePreviewBranch } from "./preview.js";
 import { updateTriggerPackages } from "./update.js";
 
 const DeployCommandOptions = CommonCommandOptions.extend({
+  authMethod: z.enum(["auto", "oidc"]).default("auto"),
   dryRun: z.boolean().default(false),
   skipSyncEnvVars: z.boolean().default(false),
-  env: z.enum(["prod", "staging", "preview", "production"]),
+  env: z.enum(["prod", "staging", "preview", "production"]).optional(),
+  prod: z.boolean().default(false),
   branch: z.string().optional(),
   load: z.boolean().optional(),
   config: z.string().optional(),
@@ -116,7 +125,10 @@ const DeployCommandOptions = CommonCommandOptions.extend({
   forceCompression: z.boolean().default(true),
 });
 
-type DeployCommandOptions = z.infer<typeof DeployCommandOptions>;
+// `env` is resolved from --env, --prod and TRIGGER_ACCESS_TOKEN before the command runs
+export type DeployCommandOptions = Omit<z.infer<typeof DeployCommandOptions>, "env"> & {
+  env: DeployEnvironment;
+};
 
 type Deployment = InitializeDeploymentResponseBody;
 
@@ -125,13 +137,21 @@ export function configureDeployCommand(program: Command) {
     commonOptions(
       program
         .command("deploy")
+        .addOption(
+          new CommandOption(
+            "--auth-method <method>",
+            "Authentication method. OIDC ignores stored credentials and requires GitHub Actions."
+          )
+            .choices(["auto", "oidc"])
+            .default("auto")
+        )
         .description("Deploy your Trigger.dev project to the cloud.")
         .argument("[path]", "The path to the project", ".")
         .option(
           "-e, --env <env>",
-          "Deploy to a specific environment (currently only prod and staging are supported)",
-          "prod"
+          "The environment to deploy to: prod, staging or preview. Defaults to the environment of the API key in TRIGGER_ACCESS_TOKEN, otherwise prod."
         )
+        .option("--prod", "Deploy to the prod environment. Shorthand for --env prod.")
         .option(
           "-b, --branch <branch>",
           "The preview branch to deploy to when passing --env preview. If not provided, we'll detect your git branch."
@@ -327,12 +347,27 @@ export function configureDeployCommand(program: Command) {
 
 async function deployCommand(dir: string, options: unknown) {
   return await wrapCommandAction("deployCommand", DeployCommandOptions, options, async (opts) => {
-    return await _deployCommand(dir, opts);
+    const environment = resolveDeployEnvironment({
+      env: opts.env,
+      prod: opts.prod,
+      accessToken: shouldUseGithubOidc(opts.authMethod, process.env.TRIGGER_ACCESS_TOKEN)
+        ? undefined
+        : process.env.TRIGGER_ACCESS_TOKEN,
+    });
+
+    logger.debug("Resolved deploy environment", environment);
+
+    return await _deployCommand(dir, { ...opts, env: environment.env });
   });
 }
 
 async function _deployCommand(dir: string, options: DeployCommandOptions) {
-  const nativeOnlyError = nativeOnlyFlagError(options);
+  const useOidc = shouldUseGithubOidc(options.authMethod, process.env.TRIGGER_ACCESS_TOKEN);
+  if (useOidc) validateTrustedDeployOptions(options);
+  const nativeOnlyError = nativeOnlyFlagError({
+    ...options,
+    nativeBuildServer: options.nativeBuildServer || useOidc,
+  });
   if (nativeOnlyError) {
     throw new Error(nativeOnlyError);
   }
@@ -358,7 +393,7 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
   }
 
   if (!options.plain) {
-    intro(`Deploying project${options.skipPromotion ? " (without promotion)" : ""}`);
+    intro(`Deploying to ${options.env}${options.skipPromotion ? " (without promotion)" : ""}`);
   }
 
   if (!options.skipUpdateCheck) {
@@ -369,6 +404,11 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
   const projectPath = resolve(cwd, dir);
 
   verifyDirectory(dir, projectPath);
+
+  if (useOidc) {
+    await runTrustedDeploy(projectPath, options, handleNativeBuildServerDeploy);
+    return;
+  }
 
   const authorization = await authenticateForDeploy({
     accessToken: process.env.TRIGGER_ACCESS_TOKEN,
@@ -388,11 +428,6 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
         `You must login first. Use the \`login\` CLI command.\n\n${authorization.error}`
       );
     }
-  }
-
-  //coerce env from production to prod
-  if (options.env === "production") {
-    options.env = "prod";
   }
 
   const envVars = resolveLocalEnvVars(options.envFile);
@@ -447,11 +482,10 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
     //auto-archive a branch if the PR is merged or closed
     if (gitMeta?.pullRequestState === "merged" || gitMeta?.pullRequestState === "closed") {
       log.message(`Pull request ${gitMeta?.pullRequestNumber} is ${gitMeta?.pullRequestState}.`);
-      const $buildSpinner = spinner();
-      $buildSpinner.start(`Archiving preview branch: "${branch}"`);
-      const result = await archivePreviewBranch(authorization, branch, resolvedConfig.project);
-      $buildSpinner.stop(
-        result ? `Successfully archived "${branch}"` : `Failed to archive "${branch}".`
+      await archivePreviewBranch(
+        { type: "token", ...authorization.auth },
+        branch,
+        resolvedConfig.project
       );
       return;
     }
@@ -467,11 +501,11 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
 
     logger.debug("Upserted branch env", branchEnv);
 
-    log.success(`Using preview branch "${branch}"`);
-
     if (!branchEnv) {
       throw new Error(`Failed to create branch "${branch}"`);
     }
+
+    log.success(`Using preview branch "${branch}"`);
   }
 
   const projectClient = await getProjectClient({
@@ -526,6 +560,7 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
       options,
       userId: userIdForDeploy(authorization),
       gitMeta,
+      branch,
     });
     return;
   }
@@ -591,6 +626,7 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
       triggeredVia: getTriggeredVia(),
       externalId: options.externalId,
       force: options.force,
+      supportsInstanceBaseImages: true,
     },
     envVars.TRIGGER_EXISTING_DEPLOYMENT_ID
   );
@@ -600,6 +636,7 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
       dashboardUrl: authorization.dashboardUrl,
       projectRef: resolvedConfig.project,
       env: options.env,
+      branch,
       shortCode: deployment.shortCode,
     });
 
@@ -637,6 +674,13 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
   }
 
   warnAboutCanceledDeployments(deployment.canceledDeployments, options.externalId);
+
+  await applyServerBaseImages({
+    baseImages: deployment.baseImages,
+    outputPath: destination.path,
+    buildManifest,
+    options,
+  });
 
   // When `externalBuildData` is not present the deployment implicitly goes into the local build path
   // which is used in self-hosted setups. There are a few subtle differences between local builds for the cloud
@@ -717,6 +761,7 @@ async function _deployCommand(dir: string, options: DeployCommandOptions) {
     dashboardUrl: authorization.dashboardUrl,
     projectRef: resolvedConfig.project,
     env: options.env,
+    branch,
     shortCode: deployment.shortCode,
   });
 
@@ -1187,19 +1232,59 @@ function buildDeploymentLinks({
   dashboardUrl,
   projectRef,
   env,
+  branch,
   shortCode,
 }: {
   dashboardUrl: string;
   projectRef: string;
   env: DeployCommandOptions["env"];
+  branch: string | undefined;
   shortCode: string;
 }) {
+  const testParams = new URLSearchParams({ environment: env === "staging" ? "stg" : env });
+
+  if (env === "preview" && branch) {
+    testParams.set("branch", branch);
+  }
+
   return {
     rawDeploymentLink: `${dashboardUrl}/projects/v3/${projectRef}/deployments/${shortCode}`,
-    rawTestLink: `${dashboardUrl}/projects/v3/${projectRef}/test?environment=${
-      env === "prod" ? "prod" : "stg"
-    }`,
+    rawTestLink: `${dashboardUrl}/projects/v3/${projectRef}/test?${testParams}`,
   };
+}
+
+async function applyServerBaseImages({
+  baseImages,
+  outputPath,
+  buildManifest,
+  options,
+}: {
+  baseImages: InitializeDeploymentResponseBody["baseImages"];
+  outputPath: string;
+  buildManifest: BuildManifest;
+  options: DeployCommandOptions;
+}) {
+  if (!baseImages) {
+    return;
+  }
+
+  const required = [
+    baseImages.base ? `base ${baseImages.base}` : undefined,
+    baseImages.buildBase ? `build ${baseImages.buildBase}` : undefined,
+  ].filter(Boolean);
+
+  const message = `Building on base images required by this instance: ${required.join(", ")}`;
+
+  if (options.plain) {
+    console.log(message);
+  } else {
+    log.info(message);
+  }
+
+  await writeContainerfile(outputPath, {
+    ...buildManifest,
+    image: { ...buildManifest.image, ...baseImages },
+  });
 }
 
 function warnAboutSkippedBuild(externalId: string | undefined, isPromoted: boolean | undefined) {
@@ -1343,13 +1428,15 @@ async function handleNativeBuildServerDeploy({
   dashboardUrl,
   userId,
   gitMeta,
+  branch,
 }: {
-  apiClient: CliApiClient;
+  apiClient: NativeBuildClient;
   config: Awaited<ReturnType<typeof loadConfig>>;
   dashboardUrl: string;
   options: DeployCommandOptions;
   userId?: string;
   gitMeta?: GitMeta;
+  branch?: string;
 }) {
   const tmpDir = join(config.workingDir, ".trigger", "tmp");
   await mkdir(tmpDir, { recursive: true });
@@ -1454,10 +1541,13 @@ async function handleNativeBuildServerDeploy({
 
   const deployment = initializeDeploymentResult.data;
 
-  const rawDeploymentLink = `${dashboardUrl}/projects/v3/${config.project}/deployments/${deployment.shortCode}`;
-  const rawTestLink = `${dashboardUrl}/projects/v3/${config.project}/test?environment=${
-    options.env === "prod" ? "prod" : "stg"
-  }`;
+  const { rawDeploymentLink, rawTestLink } = buildDeploymentLinks({
+    dashboardUrl,
+    projectRef: config.project,
+    env: options.env,
+    branch,
+    shortCode: deployment.shortCode,
+  });
 
   if (deployment.outcome === "existing") {
     $deploymentSpinner.stop(`Version ${deployment.version} was already deployed`);
@@ -1787,10 +1877,13 @@ async function handleLocalBundleDeploy({
 
   const deployment = initializeDeploymentResult.data;
 
-  const rawDeploymentLink = `${dashboardUrl}/projects/v3/${config.project}/deployments/${deployment.shortCode}`;
-  const rawTestLink = `${dashboardUrl}/projects/v3/${config.project}/test?environment=${
-    options.env === "prod" ? "prod" : "stg"
-  }`;
+  const { rawDeploymentLink, rawTestLink } = buildDeploymentLinks({
+    dashboardUrl,
+    projectRef: config.project,
+    env: options.env,
+    branch,
+    shortCode: deployment.shortCode,
+  });
 
   if (deployment.outcome === "existing") {
     $deploymentSpinner.stop(`Version ${deployment.version} was already deployed`);
@@ -1889,6 +1982,7 @@ async function buildAndFinalizeFromBundle({
     dashboardUrl,
     projectRef,
     env: options.env,
+    branch,
     shortCode: deployment.shortCode,
   });
 
@@ -2261,9 +2355,21 @@ async function handleFromBundleDeploy({
       isLocalBuild: true,
       isNativeBuild: false,
       triggeredVia: getTriggeredVia(),
+      supportsInstanceBaseImages: true,
     },
     existingDeploymentId
   );
+
+  if (deployment.baseImages) {
+    const message =
+      "This instance requires custom deploy base images, which --from-bundle deploys cannot apply. Deploy without --from-bundle.";
+
+    await projectClient.client.failDeployment(deployment.id, {
+      error: { name: "BuildError", message },
+    });
+
+    throw new Error(message);
+  }
 
   // Fail fast if we know local builds will fail
   const buildxResult = await x("docker", ["buildx", "version"]);

@@ -266,6 +266,58 @@ class Telemetry {
     },
   };
 
+  webhooks = {
+    /**
+     * Same event the marketing site's beta form sends, so requests from both land in one
+     * PostHog insight broken down by `orgSlug`.
+     */
+    betaRequested: ({
+      user,
+      organization,
+    }: {
+      user: { id: string; email: string };
+      organization: { id: string; slug: string; title: string };
+    }) => {
+      if (this.#posthogClient === undefined) return;
+      if (!IS_MANAGED_CLOUD) return;
+      this.#capture({
+        userId: user.id,
+        event: "webhooks_beta_requested",
+        organizationId: organization.id,
+        eventProperties: {
+          source: "dashboard",
+          email: user.email,
+          orgId: organization.id,
+          orgSlug: organization.slug,
+          orgTitle: organization.title,
+        },
+      });
+    },
+  };
+
+  mcp = {
+    feedbackSubmitted: ({
+      userId,
+      message,
+      toolName,
+      projectRef,
+      projectId,
+    }: {
+      userId: string;
+      message: string;
+      toolName?: string;
+      projectRef?: string;
+      projectId?: string;
+    }) => {
+      this.#capture({
+        userId,
+        event: "mcp_feedback_submitted",
+        projectId,
+        eventProperties: { message, toolName, projectRef, source: "mcp" },
+      });
+    },
+  };
+
   #capture(event: CaptureEvent) {
     if (this.#posthogClient === undefined) return;
     let groups: Record<string, string> = {};

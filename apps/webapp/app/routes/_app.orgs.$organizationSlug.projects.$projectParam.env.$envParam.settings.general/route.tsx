@@ -1,5 +1,5 @@
 import { getFormProps, getInputProps, useForm } from "@conform-to/react";
-import { conformZodMessage, parseWithZod } from "@conform-to/zod/v4";
+import { conformZodMessage, parseWithZod } from "~/utils/conform";
 import { ExclamationTriangleIcon, FolderIcon, TrashIcon } from "@heroicons/react/20/solid";
 import { Form, useActionData, useNavigation } from "@remix-run/react";
 import { json } from "@remix-run/server-runtime";
@@ -19,7 +19,7 @@ import { Label } from "~/components/primitives/Label";
 import { SpinnerWhite } from "~/components/primitives/Spinner";
 import { useProject } from "~/hooks/useProject";
 import { redirectWithErrorMessage, redirectWithSuccessMessage } from "~/models/message.server";
-import { resolveOrgIdFromSlug } from "~/models/organization.server";
+import { resolveProjectAuthScope } from "~/services/projectAuthScope.server";
 import { ProjectSettingsService } from "~/services/projectSettings.server";
 import { logger } from "~/services/logger.server";
 import { dashboardAction } from "~/services/routeBuilders/dashboardBuilder";
@@ -80,10 +80,7 @@ const Params = z.object({
 export const action = dashboardAction(
   {
     params: Params,
-    context: async (params) => {
-      const orgId = await resolveOrgIdFromSlug(params.organizationSlug);
-      return orgId ? { organizationId: orgId } : {};
-    },
+    context: (params) => resolveProjectAuthScope(params.organizationSlug, params.projectParam),
   },
   async ({ user, ability, request, params }) => {
     const userId = user.id;

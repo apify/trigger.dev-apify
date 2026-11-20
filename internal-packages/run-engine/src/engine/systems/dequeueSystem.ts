@@ -1,14 +1,15 @@
-import { startSpan } from "@internal/tracing";
+import { type Counter, startSpan } from "@internal/tracing";
 import { assertExhaustive, tryCatch } from "@trigger.dev/core";
 import type { DequeuedMessage, TaskRunInternalError } from "@trigger.dev/core/v3";
-import { RetryOptions, RunAnnotations } from "@trigger.dev/core/v3";
-import { generateInternalId, getMaxDuration, SnapshotId } from "@trigger.dev/core/v3/isomorphic";
+import { isSandboxRun, RetryOptions, RunAnnotations } from "@trigger.dev/core/v3";
+import { getMaxDuration, SnapshotId } from "@trigger.dev/core/v3/isomorphic";
 import { placementTag } from "@trigger.dev/core/v3/serverOnly";
 import type {
   BackgroundWorker,
   Prisma,
   PrismaClientOrTransaction,
   RuntimeEnvironmentType,
+  WorkerDeploymentStatus,
 } from "@trigger.dev/database";
 import { z } from "zod";
 import type { BillingCache } from "../billingCache.js";
@@ -17,20 +18,40 @@ import type {
   ResolvedWorkerDeployment,
   ResolvedWorkerTask,
 } from "../controlPlaneResolver.js";
+import { CONTINUED_WHILST_EXECUTING_DESCRIPTION } from "../consts.js";
 import { deletedEnvironmentReason, MISSING_ENVIRONMENT_REASON } from "../controlPlaneResolver.js";
 
 import { sendNotificationToWorker } from "../eventBus.js";
 import { getMachinePreset } from "../machinePresets.js";
 import { isDequeueableExecutionStatus, isExecuting } from "../statuses.js";
 import type { WorkerQueueSelection } from "../../run-queue/types.js";
-import type { RunEngineOptions, WorkerQueueDequeueOptions } from "../types.js";
-import type { ExecutionSnapshotSystem } from "./executionSnapshotSystem.js";
-import { getLatestExecutionSnapshot } from "./executionSnapshotSystem.js";
+import type {
+  DeploymentStatusMode,
+  RunEngineOptions,
+  WorkerQueueDequeueOptions,
+} from "../types.js";
+import {
+  getLatestExecutionSnapshotOrFinishedRun,
+  type ExecutionSnapshotSystem,
+  type PreviousSnapshot,
+} from "./executionSnapshotSystem.js";
 import type { RunAttemptSystem } from "./runAttemptSystem.js";
+import type { PendingVersionSystem } from "./pendingVersionSystem.js";
 import type { SystemResources } from "./systems.js";
-import { snapshotRouteFromSnapshot, type SnapshotRouteWire } from "@internal/run-store";
+import {
+  parseSnapshotRoute,
+  snapshotRouteFromSnapshot,
+  type SnapshotReadContext,
+  type SnapshotRouteWire,
+} from "@internal/run-store";
+import { dequeueCheckpointFromRow } from "../checkpointMetadata.js";
 
 const NullableRetryOptions = z.compile(RetryOptions.nullable());
+
+/** How long a run with no template and no fallback worker queue waits before the next try. */
+const TEMPLATE_WAIT_RETRY_MS = 30_000;
+const DEPLOYMENT_WAIT_RETRY_MS = 30_000;
+const DEPLOYMENT_WAIT_MAX_MS = 16 * 60_000;
 
 export type DequeueSystemOptions = {
   resources: SystemResources;
@@ -38,6 +59,10 @@ export type DequeueSystemOptions = {
   executionSnapshotSystem: ExecutionSnapshotSystem;
   runAttemptSystem: RunAttemptSystem;
   billingCache: BillingCache;
+  deploymentWaitRetryMs?: number;
+  deploymentWaitMaxMs?: number;
+  deploymentStatusMode?: () => DeploymentStatusMode;
+  pendingVersionSystem: PendingVersionSystem;
 };
 
 // Run-ops scalars the dequeue path reads off the run row. The environment half (type,
@@ -57,6 +82,7 @@ const dequeueRunSelect = {
   lockedRetryConfig: true,
   attemptNumber: true,
   machinePreset: true,
+  annotations: true,
 } satisfies Prisma.TaskRunSelect;
 
 type RunWithDequeueScalars = Prisma.TaskRunGetPayload<{ select: typeof dequeueRunSelect }>;
@@ -102,6 +128,20 @@ type RunWithBackgroundWorkerTasksResult =
       deployment: ResolvedWorkerDeployment | null;
     };
 
+/** Results that park a run as PENDING_VERSION. */
+const PENDING_VERSION_CODES: ReadonlySet<string> = new Set([
+  "NO_WORKER",
+  "TASK_NEVER_REGISTERED",
+  "QUEUE_NOT_FOUND",
+  "TASK_NOT_IN_LATEST",
+]);
+
+const UNDEPLOYABLE_DEPLOYMENT_STATUSES: ReadonlySet<WorkerDeploymentStatus> = new Set([
+  "FAILED",
+  "TIMED_OUT",
+  "CANCELED",
+]);
+
 type WorkerDeploymentWithWorkerTasks = {
   worker: BackgroundWorker;
   tasks: ResolvedWorkerTask[];
@@ -113,11 +153,28 @@ export class DequeueSystem {
   private readonly $: SystemResources;
   private readonly executionSnapshotSystem: ExecutionSnapshotSystem;
   private readonly runAttemptSystem: RunAttemptSystem;
+  private readonly pendingVersionSystem: PendingVersionSystem;
+  private readonly deploymentWaitRetryMs: number;
+  private readonly deploymentWaitMaxMs: number;
+  private readonly deploymentStatusMode: () => DeploymentStatusMode;
+  private readonly deploymentNotDeployedCounter: Counter;
 
   constructor(private readonly options: DequeueSystemOptions) {
     this.$ = options.resources;
     this.executionSnapshotSystem = options.executionSnapshotSystem;
     this.runAttemptSystem = options.runAttemptSystem;
+    this.pendingVersionSystem = options.pendingVersionSystem;
+    this.deploymentWaitRetryMs = options.deploymentWaitRetryMs ?? DEPLOYMENT_WAIT_RETRY_MS;
+    this.deploymentWaitMaxMs = options.deploymentWaitMaxMs ?? DEPLOYMENT_WAIT_MAX_MS;
+    this.deploymentStatusMode = options.deploymentStatusMode ?? (() => "shadow");
+    this.deploymentNotDeployedCounter = this.$.meter.createCounter(
+      "run_engine.dequeue.deployment_not_deployed",
+      {
+        description:
+          "Dequeues of a run whose deployment hasn't finished deploying, by what enforce mode does (or would do in shadow mode): fail, fail_stalled or wait",
+        unit: "runs",
+      }
+    );
   }
 
   /**
@@ -135,6 +192,7 @@ export class DequeueSystem {
     tx,
     blockingPop,
     blockingPopTimeoutSeconds,
+    templateFallbackWorkerQueue,
   }: WorkerQueueDequeueOptions & {
     workerQueues: WorkerQueueSelection[];
   }): Promise<DequeuedMessage | undefined> {
@@ -159,6 +217,11 @@ export class DequeueSystem {
         const workerQueue = message.workerQueue;
         const orgId = message.message.orgId;
         const runId = message.messageId;
+        // The message's birth route lets the snapshot store read a redis-primary run without a Postgres
+        // residency probe. A missing, malformed or other-org route falls back to the org id.
+        const carriedRoute = parseSnapshotRoute(message.message.snapshotRoute);
+        const snapshotReadContext: SnapshotReadContext =
+          carriedRoute && carriedRoute.organizationId === orgId ? carriedRoute : orgId;
         // The snapshot this dequeue's preparation started from; the recovery path below only requeues a
         // PENDING_EXECUTING snapshot that this preparation wrote.
         let preparedFromSnapshotId: string | undefined;
@@ -197,13 +260,18 @@ export class DequeueSystem {
             "dequeueFromWorkerQueue",
             [runId],
             async () => {
-              const snapshot = await getLatestExecutionSnapshot(
+              const { snapshot, finishedRun } = await getLatestExecutionSnapshotOrFinishedRun(
                 prisma,
                 runId,
                 this.$.runStore,
-                undefined,
-                orgId
+                snapshotReadContext,
+                { id: true }
               );
+              if (finishedRun) {
+                // A stale message for a finished run: remove it instead of starting the run.
+                await this.#acknowledgeExpiredFinishedRun(orgId, runId);
+                return;
+              }
               preparedFromSnapshotId = snapshot.id;
 
               if (!isDequeueableExecutionStatus(snapshot.executionStatus)) {
@@ -233,6 +301,7 @@ export class DequeueSystem {
                       "Tried to dequeue a run that is not in a valid state to be dequeued.",
                   },
                   previousSnapshotId: snapshot.id,
+                  previousSnapshot: snapshot,
                   snapshotRoute: snapshotRouteFromSnapshot(snapshot),
                   environmentId: snapshot.environmentId,
                   environmentType: snapshot.environmentType,
@@ -337,15 +406,18 @@ export class DequeueSystem {
                     },
                     snapshot: {
                       executionStatus: "EXECUTING",
-                      description: "Run was continued, whilst still executing.",
+                      description: CONTINUED_WHILST_EXECUTING_DESCRIPTION,
                     },
                     previousSnapshotId: snapshot.id,
+                    previousSnapshot: snapshot,
                     snapshotRoute: snapshotRouteFromSnapshot(snapshot),
                     environmentId: snapshot.environmentId,
                     environmentType: snapshot.environmentType,
                     projectId: snapshot.projectId,
                     organizationId: snapshot.organizationId,
                     batchId: snapshot.batchId ?? undefined,
+                    workerId: snapshot.workerId ?? undefined,
+                    runnerId: snapshot.runnerId ?? undefined,
                     completedWaitpoints: snapshot.completedWaitpoints.map((waitpoint) => ({
                       id: waitpoint.id,
                       index: waitpoint.index,
@@ -362,11 +434,22 @@ export class DequeueSystem {
                 return;
               }
 
-              const result = await this.#getRunWithBackgroundWorkerTasks(
+              let result = await this.#getRunWithBackgroundWorkerTasks(
                 prisma,
                 runId,
                 backgroundWorkerId
               );
+
+              // The worker version may come from a replica that lags a just-promoted deployment.
+              // Parking is only undone by a later deploy, so confirm the miss on the primary first.
+              if (!result.success && PENDING_VERSION_CODES.has(result.code)) {
+                result = await this.#getRunWithBackgroundWorkerTasks(
+                  prisma,
+                  runId,
+                  backgroundWorkerId,
+                  { fromPrimary: true }
+                );
+              }
 
               if (!result.success) {
                 switch (result.code) {
@@ -428,6 +511,7 @@ export class DequeueSystem {
                       orgId,
                       runId,
                       snapshotRoute: snapshotRouteFromSnapshot(snapshot),
+                      previousSnapshot: snapshot,
                       reason: result.message,
                       statusReason: result.code,
                       tx: prisma,
@@ -455,8 +539,138 @@ export class DequeueSystem {
                 }
               }
 
+              // The policy is resolved at trigger from task metadata that can belong to another
+              // version (unresolved external deployments, delayed or debounced runs). A sandbox
+              // task must never start without its policy, so the mismatch fails the run.
+              if (
+                result.task.executionMode === "SANDBOX" &&
+                !isSandboxRun(result.run.annotations)
+              ) {
+                span.setAttribute("result", "EXECUTION_POLICY_MISMATCH");
+                await this.runAttemptSystem.systemFailure({
+                  runId,
+                  organizationId: orgId,
+                  error: {
+                    type: "INTERNAL_ERROR",
+                    code: "CONFIGURED_INCORRECTLY",
+                    message: `Task ${result.task.slug} is a sandbox in version ${result.worker.version}, but this run was triggered without its sandbox policy. Trigger it again.`,
+                  },
+                  tx: prisma,
+                });
+                return;
+              }
+
               //check for a valid deployment if it's not a development environment
               if (result.environmentType !== "DEVELOPMENT") {
+                // Only a deployment that finished deploying may start runs. A worker registers
+                // before finalize, so a run locked to its version can reach here while the
+                // deployment is still deploying, or after it failed (including when a deploy gate
+                // refused it at finalize). The mode is read per dequeue so it can move between
+                // off, shadow and enforce without a restart; off skips every extra read.
+                const statusMode = this.deploymentStatusMode();
+                let deploymentStatus = result.deployment?.status;
+                let deployingSince: Date | undefined;
+
+                // The resolved status can lag a just-finished deploy: it comes from the
+                // control-plane replica in split mode, and from a 30s cache if fresh reads are
+                // off. DEPLOYED is terminal, so only a not-DEPLOYED read can be stale. Confirm
+                // it on the primary before deciding anything. Runs on DEPLOYED deployments,
+                // which is nearly all of them, never pay for this read.
+                if (statusMode !== "off" && result.deployment && deploymentStatus !== "DEPLOYED") {
+                  const confirmed = await this.$.controlPlaneResolver.resolveDeploymentStatus(
+                    result.deployment.id
+                  );
+                  if (confirmed) {
+                    deploymentStatus = confirmed.status;
+                    deployingSince = confirmed.deployingSince;
+                  }
+                }
+
+                // A deployment still in progress long after its deploy timeout should have
+                // fired will never finish: its timeout job was lost, or it predates timeouts
+                // (prod has DEPLOYING rows from 2024). Without this, a run locked to it would
+                // retry forever.
+                const stalled =
+                  deploymentStatus !== undefined &&
+                  deploymentStatus !== "DEPLOYED" &&
+                  !UNDEPLOYABLE_DEPLOYMENT_STATUSES.has(deploymentStatus) &&
+                  deployingSince !== undefined &&
+                  Date.now() - deployingSince.getTime() > this.deploymentWaitMaxMs;
+
+                const blockAction =
+                  statusMode === "off" ||
+                  !result.deployment ||
+                  !deploymentStatus ||
+                  deploymentStatus === "DEPLOYED"
+                    ? undefined
+                    : UNDEPLOYABLE_DEPLOYMENT_STATUSES.has(deploymentStatus)
+                      ? "fail"
+                      : stalled
+                        ? "fail_stalled"
+                        : "wait";
+
+                if (result.deployment && deploymentStatus && blockAction) {
+                  this.deploymentNotDeployedCounter.add(1, {
+                    mode: statusMode,
+                    action: blockAction,
+                    deployment_status: deploymentStatus,
+                  });
+
+                  // Shadow mode records what enforce would do and then carries on exactly as
+                  // before the check existed, including the missing-image handling below.
+                  if (statusMode === "shadow") {
+                    this.$.logger.warn(
+                      "RunEngine.dequeueFromWorkerQueue(): Deployment has not finished deploying, starting the run anyway (shadow mode)",
+                      {
+                        runId,
+                        latestSnapshot: snapshot.id,
+                        deploymentId: result.deployment.id,
+                        deploymentStatus,
+                        deployingSince,
+                        wouldAction: blockAction,
+                      }
+                    );
+                    span.setAttribute("deployment_status_shadow", blockAction);
+                  }
+                }
+
+                // Checked before the missing-image case below, so a failed deployment with no
+                // image fails its runs instead of parking them.
+                if (
+                  statusMode === "enforce" &&
+                  result.deployment &&
+                  (blockAction === "fail" || blockAction === "fail_stalled")
+                ) {
+                  this.$.logger.warn(
+                    "RunEngine.dequeueFromWorkerQueue(): Deployment did not finish deploying",
+                    {
+                      runId,
+                      latestSnapshot: snapshot.id,
+                      deploymentId: result.deployment.id,
+                      deploymentStatus,
+                      deployingSince,
+                      action: blockAction,
+                    }
+                  );
+                  span.setAttribute("result", "DEPLOYMENT_NOT_DEPLOYED");
+
+                  await this.runAttemptSystem.systemFailure({
+                    runId,
+                    organizationId: orgId,
+                    error: {
+                      type: "INTERNAL_ERROR",
+                      code: "CONFIGURED_INCORRECTLY",
+                      message:
+                        blockAction === "fail_stalled"
+                          ? `Version ${result.worker.version} started deploying at ${deployingSince?.toISOString()} and never finished, so this run can't start. Only versions that finished deploying can run.`
+                          : `Version ${result.worker.version} did not finish deploying (${deploymentStatus}), so this run can't start. Only versions that finished deploying can run.`,
+                    },
+                    tx: prisma,
+                  });
+
+                  return;
+                }
+
                 if (!result.deployment || !result.deployment.imageReference) {
                   this.$.logger.warn("RunEngine.dequeueFromWorkerQueue(): No deployment found", {
                     runId,
@@ -468,6 +682,7 @@ export class DequeueSystem {
                     orgId,
                     runId,
                     snapshotRoute: snapshotRouteFromSnapshot(snapshot),
+                    previousSnapshot: snapshot,
                     reason: "No deployment or deployment image reference found for deployed run",
                     statusReason: "NO_DEPLOYMENT",
                     tx: prisma,
@@ -475,6 +690,52 @@ export class DequeueSystem {
 
                   return;
                 }
+
+                if (statusMode === "enforce" && blockAction === "wait") {
+                  this.$.logger.warn(
+                    "RunEngine.dequeueFromWorkerQueue(): Deployment is still deploying, retrying later",
+                    {
+                      runId,
+                      latestSnapshot: snapshot.id,
+                      deploymentId: result.deployment.id,
+                      deploymentStatus,
+                    }
+                  );
+                  span.setAttribute("result", "DEPLOYMENT_WAIT");
+
+                  // Keep the run queued and re-check later, without parking it as
+                  // pending-version: nothing wakes parked runs when a deployment fails or times
+                  // out. The retry doesn't spend the redelivery budget; the wait ends when the
+                  // deployment finishes, fails or times out, or passes deploymentWaitMaxMs.
+                  await this.$.runQueue.nackMessage({
+                    orgId,
+                    messageId: runId,
+                    retryAt: Date.now() + this.deploymentWaitRetryMs,
+                    incrementAttemptCount: false,
+                  });
+
+                  return;
+                }
+              }
+
+              if (
+                templateFallbackWorkerQueue &&
+                result.environmentType !== "DEVELOPMENT" &&
+                !snapshot.checkpointId &&
+                !result.deployment?.templateKey
+              ) {
+                const outcome = await this.#moveToTemplateFallback({
+                  orgId,
+                  runId,
+                  workerQueue,
+                  // A sandbox must not leave compute, so it waits for a template instead.
+                  fallbackWorkerQueue: isSandboxRun(result.run.annotations)
+                    ? undefined
+                    : templateFallbackWorkerQueue(workerQueue),
+                  tx: prisma,
+                });
+                span.setAttribute("result", outcome);
+                return;
               }
 
               const machinePreset = getMachinePreset({
@@ -524,7 +785,8 @@ export class DequeueSystem {
                 : result.task.retryConfig;
 
               // Pre-generate snapshot ID so we can construct the result without an extra read
-              const snapshotId = generateInternalId();
+              const { id: snapshotId, createdAt: snapshotCreatedAt } =
+                this.executionSnapshotSystem.nextSnapshotIdentity(snapshot, runId);
 
               const lockedTaskRun = await this.$.runStore.lockRunToWorker(
                 runId,
@@ -544,6 +806,7 @@ export class DequeueSystem {
                   maxAttempts: maxAttempts ?? undefined,
                   snapshot: {
                     id: snapshotId,
+                    createdAt: snapshotCreatedAt,
                     previousSnapshotId: snapshot.id,
                     snapshotRoute: snapshotRouteFromSnapshot(snapshot),
                     attemptNumber: result.run.attemptNumber ?? undefined,
@@ -645,8 +908,6 @@ export class DequeueSystem {
               // Snapshot was created as part of the taskRun.update above (single transaction).
               // Construct the snapshot info from data we already have and handle side effects
               // (heartbeat + event) manually — no extra DB read needed.
-              const snapshotCreatedAt = new Date();
-
               this.$.eventBus.emit("executionSnapshotCreated", {
                 time: snapshotCreatedAt,
                 run: {
@@ -685,7 +946,8 @@ export class DequeueSystem {
                   createdAt: snapshotCreatedAt,
                 },
                 image: result.deployment?.imageReference ?? undefined,
-                checkpoint: snapshot.checkpoint ?? undefined,
+                templateKey: result.deployment?.templateKey ?? undefined,
+                checkpoint: dequeueCheckpointFromRow(snapshot.checkpoint),
                 completedWaitpoints: snapshot.completedWaitpoints,
                 backgroundWorker: {
                   id: result.worker.id,
@@ -758,11 +1020,18 @@ export class DequeueSystem {
           // Reentrant: tryNackAndRequeue's own lock on this run nests inside this one.
           await this.$.runLock.lock("dequeueFromWorkerQueueRecovery", [runId], async () => {
             // Preparation may have committed a transition before throwing, so read current state.
-            const [snapshotError, snapshot] = await tryCatch(
-              getLatestExecutionSnapshot(prisma, runId, this.$.runStore)
+            // A finished run's stale message is removed; any read error (including a failed row
+            // read after expiry) falls through to the nack below.
+            const [snapshotError, read] = await tryCatch(
+              getLatestExecutionSnapshotOrFinishedRun(
+                prisma,
+                runId,
+                this.$.runStore,
+                snapshotReadContext,
+                { id: true }
+              )
             );
-
-            if (snapshotError) {
+            if (snapshotError || !read) {
               // Do not replace execution state we could not read with a checkpoint-less snapshot.
               const requeued = await this.$.runQueue.nackMessage({ orgId, messageId: runId });
               if (requeued === false) {
@@ -775,6 +1044,11 @@ export class DequeueSystem {
               }
               return;
             }
+            if (read.finishedRun) {
+              await this.#acknowledgeExpiredFinishedRun(orgId, runId);
+              return;
+            }
+            const snapshot = read.snapshot;
 
             // A PENDING_EXECUTING snapshot written by this preparation was never handed to a worker,
             // so it is still ours to requeue. Any other non-dequeueable state is owned elsewhere.
@@ -806,16 +1080,24 @@ export class DequeueSystem {
               )
             );
 
-            const env = run
-              ? await this.$.controlPlaneResolver.resolveEnv(run.runtimeEnvironmentId)
-              : null;
+            const [envError, env] = run
+              ? await tryCatch(this.$.controlPlaneResolver.resolveEnv(run.runtimeEnvironmentId))
+              : [null, null];
 
-            if (findError || !run || !env) {
+            if (findError || envError || !run || !env) {
               this.$.logger.error(
                 "RunEngine.dequeueFromWorkerQueue(): Failed to find run, nacking directly via Redis",
-                { runId, orgId, findError }
+                { runId, orgId, findError, envError }
               );
-              await this.$.runQueue.nackMessage({ orgId, messageId: runId });
+              const requeued = await this.$.runQueue.nackMessage({ orgId, messageId: runId });
+              if (requeued === false) {
+                await this.runAttemptSystem.systemFailure({
+                  runId,
+                  organizationId: orgId,
+                  error: dequeueMaxRetriesError,
+                  tx: prisma,
+                });
+              }
               return;
             }
 
@@ -829,6 +1111,7 @@ export class DequeueSystem {
               batchId: snapshot.batchId ?? undefined,
               error: dequeueMaxRetriesError,
               snapshotRoute: snapshotRouteFromSnapshot(snapshot),
+              previousSnapshot: snapshot,
               tx: prisma,
             });
           });
@@ -847,10 +1130,82 @@ export class DequeueSystem {
     );
   }
 
+  /**
+   * Gives back a run whose deployment this consumer cannot start. With a fallback worker queue the
+   * run moves there without using its redelivery budget. Without one it is retried later, and the
+   * budget bounds how long it waits for a template.
+   */
+  async #moveToTemplateFallback({
+    orgId,
+    runId,
+    workerQueue,
+    fallbackWorkerQueue,
+    tx,
+  }: {
+    orgId: string;
+    runId: string;
+    workerQueue: string;
+    fallbackWorkerQueue: string | undefined;
+    tx: PrismaClientOrTransaction;
+  }): Promise<"TEMPLATE_FALLBACK" | "TEMPLATE_WAIT"> {
+    if (fallbackWorkerQueue && fallbackWorkerQueue !== workerQueue) {
+      this.$.logger.info("RunEngine.dequeueFromWorkerQueue(): No template, moving the run", {
+        runId,
+        workerQueue,
+        fallbackWorkerQueue,
+      });
+      await this.$.runStore.requeueRun(
+        runId,
+        { select: { id: true }, workerQueue: fallbackWorkerQueue },
+        tx
+      );
+      await this.$.runQueue.nackMessage({
+        orgId,
+        messageId: runId,
+        workerQueue: fallbackWorkerQueue,
+        retryAt: Date.now(),
+        incrementAttemptCount: false,
+      });
+      return "TEMPLATE_FALLBACK";
+    }
+
+    this.$.logger.warn("RunEngine.dequeueFromWorkerQueue(): No template and no fallback queue", {
+      runId,
+      workerQueue,
+    });
+    const requeued = await this.$.runQueue.nackMessage({
+      orgId,
+      messageId: runId,
+      retryAt: Date.now() + TEMPLATE_WAIT_RETRY_MS,
+    });
+    if (requeued === false) {
+      await this.runAttemptSystem.systemFailure({
+        runId,
+        organizationId: orgId,
+        error: {
+          type: "INTERNAL_ERROR",
+          code: "TASK_RUN_DEQUEUED_MAX_RETRIES",
+          message: "The run's deployment is not ready to start on this worker queue.",
+        },
+        tx,
+      });
+    }
+    return "TEMPLATE_WAIT";
+  }
+
+  async #acknowledgeExpiredFinishedRun(orgId: string, runId: string): Promise<void> {
+    this.$.logger.warn(
+      "dequeueFromWorkerQueue: snapshot state expired for a finished run, removing from queue",
+      { runId, orgId }
+    );
+    await this.$.runQueue.acknowledgeMessage(orgId, runId);
+  }
+
   async #pendingVersion({
     orgId,
     runId,
     snapshotRoute,
+    previousSnapshot,
     workerId,
     runnerId,
     reason,
@@ -860,6 +1215,7 @@ export class DequeueSystem {
     orgId: string;
     runId: string;
     snapshotRoute?: SnapshotRouteWire;
+    previousSnapshot?: PreviousSnapshot;
     statusReason: string;
     workerId?: string;
     runnerId?: string;
@@ -874,7 +1230,7 @@ export class DequeueSystem {
       statusReason,
     });
 
-    return this.$.runLock.lock("pendingVersion", [runId], async () => {
+    await this.$.runLock.lock("pendingVersion", [runId], async () => {
       this.$.logger.debug("RunEngine.dequeueFromWorkerQueue(): Pending version lock acquired", {
         runId,
         reason,
@@ -918,6 +1274,7 @@ export class DequeueSystem {
       await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
         run,
         snapshotRoute,
+        previousSnapshot,
         snapshot: {
           executionStatus: "RUN_CREATED",
           description:
@@ -955,12 +1312,65 @@ export class DequeueSystem {
         },
       });
     });
+
+    await this.#requeueIfWorkerNowCovers(prisma, runId);
+  }
+
+  /**
+   * A deployment's pending-version sweep runs once, right after it is promoted. A run parked
+   * after that sweep has finished would wait for the next deploy, so check the primary again
+   * after parking and promote the run if a worker now covers it.
+   */
+  async #requeueIfWorkerNowCovers(prisma: PrismaClientOrTransaction, runId: string) {
+    const [error, result] = await tryCatch(
+      this.#getRunWithBackgroundWorkerTasks(prisma, runId, undefined, { fromPrimary: true })
+    );
+
+    if (error) {
+      this.$.logger.error("RunEngine.#pendingVersion(): re-check after parking failed", {
+        runId,
+        error,
+      });
+      return;
+    }
+
+    if (!result.success) {
+      return;
+    }
+
+    // Matches the dequeue check that parks a deployed run with NO_DEPLOYMENT, so a requeue can't
+    // land straight back here.
+    if (
+      result.environmentType !== "DEVELOPMENT" &&
+      (!result.deployment || !result.deployment.imageReference)
+    ) {
+      return;
+    }
+
+    this.$.logger.info("RunEngine.#pendingVersion(): a worker now covers the parked run", {
+      runId,
+      backgroundWorkerId: result.worker.id,
+    });
+
+    // Promoted here rather than through a job: a worker still on an older release would run that
+    // job as an ordinary candidate lookup, which may not see this run yet.
+    const [promoteError] = await tryCatch(
+      this.pendingVersionSystem.enqueueRunsForBackgroundWorker(result.worker.id, 0, [runId])
+    );
+
+    if (promoteError) {
+      this.$.logger.error("RunEngine.#pendingVersion(): requeue after parking failed", {
+        runId,
+        error: promoteError,
+      });
+    }
   }
 
   async #getRunWithBackgroundWorkerTasks(
     prisma: PrismaClientOrTransaction,
     runId: string,
-    backgroundWorkerId?: string
+    backgroundWorkerId?: string,
+    options?: { fromPrimary?: boolean }
   ): Promise<RunWithBackgroundWorkerTasksResult> {
     return startSpan(this.$.tracer, "getRunWithBackgroundWorkerTasks", async (span) => {
       span.setAttribute("run_id", runId);
@@ -1026,14 +1436,16 @@ export class DequeueSystem {
       const workerId = run.lockedToVersionId ?? backgroundWorkerId;
 
       //get the relevant BackgroundWorker with tasks and deployment (if not DEV)
-      const workerWithTasks: WorkerDeploymentWithWorkerTasks | null =
-        await this.$.controlPlaneResolver.resolveWorkerVersion({
-          environmentId: run.runtimeEnvironmentId,
-          type: env.type,
-          workerId: workerId ?? undefined,
-          taskIdentifier: run.taskIdentifier,
-          queue: { lockedQueueId: run.lockedQueueId, name: run.queue },
-        });
+      const resolveArgs = {
+        environmentId: run.runtimeEnvironmentId,
+        type: env.type,
+        workerId: workerId ?? undefined,
+        taskIdentifier: run.taskIdentifier,
+        queue: { lockedQueueId: run.lockedQueueId, name: run.queue },
+      };
+      const workerWithTasks: WorkerDeploymentWithWorkerTasks | null = options?.fromPrimary
+        ? await this.$.controlPlaneResolver.resolveWorkerVersionFromPrimary(resolveArgs)
+        : await this.$.controlPlaneResolver.resolveWorkerVersion(resolveArgs);
 
       if (!workerWithTasks) {
         span.setAttribute("result", "NO_WORKER");

@@ -55,32 +55,49 @@ export async function action({ params, request }: ActionFunctionArgs) {
   const repository = new EnvironmentVariablesRepository();
 
   const body = await parseImportBody(request);
+  if (
+    authenticationResult.type === "apiKey" &&
+    authenticationResult.result.ok &&
+    authenticationResult.result.credentialKind === "run_token" &&
+    body.parentVariables &&
+    Object.keys(body.parentVariables).length > 0
+  ) {
+    return json({ error: "Run tokens cannot write parent environment variables" }, { status: 403 });
+  }
 
-  const result = await repository.create(environment.project.id, {
-    override: typeof body.override === "boolean" ? body.override : false,
-    isSecret: body.isSecret,
-    environmentIds: [environment.id],
-    // Pass parent environment ID so new variables can inherit isSecret from parent
-    parentEnvironmentId: environment.parentEnvironmentId ?? undefined,
-    variables: Object.entries(body.variables).map(([key, value]) => ({
-      key,
-      value,
-    })),
-    lastUpdatedBy: body.source,
-  });
-
-  // Only sync parent variables if this is a branch environment
-  if (environment.parentEnvironmentId && body.parentVariables) {
-    const parentResult = await repository.create(environment.project.id, {
+  const result = await repository.create(
+    environment.project.id,
+    {
       override: typeof body.override === "boolean" ? body.override : false,
       isSecret: body.isSecret,
-      environmentIds: [environment.parentEnvironmentId],
-      variables: Object.entries(body.parentVariables).map(([key, value]) => ({
+      environmentIds: [environment.id],
+      // Pass parent environment ID so new variables can inherit isSecret from parent
+      parentEnvironmentId: environment.parentEnvironmentId ?? undefined,
+      variables: Object.entries(body.variables).map(([key, value]) => ({
         key,
         value,
       })),
       lastUpdatedBy: body.source,
-    });
+    },
+    { imported: true }
+  );
+
+  // Only sync parent variables if this is a branch environment
+  if (environment.parentEnvironmentId && body.parentVariables) {
+    const parentResult = await repository.create(
+      environment.project.id,
+      {
+        override: typeof body.override === "boolean" ? body.override : false,
+        isSecret: body.isSecret,
+        environmentIds: [environment.parentEnvironmentId],
+        variables: Object.entries(body.parentVariables).map(([key, value]) => ({
+          key,
+          value,
+        })),
+        lastUpdatedBy: body.source,
+      },
+      { imported: true }
+    );
 
     let childFailure = !result.success ? result : undefined;
     let parentFailure = !parentResult.success ? parentResult : undefined;
@@ -93,7 +110,7 @@ export async function action({ params, request }: ActionFunctionArgs) {
           error: childFailure?.error || parentFailure?.error || "Unknown error",
           variableErrors: childFailure?.variableErrors || parentFailure?.variableErrors,
         },
-        { status: 400 }
+        { status: (childFailure ?? parentFailure)?.conflict ? 409 : 400 }
       );
     }
   }
@@ -101,7 +118,10 @@ export async function action({ params, request }: ActionFunctionArgs) {
   if (result.success) {
     return json({ success: true });
   } else {
-    return json({ error: result.error, variableErrors: result.variableErrors }, { status: 400 });
+    return json(
+      { error: result.error, variableErrors: result.variableErrors },
+      { status: result.conflict ? 409 : 400 }
+    );
   }
 }
 
