@@ -480,6 +480,7 @@ export class IdempotencyKeyConcern {
     const parentRunId = request.body.options?.parentRunId;
     const resumeParentOnCompletion = request.body.options?.resumeParentOnCompletion;
 
+    let resolvedRun: TaskRun = existingRun;
     //We're using `andWait` so we need to block the parent run with a waitpoint
     if (resumeParentOnCompletion && parentRunId) {
       // `parentRunId` comes from the request body and isn't re-validated
@@ -498,13 +499,19 @@ export class IdempotencyKeyConcern {
         throw new ServiceValidationError("Parent run not found in the calling environment", 404);
       }
 
-      // Get or create waitpoint lazily (existing run may not have one if it was standalone)
+      // Get or create waitpoint lazily (existing run may not have one if it was standalone). The
+      // late-waiting parent decides a new mint's residency; an existing association is reused unchanged.
       let associatedWaitpoint = existingRun.associatedWaitpoint;
       if (!associatedWaitpoint) {
         associatedWaitpoint = await this.engine.getOrCreateRunWaitpoint({
           runId: existingRun.id,
           projectId: request.environment.projectId,
           environmentId: request.environment.id,
+          blockingParentRunId: parentRunInternalId,
+          organizationId: request.environment.organizationId,
+          // The batch header fixes new child storage; existing associations retain their owner.
+          blockingViaBatch: !!request.options?.batchId,
+          blockingBatchId: request.options?.batchId,
         });
       }
 
@@ -525,7 +532,19 @@ export class IdempotencyKeyConcern {
                 ? `${event.traceparent.spanId}:${event.spanId}`
                 : event.spanId;
 
-          await this.engine.blockRunWithWaitpoint({
+          // A store-format waitpoint (reused or minted) needs the caller-owned block-operation identity;
+          // undefined for a legacy waitpoint, which ignores it.
+          const idempotentBlockOperation =
+            (await this.engine.waitpointSystem.isWaitpointStoreEnabled(
+              request.environment.organizationId
+            ))
+              ? await this.engine.waitpointSystem.buildStoreBlockOperation({
+                  runId: parentRunInternalId,
+                  waitpointId: associatedWaitpoint!.id,
+                  organizationId: request.environment.organizationId,
+                })
+              : undefined;
+          const blockInput: Parameters<typeof this.engine.blockRunWithWaitpoint>[0] = {
             runId: parentRunInternalId,
             waitpoints: associatedWaitpoint!.id,
             spanIdToComplete: spanId,
@@ -538,12 +557,19 @@ export class IdempotencyKeyConcern {
             projectId: request.environment.projectId,
             organizationId: request.environment.organizationId,
             tx: dedupClient,
+          };
+          if (idempotentBlockOperation !== undefined)
+            blockInput.blockOperation = idempotentBlockOperation;
+          // A batch position another run already holds resolves the item to that run.
+          resolvedRun = await this.engine.blockRunWithCachedRun({
+            ...blockInput,
+            cachedRun: existingRun,
           });
         }
       );
     }
 
-    return { isCached: true, run: existingRun };
+    return { isCached: true, run: resolvedRun };
   }
 
   // Re-serialise a cross-DB recreate through the claim after a claim-loser's

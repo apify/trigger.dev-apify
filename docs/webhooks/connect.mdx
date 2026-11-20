@@ -1,0 +1,37 @@
+---
+title: "Connect a webhook provider"
+description: "Register an endpoint's URL and signing credential with the provider, by hand or with an AI coding agent, then check that events arrive."
+sidebarTitle: "Connect a provider"
+---
+
+Connect a provider to an [endpoint](/webhooks/overview) by registering the endpoint's URL with the provider and giving Trigger.dev the credential that verifies its requests. Each [provider page](/webhooks/providers) shows where that provider keeps its webhook settings; for a provider that isn't listed, define a [custom provider](/webhooks/custom-providers) first.
+
+Deploy the project or start `trigger dev` first. Once the CLI finds the endpoint, it appears on the environment's **Webhooks** page. The **Signing secret** column shows **Ready** when the endpoint can verify deliveries and **Needs secret** until then. Every delivery is rejected while an endpoint needs its secret.
+
+## Set it up by hand
+
+<Steps>
+  <Step title="Copy the webhook URL">
+    Open the endpoint from the Webhooks page and copy the **Webhook URL**.
+  </Step>
+  <Step title="Configure the provider">
+    Add the URL as the webhook destination in your provider's dashboard and select the events your subscribers need.
+  </Step>
+  <Step title="Set the credential">
+    Choose **Set signing secret** and paste the secret the provider issues, choose **Generate secret** and paste the value into the provider, or choose **Set public key** for a provider that signs with a key pair. The [provider page](/webhooks/providers) says which one it needs; see [Signing secrets](/webhooks/signing-secrets#set-the-credential).
+
+    Set the credential before sending a test event or asking the provider to validate the URL.
+  </Step>
+</Steps>
+
+## Verify the connection
+
+Send a test event from your provider, or use the endpoint's **Test** tab. The event appears on the endpoint's **Deliveries** tab. Open it to see which subscribers it reached and follow the links to their runs; see [Deliveries and endpoints](/webhooks/deliveries) for the statuses.
+
+If no delivery appears, check that the provider uses the copied URL and that both sides have the same signing secret or public key.
+
+## Set it up with an AI agent
+
+Each endpoint has a setup prompt: the URL, the events its subscribers filter on, the provider's own setup steps, and how to generate or store the signing secret. Choose **Copy setup prompt** on the Webhooks page or the endpoint's page, and paste it into an AI coding agent such as Claude Code.
+
+The prompt tells the agent to use the Trigger.dev MCP server (`npx trigger.dev@latest install-mcp`), which reads the endpoint and stores or generates its secret. See [Signing secrets](/webhooks/signing-secrets) for the MCP tools, CLI commands and REST API.

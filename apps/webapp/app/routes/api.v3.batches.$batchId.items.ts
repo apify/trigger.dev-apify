@@ -7,12 +7,13 @@ import {
   streamToAsyncIterable,
 } from "~/runEngine/services/streamBatchItems.server";
 import { logger } from "~/services/logger.server";
-import { rbac } from "~/services/rbac.server";
+import { authenticateBearerWithTelemetry } from "~/services/authTelemetry.server";
 import {
   authorizedBatchItemStream,
   BatchItemAuthorizationError,
 } from "~/utils/batchItemAuthorization";
 import { ServiceValidationError } from "~/v3/services/baseService.server";
+import { storedPayloadPointerPolicy } from "~/services/packetApi.server";
 
 const ParamsSchema = z.object({
   batchId: z.string(),
@@ -64,7 +65,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
   // reach it having passed no checks at all. Any logic added between here and
   // that call runs authenticated but NOT authorized, so keep new per-request
   // work behind it.
-  const authResult = await rbac.authenticateBearer(request, { allowJWT: true });
+  const authResult = await authenticateBearerWithTelemetry(request, {
+    allowJWT: true,
+  });
 
   if (!authResult.ok) {
     return json({ error: authResult.error }, { status: authResult.status });
@@ -96,7 +99,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
       streamToAsyncIterable(parsedStream),
       authResult.ability,
       batchId,
-      authResult.subject.type !== "publicJWT"
+      storedPayloadPointerPolicy(authResult.subject)
     );
 
     // Process the stream

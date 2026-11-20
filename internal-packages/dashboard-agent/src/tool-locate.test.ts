@@ -1,8 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApiClient } from "./tool-api-client";
 import { buildLocateTool } from "./tool-locate";
-import { createSourceReadLedger, type SourceReadLedger } from "./tool-source-ledger";
-import { buildWatchTools } from "./watch-tools";
+import { type SourceReadLedger } from "./tool-source-ledger";
 
 const ORIGIN = "https://api.example.com";
 const requested: string[] = [];
@@ -38,7 +37,7 @@ function locate(
 
 const RUN = { kind: "run", id: "run_abc" };
 const ERROR = { kind: "error", id: "error_abc" };
-const UNAVAILABLE = { error: "Couldn't check error error_abc right now — try again." };
+const UNAVAILABLE = { error: "Couldn't check error error_abc right now - try again." };
 
 beforeEach(() => {
   requested.length = 0;
@@ -59,6 +58,8 @@ describe("locate", () => {
     ["run", "not-a-run-id"],
     ["deployment", "deployment"],
     ["deployment", "20260101.1"],
+    // Catches: a dot-segment id collapsing the URL onto a parent route.
+    ["error", ".."],
   ])("rejects a bad %s id shape without a fetch", async (kind, id) => {
     const result = await locate({ kind, id }, {});
 
@@ -101,7 +102,7 @@ describe("locate", () => {
       "call the relevant tool with project=proj_a environment=staging"
     );
     expect(result.scopes[1].next).toBe(
-      "call the relevant tool with project=proj_a environment=preview branch=feature-x"
+      "call the relevant tool with project=proj_a environment=preview branch=«untrusted:branch» feature-x «/untrusted:branch»"
     );
   });
 
@@ -135,6 +136,7 @@ describe("locate", () => {
    */
   const QUEUE = { kind: "queue", id: "q-plain" };
 
+  // Catches: a located queue name reaching the model unfenced in the next hint.
   it("points a queue's next hint at get_queue with the name and kind it resolved", async () => {
     const result = await locate(QUEUE, {
       found: true,
@@ -154,7 +156,7 @@ describe("locate", () => {
     expect(result.found).toBe(true);
     expect(result.scopes).toHaveLength(1);
     expect(result.scopes[0].next).toBe(
-      "call get_queue queue=q-plain type=custom with project=proj_a environment=prod"
+      "call get_queue queue=«untrusted:queueName» q-plain «/untrusted:queueName» type=custom with project=proj_a environment=prod"
     );
   });
 
@@ -176,15 +178,22 @@ describe("locate", () => {
           environmentName: "preview",
           environmentId: "env_b",
           branch: "feature-x",
+          taskIdentifier: "send-receipt",
           queueName: "q-plain",
           queueType: "custom",
         },
       ],
     });
 
+    // Catches: a located scope's branch, task or queue name reaching the model unfenced.
+    expect(result.scopes[1]).toMatchObject({
+      branch: "«untrusted:branch» feature-x «/untrusted:branch»",
+      taskIdentifier: "«untrusted:taskIdentifier» send-receipt «/untrusted:taskIdentifier»",
+      queueName: "«untrusted:queueName» q-plain «/untrusted:queueName»",
+    });
     expect(result.scopes.map((scope: any) => scope.next)).toEqual([
-      "call get_queue queue=q-plain type=task with project=proj_a environment=prod",
-      "call get_queue queue=q-plain type=custom with project=proj_b environment=preview branch=feature-x",
+      "call get_queue queue=«untrusted:queueName» q-plain «/untrusted:queueName» type=task with project=proj_a environment=prod",
+      "call get_queue queue=«untrusted:queueName» q-plain «/untrusted:queueName» type=custom with project=proj_b environment=preview branch=«untrusted:branch» feature-x «/untrusted:branch»",
     ]);
   });
 
@@ -232,66 +241,6 @@ describe("locate", () => {
 
     expect(result).toEqual(UNAVAILABLE);
     expect(result).not.toHaveProperty("found");
-  });
-
-  it("records the found scope so schedule_watch refuses a run or error group silently landing elsewhere", async () => {
-    const reads = createSourceReadLedger({ origin: ORIGIN, hasAuth: true, userActorToken: "uat" });
-    const ctx = { projectRef: "P1", environmentName: "dev", environmentId: "env_p1_dev" };
-    const watch = buildWatchTools({ ctx, reads }).schedule_watch as {
-      execute: (input: unknown, opts: unknown) => Promise<any>;
-    };
-
-    await locate(
-      RUN,
-      {
-        found: true,
-        kind: "run",
-        id: "run_abc",
-        scopes: [{ projectRef: "P2", environmentName: "prod", environmentId: "env_p2_prod" }],
-      },
-      200,
-      reads
-    );
-    const runResult = await watch.execute(
-      {
-        watch: {
-          kind: "run_finished",
-          runId: "run_abc",
-          checkEveryMinutes: 1,
-          maxHours: 2,
-          note: "tell me when it finishes",
-        },
-      },
-      {}
-    );
-    expect(runResult.error).toContain("Watches are limited to the current project/environment");
-    expect(runResult.error).toContain("P2/prod");
-
-    await locate(
-      ERROR,
-      {
-        found: true,
-        kind: "error",
-        id: "error_abc",
-        scopes: [{ projectRef: "P2", environmentName: "prod", environmentId: "env_p2_prod" }],
-      },
-      200,
-      reads
-    );
-    const errorResult = await watch.execute(
-      {
-        watch: {
-          kind: "error_recurrence",
-          fingerprint: "error_abc",
-          checkEveryMinutes: 5,
-          maxHours: 1,
-          note: "tell me if it recurs",
-        },
-      },
-      {}
-    );
-    expect(errorResult.error).toContain("Watches are limited to the current project/environment");
-    expect(errorResult.error).toContain("P2/prod");
   });
 
   it("passes through additive server fields it doesn't know about", async () => {

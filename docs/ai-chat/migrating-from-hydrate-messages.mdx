@@ -178,7 +178,7 @@ With `hydrateMessages`, your hook was the source of truth and the runtime wrote 
     ```ts lib/transcript-storage.ts
     loadContext: async ({ chatId, clientData }, { incomingMessages }) => {
       const branch = await db.activeBranch(chatId, clientData.userId);
-      return [...branch, ...incomingMessages];
+      return [...branch, ...incomingMessages.filter((m) => m.role === "user")];
     },
     ```
 
@@ -194,7 +194,7 @@ With `hydrateMessages`, your hook was the source of truth and the runtime wrote 
       storage: transcriptStorage,
       clientDataSchema: z.object({ userId: z.string() }),
       run: async ({ messages, signal, streamText }) =>
-        streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal }),
+        streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal }),
     });
     ```
   </Step>

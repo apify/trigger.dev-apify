@@ -52,7 +52,7 @@ function parseNano(value: string): bigint | undefined {
   }
 }
 
-function parseMetadata(metadata: string): Record<string, unknown> | undefined {
+export function parseMetadata(metadata: string): Record<string, unknown> | undefined {
   if (!metadata) {
     return undefined;
   }
@@ -111,6 +111,10 @@ export class TraceChunkAssembler {
   // after a failed tick; released once a tail from that point completes.
   #tailFloor: number | null = null;
   #tailFloorHeld = false;
+  // Spans first seen in a live tail read, not in a stored one.
+  #liveSpanIds = new Set<string>();
+  // Times a span already held got a new message, so search can refilter on the same tree.
+  #messageChanges = 0;
 
   mergeChunk(events: TraceChunkEvent[], options?: { source?: TraceChunkSource }): void {
     const source = options?.source ?? "stream";
@@ -143,6 +147,15 @@ export class TraceChunkAssembler {
 
   markRendered(): void {
     this.#changedSinceRender = false;
+  }
+
+  /** Spans first seen in a live tail read. Only grows; a later tail re-read doesn't add. */
+  get liveSpanIds(): ReadonlySet<string> {
+    return this.#liveSpanIds;
+  }
+
+  get messageChanges(): number {
+    return this.#messageChanges;
   }
 
   #renderedSpan(spanId: string): RenderedSpan | undefined {
@@ -205,6 +218,7 @@ export class TraceChunkAssembler {
         },
       };
       this.#nodes.set(event.spanId, node);
+      if (source === "tail") this.#liveSpanIds.add(event.spanId);
     }
 
     if (isLogEvent(event.kind)) {
@@ -252,8 +266,9 @@ export class TraceChunkAssembler {
     }
 
     if (event.kind === "SPAN") {
-      if (!isStalePartial) {
+      if (!isStalePartial && node.data.message !== event.message) {
         node.data.message = event.message;
+        this.#messageChanges++;
       }
       if (event.status === "ERROR") {
         node.data.isError = true;
@@ -357,10 +372,11 @@ export class TraceChunkAssembler {
     return this.#nodes.size;
   }
 
-  // Next tail's starting write time; null when rows have none (v1 or empty).
+  // Next tail's starting write time; null when rows have none (v1).
   tailBase(): number | null {
     if (this.#maxInsertedAt === null) {
-      return null;
+      // No rows yet (an empty first chunk): tail from its read time, then from each tail's.
+      return this.#nodes.size > 0 ? null : (this.#tailHighWater ?? this.#tailFloor);
     }
     if (this.#tailFloor === null) {
       return this.#tailHighWater ?? this.#maxInsertedAt;

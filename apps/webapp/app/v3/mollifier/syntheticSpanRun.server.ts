@@ -71,7 +71,8 @@ export async function buildSyntheticSpanRun(args: {
       ? "inactive"
       : undefined;
 
-  const taskKind = RunAnnotations.safeParse(run.annotations).data?.taskKind;
+  const annotations = RunAnnotations.safeParse(run.annotations).data;
+  const taskKind = annotations?.taskKind;
   const isAgentRun = taskKind === "AGENT";
   const isScheduled = taskKind === "SCHEDULED";
   const isWebhook = taskKind === "WEBHOOK";
@@ -156,6 +157,7 @@ export async function buildSyntheticSpanRun(args: {
     isAgentRun,
     isScheduled,
     isWebhook,
+    executionPolicy: annotations?.executionPolicy,
     payload,
     payloadType: run.payloadType ?? "application/json",
     output: undefined,
@@ -197,6 +199,8 @@ export async function buildSyntheticSpanRun(args: {
     engine: "V2",
     region: null,
     workerQueue: run.workerQueue ?? "",
+    workerCell: undefined,
+    workerLane: undefined,
     traceId: run.traceId ?? "",
     spanId: run.spanId ?? "",
     isCached: false,

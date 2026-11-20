@@ -1,6 +1,7 @@
 import { Worker as RedisWorker } from "@trigger.dev/redis-worker";
 import { z } from "zod";
 import { env } from "~/env.server";
+import { DIRECTORY_SYNC_ATTRIBUTION } from "~/models/memberAudit.server";
 import { logger } from "~/services/logger.server";
 import { singleton } from "~/utils/singleton";
 import { ssoController } from "~/services/sso.server";
@@ -74,7 +75,9 @@ function initializeWorker() {
           data: payload.data,
         });
         if (result.isErr()) {
-          const error = new Error(`account webhook processing failed: ${result.error}`);
+          const error = new Error(
+            `account webhook processing failed for ${payload.event}: ${result.error}`
+          );
           if (result.error === "not_ready") {
             Object.assign(error, { logLevel: "warn" as const });
           }
@@ -83,7 +86,10 @@ function initializeWorker() {
         // Directory-sync events return membership effects to apply against
         // public.* tables (the plugin never writes those). A throw here
         // bubbles to the worker for retry; effects are idempotent.
-        const { unqueuedUserIds } = await applyDirectorySyncEffects(result.value.effects);
+        const { unqueuedUserIds } = await applyDirectorySyncEffects(
+          result.value.effects,
+          DIRECTORY_SYNC_ATTRIBUTION
+        );
         if (unqueuedUserIds.length > 0) {
           throw unqueuedProvisioningError(unqueuedUserIds);
         }

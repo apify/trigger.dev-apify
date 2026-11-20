@@ -329,7 +329,10 @@ describe("runAttemptSystem.resolveTaskRunContext controlPlaneResolver (single-DB
       const resolver: ControlPlaneResolver = {
         resolveEnv: passthrough.resolveEnv.bind(passthrough),
         resolveEnvDeletionState: passthrough.resolveEnvDeletionState.bind(passthrough),
+        resolveDeploymentStatus: passthrough.resolveDeploymentStatus.bind(passthrough),
         resolveWorkerVersion: passthrough.resolveWorkerVersion.bind(passthrough),
+        resolveWorkerVersionFromPrimary:
+          passthrough.resolveWorkerVersionFromPrimary.bind(passthrough),
         assertEnvExists: passthrough.assertEnvExists.bind(passthrough),
         async resolveAuthenticatedEnv() {
           return null;

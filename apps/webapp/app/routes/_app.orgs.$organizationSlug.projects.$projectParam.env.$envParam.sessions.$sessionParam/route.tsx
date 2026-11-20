@@ -1,6 +1,6 @@
 import { BoltIcon, BoltSlashIcon } from "@heroicons/react/20/solid";
 import { BookOpenIcon, CheckIcon } from "@heroicons/react/24/solid";
-
+import { useLocation } from "@remix-run/react";
 import { type LoaderFunctionArgs } from "@remix-run/server-runtime";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Clipboard, ClipboardCheck } from "lucide-react";
@@ -18,6 +18,7 @@ import { TextWrapIcon } from "~/assets/icons/TextWrapIcon";
 import { CodeBlock } from "~/components/code/CodeBlock";
 import { PageBody } from "~/components/layout/AppLayout";
 import { Button, LinkButton } from "~/components/primitives/Buttons";
+import { Callout } from "~/components/primitives/Callout";
 import { CopyableText } from "~/components/primitives/CopyableText";
 import { DateTime } from "~/components/primitives/DateTime";
 import { Dialog, DialogTrigger } from "~/components/primitives/Dialog";
@@ -28,6 +29,7 @@ import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
+  type ResizableSnapshot,
 } from "~/components/primitives/Resizable";
 import { Spinner } from "~/components/primitives/Spinner";
 import { TabButton, TabContainer } from "~/components/primitives/Tabs";
@@ -46,6 +48,10 @@ import {
   TaskRunStatusCombo,
 } from "~/components/runs/v3/TaskRunStatus";
 import { TranscriptDownloadButton } from "~/components/sessions/v1/TranscriptDownloadButton";
+import {
+  type ConversationTranscript,
+  useConversationTranscript,
+} from "~/components/sessions/v1/useConversationTranscript";
 import { CloseSessionDialog } from "~/components/sessions/v1/CloseSessionDialog";
 import { SessionStatusCombo } from "~/components/sessions/v1/SessionStatus";
 import { $replica } from "~/db.server";
@@ -55,9 +61,22 @@ import { useProject } from "~/hooks/useProject";
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { useHasAdminAccess } from "~/hooks/useUser";
 import { redirectWithErrorMessage } from "~/models/message.server";
-import { findProjectBySlug } from "~/models/project.server";
+import { findProjectWithOrgFlagsBySlug } from "~/models/project.server";
 import { findEnvironmentBySlug } from "~/models/runtimeEnvironment.server";
 import { SessionPresenter } from "~/presenters/v3/SessionPresenter.server";
+import { featuresForRequest } from "~/features.server";
+import { canAccessSessionTrace } from "~/v3/canAccessSessionTrace.server";
+import { SessionTraceTab } from "~/components/sessions/v1/trace/SessionTraceTab";
+import { useSessionViewAnalytics } from "~/components/sessions/v1/trace/useSessionViewAnalytics";
+import { SessionRunInspector } from "~/components/sessions/v1/trace/SessionRunInspector";
+import { SessionPanelStoreProvider } from "~/components/sessions/v1/trace/sessionPanelStore";
+import { useSessionTraceSelection } from "~/components/sessions/v1/trace/useSessionTraceSelection";
+import {
+  SESSION_TREE_AUTOSAVE_ID,
+  resolveSessionPageView,
+  type SessionPageView,
+} from "~/components/sessions/v1/trace/sessionTraceView";
+import { getResizableSnapshot } from "~/services/resizablePanel.server";
 import { tryCatch } from "@trigger.dev/core/utils";
 import { S2RealtimeStreams } from "~/services/realtime/s2realtimeStreams.server";
 import {
@@ -70,7 +89,7 @@ import {
   type StreamChunk,
   useRealtimeStream,
 } from "~/routes/resources.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs.$runParam.streams.$streamKey/route";
-import { requireUserId } from "~/services/session.server";
+import { requireUser } from "~/services/session.server";
 import { type SessionStatus } from "~/services/sessionsRepository/sessionsRepository.server";
 import { cn } from "~/utils/cn";
 import { throwNotFound } from "~/utils/httpErrors";
@@ -79,13 +98,16 @@ import {
   EnvironmentParamSchema,
   v3RunPath,
   v3RunsPath,
+  v3SessionRunsPath,
   v3SessionsPath,
+  v3SessionTranscriptPath,
 } from "~/utils/pathBuilder";
 import { sessionsAgentPageContext } from "~/components/dashboard-agent/suggested-prompts";
 import { WhenAgentUnavailable } from "~/components/dashboard-agent/WhenAgentUnavailable";
 import type { Handle } from "~/utils/handle";
 
 import { pageMeta } from "~/utils/pageTitle";
+import { shouldRevalidateSessionPage } from "./shouldRevalidateSessionPage";
 
 const ParamsSchema = EnvironmentParamSchema.extend({
   sessionParam: z.string(),
@@ -95,21 +117,40 @@ export const handle: Handle = {
   agentPageContext: (data) => sessionsAgentPageContext(data),
 };
 
+export { shouldRevalidateSessionPage as shouldRevalidate };
+
 export const meta = pageMeta(({ params }) => [params.sessionParam ?? "Session", "Sessions"]);
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
-  const userId = await requireUserId(request);
+  const user = await requireUser(request);
+  const userId = user.id;
   const { projectParam, organizationSlug, envParam, sessionParam } = ParamsSchema.parse(params);
 
-  const project = await findProjectBySlug(organizationSlug, projectParam, userId);
+  const project = await findProjectWithOrgFlagsBySlug(organizationSlug, projectParam, userId);
   if (!project) {
     return redirectWithErrorMessage("/", request, "Project not found");
   }
+
+  const sessionTraceEnabled = await canAccessSessionTrace({
+    isManagedCloud: featuresForRequest(request).isManagedCloud,
+    isAdmin: user.admin,
+    orgFeatureFlags: project.organization.featureFlags,
+  });
 
   const environment = await findEnvironmentBySlug(project.id, envParam, userId);
   if (!environment) {
     throwNotFound("Environment not found");
   }
+
+  // Opening on the Trace tab skips the transcript; the Conversation tab fetches it when shown.
+  const searchParams = new URL(request.url).searchParams;
+  const opensOnConversation =
+    resolveSessionPageView({
+      view: searchParams.get("view") ?? undefined,
+      raw: searchParams.get("raw") ?? undefined,
+      channel: searchParams.get("channel") ?? undefined,
+      traceEnabled: sessionTraceEnabled,
+    }) === "conversation";
 
   const presenter = new SessionPresenter($replica);
   const session = await presenter.call({
@@ -118,6 +159,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     sessionParam,
     projectExternalRef: project.externalRef,
     environmentSlug: environment.slug,
+    readTranscript: opensOnConversation,
   });
 
   if (!session) {
@@ -147,11 +189,23 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     }
   }
 
-  return typedjson({ session, channels, loadedAt: Date.now() });
+  const traceTreeSnapshot = sessionTraceEnabled
+    ? await getResizableSnapshot(request, SESSION_TREE_AUTOSAVE_ID)
+    : undefined;
+
+  return typedjson({
+    session,
+    channels,
+    transcriptRead: opensOnConversation,
+    sessionTraceEnabled,
+    traceTreeSnapshot,
+    loadedAt: Date.now(),
+  });
 };
 
 export default function Page() {
-  const { session, channels, loadedAt } = useTypedLoaderData<typeof loader>();
+  const { session, channels, transcriptRead, sessionTraceEnabled, traceTreeSnapshot, loadedAt } =
+    useTypedLoaderData<typeof loader>();
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
@@ -188,20 +242,36 @@ export default function Page() {
         </PageAccessories>
       </NavBar>
       <PageBody scrollable={false}>
-        <ResizablePanelGroup orientation="horizontal" className="max-h-full">
-          <ResizablePanel id="session-conversation" min={"300px"}>
-            <ConversationPane session={session} channels={channels} />
-          </ResizablePanel>
-          <ResizableHandle id="session-handle" />
-          <ResizablePanel
-            id="session-inspector"
-            min="380px"
-            default="420px"
-            className="overflow-hidden"
-          >
-            <InspectorPane session={session} status={status} isExpired={isExpired} />
-          </ResizablePanel>
-        </ResizablePanelGroup>
+        <SessionPanelStoreProvider>
+          <ResizablePanelGroup orientation="horizontal" className="max-h-full">
+            <ResizablePanel id="session-conversation" min={"300px"}>
+              {sessionTraceEnabled ? (
+                <SessionLeftPane
+                  session={session}
+                  channels={channels}
+                  transcriptRead={transcriptRead}
+                  traceTreeSnapshot={traceTreeSnapshot}
+                />
+              ) : (
+                <StandaloneConversationPane session={session} channels={channels} />
+              )}
+            </ResizablePanel>
+            <ResizableHandle id="session-handle" />
+            <ResizablePanel
+              id="session-inspector"
+              min="380px"
+              default="420px"
+              className="overflow-hidden"
+            >
+              <InspectorPane
+                session={session}
+                status={status}
+                isExpired={isExpired}
+                sessionTraceEnabled={sessionTraceEnabled}
+              />
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        </SessionPanelStoreProvider>
       </PageBody>
     </>
   );
@@ -209,7 +279,220 @@ export default function Page() {
 
 type LoadedSession = ReturnType<typeof useTypedLoaderData<typeof loader>>["session"];
 
-function ConversationPane({ session, channels }: { session: LoadedSession; channels: string[] }) {
+// Trace and Conversation tabs, shown when the session trace is enabled.
+function SessionLeftPane({
+  session,
+  channels,
+  transcriptRead,
+  traceTreeSnapshot,
+}: {
+  session: LoadedSession;
+  channels: string[];
+  transcriptRead: boolean;
+  traceTreeSnapshot: ResizableSnapshot | undefined;
+}) {
+  const organization = useOrganization();
+  const project = useProject();
+  const environment = useEnvironment();
+  const { replace } = useSearchParams();
+  const view = useSessionPageView(true);
+  const track = useSessionViewAnalytics();
+  // Kept here so switching tabs doesn't fetch it again.
+  const transcript = useSessionTranscript({
+    session,
+    channels,
+    transcriptRead,
+    shown: view === "conversation",
+  });
+
+  // Each tab mounts the first time it's shown and then stays mounted, so switching back keeps
+  // its state and the conversation stream never stops.
+  const [opened, setOpened] = useState(() => ({
+    trace: view === "trace",
+    conversation: view === "conversation",
+  }));
+  if (!opened[view]) setOpened({ ...opened, [view]: true });
+
+  const showView = (next: SessionPageView) => {
+    if (next === view) return;
+    if (next === "conversation") track("conversation_opened");
+    replace({ view: next });
+  };
+
+  // Arrow keys, Home and End move between the tabs and show the one they land on.
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const next = tabViewForKey(view, event.key);
+    if (!next) return;
+    event.preventDefault();
+    showView(next);
+    document.getElementById(sessionTabId(next))?.focus();
+  };
+
+  return (
+    <div className="grid h-full max-h-full grid-rows-[auto_1fr] overflow-hidden bg-background-bright">
+      <div role="tablist" aria-label="Session view" className="border-b border-grid-bright px-3">
+        <TabContainer className="-mb-px">
+          {SESSION_PAGE_VIEWS.map((tab) => (
+            <TabButton
+              key={tab}
+              id={sessionTabId(tab)}
+              role="tab"
+              aria-selected={view === tab}
+              aria-controls={sessionTabPanelId(tab)}
+              tabIndex={view === tab ? 0 : -1}
+              isActive={view === tab}
+              layoutId="session-left-view"
+              onClick={() => showView(tab)}
+              onKeyDown={onTabKeyDown}
+            >
+              {tab === "trace" ? "Trace" : "Conversation"}
+            </TabButton>
+          ))}
+        </TabContainer>
+      </div>
+      <div className="relative min-h-0 overflow-hidden">
+        {opened.trace && (
+          <SessionTabPanel view="trace" active={view === "trace"}>
+            <SessionTraceTab
+              key={session.friendlyId}
+              runsPath={v3SessionRunsPath(organization, project, environment, session)}
+              treeSnapshot={traceTreeSnapshot}
+              active={view === "trace"}
+            />
+          </SessionTabPanel>
+        )}
+        {opened.conversation && (
+          <SessionTabPanel view="conversation" active={view === "conversation"}>
+            <ConversationPane
+              session={session}
+              channels={channels}
+              transcript={transcript}
+              pinConversationView
+              active={view === "conversation"}
+            />
+          </SessionTabPanel>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// The hidden tab stays laid out (not display:none), so its scroll positions and panel sizes
+// survive, but it can't be focused or clicked.
+function SessionTabPanel({
+  view,
+  active,
+  children,
+}: {
+  view: SessionPageView;
+  active: boolean;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (ref.current) ref.current.inert = !active;
+  }, [active]);
+  return (
+    <div
+      ref={ref}
+      id={sessionTabPanelId(view)}
+      role="tabpanel"
+      aria-labelledby={sessionTabId(view)}
+      aria-hidden={!active}
+      className={cn("absolute inset-0", !active && "invisible")}
+    >
+      {children}
+    </div>
+  );
+}
+
+const SESSION_PAGE_VIEWS: SessionPageView[] = ["trace", "conversation"];
+
+const sessionTabId = (view: SessionPageView) => `session-tab-${view}`;
+const sessionTabPanelId = (view: SessionPageView) => `session-tabpanel-${view}`;
+
+function tabViewForKey(view: SessionPageView, key: string): SessionPageView | undefined {
+  const index = SESSION_PAGE_VIEWS.indexOf(view);
+  const last = SESSION_PAGE_VIEWS.length - 1;
+  switch (key) {
+    case "ArrowRight":
+      return SESSION_PAGE_VIEWS[index === last ? 0 : index + 1];
+    case "ArrowLeft":
+      return SESSION_PAGE_VIEWS[index === 0 ? last : index - 1];
+    case "Home":
+      return SESSION_PAGE_VIEWS[0];
+    case "End":
+      return SESSION_PAGE_VIEWS[last];
+    default:
+      return undefined;
+  }
+}
+
+/** The saved transcript, wanted while the rendered conversation is shown (Raw and channels don't use it). */
+function useSessionTranscript({
+  session,
+  channels,
+  transcriptRead,
+  shown,
+}: {
+  session: LoadedSession;
+  channels: string[];
+  transcriptRead: boolean;
+  shown: boolean;
+}) {
+  const organization = useOrganization();
+  const project = useProject();
+  const environment = useEnvironment();
+  const { value } = useSearchParams();
+  const channelParam = value("channel");
+  return useConversationTranscript({
+    transcriptPath: v3SessionTranscriptPath(
+      organization,
+      project,
+      environment,
+      session.agentView.sessionId
+    ),
+    loaderSeed: session.agentView.transcriptSeed,
+    loaderFailed: session.agentView.transcriptFailed,
+    transcriptRead,
+    wanted: shown && value("raw") !== "1" && !(channelParam && channels.includes(channelParam)),
+  });
+}
+
+// The page without the Trace tab: the loader always reads the transcript.
+function StandaloneConversationPane({
+  session,
+  channels,
+}: {
+  session: LoadedSession;
+  channels: string[];
+}) {
+  const transcript = useSessionTranscript({ session, channels, transcriptRead: true, shown: true });
+
+  return (
+    <ConversationPane
+      session={session}
+      channels={channels}
+      transcript={transcript}
+      pinConversationView={false}
+    />
+  );
+}
+
+function ConversationPane({
+  session,
+  channels,
+  transcript,
+  pinConversationView,
+  active = true,
+}: {
+  session: LoadedSession;
+  channels: string[];
+  transcript: ConversationTranscript;
+  /** Keep `?view=conversation` so clearing Raw or a channel doesn't switch to the Trace tab. */
+  pinConversationView: boolean;
+  active?: boolean;
+}) {
   const organization = useOrganization();
   const project = useProject();
   const environment = useEnvironment();
@@ -222,13 +505,15 @@ function ConversationPane({ session, channels }: { session: LoadedSession; chann
   const encodedSession = encodeURIComponent(sessionId);
   const sessionResourceBase = `/resources/orgs/${organization.slug}/projects/${project.slug}/env/${environment.slug}/sessions/${encodedSession}/realtime/v1`;
 
+  const conversationView = pinConversationView ? "conversation" : undefined;
   const setView = useCallback(
-    (raw: boolean) => replace({ raw: raw ? "1" : undefined, channel: undefined }),
-    [replace]
+    (raw: boolean) =>
+      replace({ raw: raw ? "1" : undefined, channel: undefined, view: conversationView }),
+    [replace, conversationView]
   );
   const selectChannel = useCallback(
-    (channel: string) => replace({ channel, raw: undefined }),
-    [replace]
+    (channel: string) => replace({ channel, raw: undefined, view: conversationView }),
+    [replace, conversationView]
   );
 
   const utilityBarProps = {
@@ -266,8 +551,33 @@ function ConversationPane({ session, channels }: { session: LoadedSession; chann
       ) : (
         <>
           <ConversationUtilityBar isRaw={isRaw} onChangeView={setView} {...utilityBarProps} />
+          {transcript.ready && transcript.failed && (
+            <Callout
+              variant="warning"
+              className="mx-3 mt-2 w-auto"
+              cta={
+                <Button variant="secondary/small" onClick={transcript.retry}>
+                  Retry
+                </Button>
+              }
+            >
+              Couldn't load earlier messages. Only the latest ones are shown.
+            </Callout>
+          )}
           <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-3 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
-            <AgentView key={session.agentView.sessionId} agentView={session.agentView} />
+            {/* The view reads its seed when it subscribes, so it mounts once the seed is in. */}
+            {transcript.ready ? (
+              <AgentView
+                key={session.agentView.sessionId}
+                agentView={{ ...session.agentView, transcriptSeed: transcript.seed }}
+                paused={!active}
+              />
+            ) : (
+              <div className="flex items-center justify-center gap-2 py-6">
+                <Spinner className="size-4" />
+                <Paragraph variant="small/dimmed">Loading conversation…</Paragraph>
+              </div>
+            )}
           </div>
         </>
       )}
@@ -802,7 +1112,49 @@ function MergedStreamRow({
   );
 }
 
+/** The tab the URL asks for; the loader works it out from the request the same way. */
+function useSessionPageView(traceEnabled: boolean) {
+  const { value } = useSearchParams();
+  return resolveSessionPageView({
+    view: value("view"),
+    raw: value("raw"),
+    channel: value("channel"),
+    traceEnabled,
+  });
+}
+
 function InspectorPane({
+  session,
+  status,
+  isExpired,
+  sessionTraceEnabled,
+}: {
+  session: LoadedSession;
+  status: SessionStatus;
+  isExpired: boolean;
+  sessionTraceEnabled: boolean;
+}) {
+  // A selected run or span replaces the session details; without the trace, the params mean nothing.
+  const { selection, setSelection } = useSessionTraceSelection();
+  const organization = useOrganization();
+  const project = useProject();
+  const environment = useEnvironment();
+  const onTraceTab = useSessionPageView(sessionTraceEnabled) === "trace";
+  if (sessionTraceEnabled && selection.kind !== "session") {
+    return (
+      <SessionRunInspector
+        selection={selection}
+        runsPath={v3SessionRunsPath(organization, project, environment, session)}
+        onTraceTab={onTraceTab}
+        onClose={() => setSelection({ kind: "session" })}
+      />
+    );
+  }
+
+  return <SessionDetailsPane session={session} status={status} isExpired={isExpired} />;
+}
+
+function SessionDetailsPane({
   session,
   status,
   isExpired,
@@ -883,7 +1235,8 @@ function OverviewTab({
   const project = useProject();
   const environment = useEnvironment();
   const isAdmin = useHasAdminAccess();
-  const sessionsPath = v3SessionsPath(organization, project, environment);
+  // Closing reloads this page as it is: same tab, view and selection.
+  const { pathname, search } = useLocation();
 
   return (
     <div className="flex flex-col gap-4">
@@ -903,7 +1256,7 @@ function OverviewTab({
               <CloseSessionDialog
                 sessionParam={session.friendlyId}
                 environmentId={environment.id}
-                redirectPath={`${sessionsPath}/${session.friendlyId}`}
+                redirectPath={`${pathname}${search}`}
               />
             </Dialog>
           )}

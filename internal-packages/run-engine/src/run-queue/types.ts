@@ -125,6 +125,12 @@ export interface RunQueueKeyProducer {
   queueGroupConcurrencyKeyFromQueue(queue: string): string;
   queueTotalConcurrencyLimitKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
   queueTotalConcurrencyLimitKeyFromQueue(queue: string): string;
+  queueConcurrencyKeyLimitKey(
+    env: RunQueueKeyProducerEnvironment,
+    queue: string,
+    concurrencyKey: string
+  ): string;
+  queueConcurrencyKeyLimitKeyFromQueue(queue: string): string;
   gateQueuedCounterKey(env: RunQueueKeyProducerEnvironment, queue: string): string;
 
   //env oncurrency
@@ -167,9 +173,6 @@ export interface RunQueueKeyProducer {
 
   // CK index methods
   ckIndexKeyFromQueue(queue: string): string;
-  ckVtimeKeyFromQueue(queue: string): string;
-  ckVtimeFloorKeyFromQueue(queue: string): string;
-  ckVtimeIdleKeyFromQueue(queue: string): string;
   baseQueueKeyFromQueue(queue: string): string;
   isCkWildcard(queue: string): boolean;
   toCkWildcard(queue: string): string;

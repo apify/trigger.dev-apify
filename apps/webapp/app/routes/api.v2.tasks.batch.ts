@@ -8,6 +8,14 @@ import { RunEngineBatchTriggerService } from "~/runEngine/services/batchTrigger.
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { getOneTimeUseToken } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
+import {
+  inheritedSourcePatClaim,
+  type RequestActor,
+} from "~/services/publicAccessTokenResponse.server";
+import {
+  STORED_PAYLOAD_FORBIDDEN_ERROR,
+  storedPayloadPointerPolicy,
+} from "~/services/packetApi.server";
 import { createActionApiRoute, everyResource } from "~/services/routeBuilders/apiBuilder.server";
 import {
   handleRequestIdempotency,
@@ -23,6 +31,7 @@ import { clientSafeErrorMessage } from "~/utils/prismaErrors";
 import { HeadersSchema } from "./api.v1.tasks.$taskId.trigger";
 import { determineRealtimeStreamsVersion } from "~/services/realtime/v1StreamsGlobal.server";
 import { extractJwtSigningSecretKey } from "~/services/realtime/jwtAuth.server";
+import { publicTokenSubject } from "~/services/publicTokenSubject.server";
 
 const { action, loader } = createActionApiRoute(
   {
@@ -48,12 +57,15 @@ const { action, loader } = createActionApiRoute(
     },
     corsStrategy: "all",
   },
-  async ({ body, headers, params, authentication, ability }) => {
+  async ({ body, headers, params, authentication, subject, ability }) => {
+    const allowStoredPayload = storedPayloadPointerPolicy(subject);
     if (
-      authentication.type !== "PRIVATE" &&
-      body.items.some((item) => item.options?.payloadType === "application/store")
+      body.items.some(
+        (item) =>
+          item.options?.payloadType === "application/store" && !allowStoredPayload(item.payload)
+      )
     ) {
-      return json({ error: "Stored payloads require a private API key" }, { status: 403 });
+      return json({ error: STORED_PAYLOAD_FORBIDDEN_ERROR }, { status: 403 });
     }
 
     if (!body.items.length) {
@@ -124,7 +136,11 @@ const { action, loader } = createActionApiRoute(
         runCount: cachedBatch.runCount,
       }),
       buildResponseHeaders: async (responseBody, cachedEntity) => {
-        return await responseHeaders(responseBody, authentication.environment);
+        return await responseHeaders(
+          responseBody,
+          authentication.environment,
+          authentication.actor
+        );
       },
     });
 
@@ -158,7 +174,11 @@ const { action, loader } = createActionApiRoute(
         triggerAction: "trigger",
       });
 
-      const $responseHeaders = await responseHeaders(batch, authentication.environment);
+      const $responseHeaders = await responseHeaders(
+        batch,
+        authentication.environment,
+        authentication.actor
+      );
 
       return json(batch, {
         status: 202,
@@ -205,12 +225,14 @@ const { action, loader } = createActionApiRoute(
 
 async function responseHeaders(
   batch: BatchTriggerTaskV3Response,
-  environment: AuthenticatedEnvironment
+  environment: AuthenticatedEnvironment,
+  actor: RequestActor | undefined
 ): Promise<Record<string, string>> {
   const claims = {
-    sub: environment.id,
+    sub: publicTokenSubject(environment.id),
     pub: true,
     scopes: [`read:batch:${batch.id}`],
+    ...inheritedSourcePatClaim(actor),
   };
 
   const jwt = await generateJWT({
@@ -220,7 +242,7 @@ async function responseHeaders(
   });
 
   return {
-    "x-trigger-jwt-claims": JSON.stringify({ sub: environment.id, pub: true }),
+    "x-trigger-jwt-claims": JSON.stringify({ sub: publicTokenSubject(environment.id), pub: true }),
     "x-trigger-jwt": jwt,
   };
 }

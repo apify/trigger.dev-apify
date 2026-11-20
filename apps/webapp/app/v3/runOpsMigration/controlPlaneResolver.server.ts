@@ -3,6 +3,7 @@ import type {
   PrismaClient,
   PrismaReplicaClient,
   RuntimeEnvironmentType,
+  WorkerDeploymentStatus,
 } from "@trigger.dev/database";
 import { prisma, $replica } from "~/db.server";
 import { env } from "~/env.server";
@@ -74,6 +75,20 @@ type WorkerVersionWheres = {
   taskWhere: { slug: string } | undefined;
   queueWhere: { id: string } | { name: string } | undefined;
 };
+
+function workerVersionWheres(filter: {
+  taskIdentifier?: string;
+  queue?: { lockedQueueId?: string | null; name: string };
+}): WorkerVersionWheres {
+  return {
+    taskWhere: filter.taskIdentifier ? { slug: filter.taskIdentifier } : undefined,
+    queueWhere: filter.queue
+      ? filter.queue.lockedQueueId
+        ? { id: filter.queue.lockedQueueId }
+        : { name: filter.queue.name }
+      : undefined,
+  };
+}
 
 const ALL_WORKER_VERSION_WHERES: WorkerVersionWheres = {
   taskWhere: undefined,
@@ -178,6 +193,19 @@ export class ControlPlaneResolver {
    * process can serve pre-deletion state until its entry expires. A caller whose decision must
    * not be made on that stale value uses this instead.
    */
+  /** A deployment's status from the control-plane primary: no cache, no replica lag. */
+  async resolveDeploymentStatus(
+    deploymentId: string
+  ): Promise<{ status: WorkerDeploymentStatus; deployingSince: Date } | null> {
+    const deployment = await this.controlPlanePrimary.workerDeployment.findFirst({
+      where: { id: deploymentId },
+      select: { status: true, builtAt: true, createdAt: true },
+    });
+    return deployment
+      ? { status: deployment.status, deployingSince: deployment.builtAt ?? deployment.createdAt }
+      : null;
+  }
+
   async resolveEnvDeletionState(environmentId: string): Promise<EnvDeletionState | null> {
     const env = await this.controlPlanePrimary.runtimeEnvironment.findFirst({
       where: { id: environmentId },
@@ -435,17 +463,31 @@ export class ControlPlaneResolver {
       return resolved;
     }
 
-    const wheres: WorkerVersionWheres = {
-      taskWhere: args.taskIdentifier ? { slug: args.taskIdentifier } : undefined,
-      queueWhere: args.queue
-        ? args.queue.lockedQueueId
-          ? { id: args.queue.lockedQueueId }
-          : { name: args.queue.name }
-        : undefined,
-    };
-
     const client = this.splitEnabled() ? this.controlPlaneReplica : this.controlPlanePrimary;
-    return this.#queryWorkerVersion(client, environmentId, backgroundWorkerId, type, wheres);
+    return this.#queryWorkerVersion(
+      client,
+      environmentId,
+      backgroundWorkerId,
+      type,
+      workerVersionWheres(args)
+    );
+  }
+
+  /** `resolveWorkerVersion` from the control-plane primary: no cache, no replica lag. */
+  async resolveWorkerVersionFromPrimary(args: {
+    environmentId: string;
+    backgroundWorkerId?: string;
+    type: RuntimeEnvironmentType;
+    taskIdentifier?: string;
+    queue?: { lockedQueueId?: string | null; name: string };
+  }): Promise<ResolvedWorkerVersion | null> {
+    return this.#queryWorkerVersion(
+      this.controlPlanePrimary,
+      args.environmentId,
+      args.backgroundWorkerId,
+      args.type,
+      workerVersionWheres(args)
+    );
   }
 
   async #queryWorkerVersion(
@@ -520,8 +562,10 @@ export class ControlPlaneResolver {
         deployment: {
           id: promotion.deployment.id,
           friendlyId: promotion.deployment.friendlyId,
+          status: promotion.deployment.status,
           imageReference: promotion.deployment.imageReference,
           imagePlatform: promotion.deployment.imagePlatform,
+          templateKey: promotion.deployment.templateKey,
         },
       };
     }
@@ -553,8 +597,10 @@ export class ControlPlaneResolver {
       deployment: {
         id: latestV2Deployment.id,
         friendlyId: latestV2Deployment.friendlyId,
+        status: latestV2Deployment.status,
         imageReference: latestV2Deployment.imageReference,
         imagePlatform: latestV2Deployment.imagePlatform,
+        templateKey: latestV2Deployment.templateKey,
       },
     };
   }

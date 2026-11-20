@@ -51,6 +51,14 @@ export default function Page() {
               label: "Data Stores",
               to: "/admin/data-stores",
             },
+            {
+              label: "Environment encryption",
+              to: "/admin/environment-encryption",
+            },
+            {
+              label: "OIDC",
+              to: "/admin/oidc",
+            },
           ]}
           layoutId={"admin"}
         />

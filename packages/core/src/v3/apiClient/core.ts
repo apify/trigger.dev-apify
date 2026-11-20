@@ -2,6 +2,10 @@ import { z as z3 } from "zod/v3";
 import { z } from "zod/v4";
 import { fromZodError } from "zod-validation-error/v4";
 import type { RetryOptions } from "../schemas/index.js";
+import {
+  SDK_CREDENTIAL_OPERATION_HEADER,
+  SDK_CREDENTIAL_REASON_HEADER,
+} from "../sdkCredentialTelemetry.js";
 import { calculateNextRetryDelay } from "../utils/retries.js";
 import { ApiConnectionError, ApiError, ApiSchemaValidationError } from "./errors.js";
 
@@ -32,6 +36,8 @@ export const defaultRetryOptions = {
 
 export type ZodFetchOptions<TData = any> = {
   retry?: RetryOptions;
+  resolveAccessToken?: () => string;
+  resolveHeaders?: () => Record<string, string>;
   tracer?: TriggerTracer;
   name?: string;
   attributes?: Attributes;
@@ -254,8 +260,22 @@ async function _doZodFetchWithRetries<TResponseBodySchema extends AnyZodSchema>(
   attempt = 1
 ): Promise<ZodFetchResult<inferZodSchemaOutput<TResponseBodySchema>>> {
   try {
+    let attemptRequestInit = requestInit;
+    if (options?.resolveHeaders || options?.resolveAccessToken) {
+      const headers = new Headers(requestInit?.headers);
+      headers.delete(SDK_CREDENTIAL_OPERATION_HEADER);
+      headers.delete(SDK_CREDENTIAL_REASON_HEADER);
+      if (options.resolveHeaders) {
+        for (const [key, value] of Object.entries(options.resolveHeaders()))
+          headers.set(key, value);
+      } else if (options.resolveAccessToken) {
+        headers.set("Authorization", `Bearer ${options.resolveAccessToken()}`);
+      }
+      attemptRequestInit = { ...requestInit, headers };
+    }
+
     const response = await context.with(suppressTracing(context.active()), () =>
-      fetch(url, requestInitWithCache(requestInit))
+      fetch(url, requestInitWithCache(attemptRequestInit))
     );
 
     const responseHeaders = createResponseHeaders(response.headers);
@@ -761,6 +781,8 @@ export type ApiResult<TSuccessResult> =
        */
       statusCode?: number;
       errorCode?: string | null;
+      /** The server's `x-should-retry` header, when it sent one. Overrides any status-based decision. */
+      shouldRetry?: boolean;
     };
 
 export async function wrapZodFetch<T extends AnyZodSchema>(
@@ -787,11 +809,15 @@ export async function wrapZodFetch<T extends AnyZodSchema>(
     };
   } catch (error) {
     if (error instanceof ApiError) {
+      const shouldRetryHeader = error.headers?.["x-should-retry"];
+
       return {
         success: false,
         error: error.message,
         statusCode: error.status,
         errorCode: error.code,
+        shouldRetry:
+          shouldRetryHeader === "true" ? true : shouldRetryHeader === "false" ? false : undefined,
       };
     } else if (error instanceof Error) {
       return {

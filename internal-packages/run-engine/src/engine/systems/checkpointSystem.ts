@@ -3,6 +3,8 @@ import type {
   CreateCheckpointResult,
   ExecutionResult,
 } from "@trigger.dev/core/v3";
+import { validateCheckpointLocation } from "@trigger.dev/core/v3";
+import { encodeCheckpointMetadata } from "../checkpointMetadata.js";
 import { CheckpointId } from "@trigger.dev/core/v3/isomorphic";
 import type { PrismaClientOrTransaction } from "@trigger.dev/database";
 import { sendNotificationToWorker } from "../eventBus.js";
@@ -16,11 +18,16 @@ import type { SystemResources } from "./systems.js";
 import { snapshotRouteFromSnapshot } from "@internal/run-store";
 import { ServiceValidationError } from "../errors.js";
 import type { EnqueueSystem } from "./enqueueSystem.js";
+import { cycleAnchorSnapshotId } from "./waitpointSystem.js";
+
+/** The description of the EXECUTING snapshot `continueRunExecution` writes. */
+export const CONTINUED_AFTER_SUSPENDED_DESCRIPTION = "Run was continued after being suspended";
 
 export type CheckpointSystemOptions = {
   resources: SystemResources;
   executionSnapshotSystem: ExecutionSnapshotSystem;
   enqueueSystem: EnqueueSystem;
+  waitpointStoreEnabled?: (organizationId: string) => boolean | Promise<boolean>;
 };
 
 export class CheckpointSystem {
@@ -124,6 +131,38 @@ export class CheckpointSystem {
         };
       }
 
+      const validLocation = validateCheckpointLocation(checkpoint);
+
+      if (!validLocation.ok) {
+        this.$.logger.error("Tried to createCheckpoint with an invalid location", {
+          runId,
+          snapshotId: snapshot.id,
+          checkpointType: checkpoint.type,
+          location: checkpoint.location.slice(0, 64),
+          error: validLocation.error,
+        });
+
+        this.$.eventBus.emit("incomingCheckpointDiscarded", {
+          time: new Date(),
+          run: {
+            id: runId,
+          },
+          checkpoint: {
+            discardReason: "Invalid checkpoint location",
+            metadata: checkpoint,
+          },
+          snapshot: {
+            id: snapshot.id,
+            executionStatus: snapshot.executionStatus,
+          },
+        });
+
+        return {
+          ok: false as const,
+          error: "Invalid checkpoint location",
+        };
+      }
+
       // Get the run (run-ops scalars only) and update the status; the control-plane env is
       // resolved separately so the run-ops DB can split without a cross-provider join.
       const run = await this.$.runStore.suspendForCheckpoint(
@@ -189,6 +228,7 @@ export class CheckpointSystem {
             location: checkpoint.location,
             imageRef: checkpoint.imageRef,
             reason: checkpoint.reason,
+            metadata: encodeCheckpointMetadata(checkpoint.digest),
             runtimeEnvironmentId: env.id,
             projectId: env.projectId,
           },
@@ -209,6 +249,7 @@ export class CheckpointSystem {
             metadata: snapshot.metadata,
           },
           previousSnapshotId: snapshot.id,
+          previousSnapshot: snapshot,
           snapshotRoute: snapshotRouteFromSnapshot(snapshot),
           batchId: snapshot.batchId ?? undefined,
           completedWaitpoints: snapshot.completedWaitpoints.map((waitpoint) => ({
@@ -236,15 +277,31 @@ export class CheckpointSystem {
           checkpoint: taskRunCheckpoint,
         } satisfies CreateCheckpointResult;
       } else {
+        // An unwired capability check returns false synchronously.
+        const storeEnabled =
+          (snapshot.executionStatus === "EXECUTING_WITH_WAITPOINTS" ||
+            snapshot.executionStatus === "SUSPENDED") &&
+          this.options.waitpointStoreEnabled?.(env.organizationId);
         //create a new execution snapshot, with the checkpoint
         const newSnapshot = await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
           run,
           snapshot: {
             executionStatus: "SUSPENDED",
             description: "Run was suspended after creating a checkpoint.",
-            metadata: snapshot.metadata,
+            metadata:
+              storeEnabled && (await storeEnabled) === true
+                ? {
+                    ...(snapshot.metadata &&
+                    typeof snapshot.metadata === "object" &&
+                    !Array.isArray(snapshot.metadata)
+                      ? snapshot.metadata
+                      : {}),
+                    waitpointCycleAnchor: cycleAnchorSnapshotId(snapshot),
+                  }
+                : snapshot.metadata,
           },
           previousSnapshotId: snapshot.id,
+          previousSnapshot: snapshot,
           snapshotRoute: snapshotRouteFromSnapshot(snapshot),
           batchId: snapshot.batchId ?? undefined,
           completedWaitpoints: snapshot.completedWaitpoints.map((waitpoint) => ({
@@ -310,6 +367,31 @@ export class CheckpointSystem {
       );
 
       if (snapshot.id !== snapshotId) {
+        // A retry of a continue that already succeeded: that request created this snapshot, but
+        // its response never reached the runner (e.g. it was cut off while the handler kept
+        // running). Answer the retry with the same result instead of failing the run.
+        if (
+          snapshot.executionStatus === "EXECUTING" &&
+          snapshot.description === CONTINUED_AFTER_SUSPENDED_DESCRIPTION &&
+          snapshot.previousSnapshotId === snapshotId &&
+          (snapshot.runnerId ?? undefined) === runnerId
+        ) {
+          this.$.logger.info("continueRunExecution: already continued from this snapshot", {
+            runId,
+            snapshotId,
+            latestSnapshotId: snapshot.id,
+          });
+
+          // The runner is alive but can only act on this snapshot once it has this response, and
+          // its heartbeats still name the previous snapshot, so they don't extend this one. Give
+          // it a fresh heartbeat window, and tell the worker again in case the first notification
+          // was lost.
+          await this.executionSnapshotSystem.enqueueHeartbeatIfNeeded(snapshot);
+          await sendNotificationToWorker({ runId, snapshot, eventBus: this.$.eventBus });
+
+          return executionResultFromSnapshot(snapshot);
+        }
+
         throw new ServiceValidationError(
           "Snapshot ID doesn't match the latest snapshot in continueRunExecution",
           400,
@@ -386,9 +468,10 @@ export class CheckpointSystem {
         run,
         snapshot: {
           executionStatus: "EXECUTING",
-          description: "Run was continued after being suspended",
+          description: CONTINUED_AFTER_SUSPENDED_DESCRIPTION,
         },
         previousSnapshotId: snapshot.id,
+        previousSnapshot: snapshot,
         snapshotRoute: snapshotRouteFromSnapshot(snapshot),
         environmentId: snapshot.environmentId,
         environmentType: snapshot.environmentType,

@@ -1,4 +1,5 @@
 import { containerTest } from "@internal/testcontainers";
+import type { ApiKeyCapabilityCatalogue } from "@trigger.dev/plugins";
 import { expect, vi } from "vitest";
 import { ApiKeysPresenter } from "~/presenters/v3/ApiKeysPresenter.server";
 import {
@@ -100,17 +101,23 @@ containerTest(
     const describeApiKeyPolicy = vi.fn(async (policy: { scopes: string[] }) =>
       policy.scopes.includes("trigger:tasks:send-email") ? { taskIdentifiers: ["send-email"] } : {}
     );
-    const apiKeyPresets = vi.fn().mockResolvedValue([
-      {
-        id: "RESTRICTED_TEST_PRESET",
-        label: "Restricted access",
-        description: "Restricted test access",
-        scopes: ["read:deployments"],
-        usesTaskSelection: false,
-        available: true,
-      },
-    ]);
-    const presenter = new ApiKeysPresenter(prisma, { describeApiKeyPolicy, apiKeyPresets });
+    const apiKeyAccessOptions = vi.fn().mockResolvedValue({
+      presets: [
+        {
+          id: "RESTRICTED_TEST_PRESET",
+          label: "Restricted access",
+          description: "Restricted test access",
+          scopes: ["read:deployments"],
+          usesTaskSelection: false,
+          available: true,
+        },
+      ],
+      catalogue: { available: true, capabilities: [] },
+    });
+    const presenter = new ApiKeysPresenter(prisma, {
+      describeApiKeyPolicy,
+      apiKeyAccessOptions,
+    });
 
     const result = await presenter.call({
       userId: user.id,
@@ -125,29 +132,51 @@ containerTest(
       presetId: null,
       scopes: ["admin"],
     });
-    expect(apiKeyPresets).toHaveBeenCalledWith(organization.id);
+    expect(apiKeyAccessOptions).toHaveBeenCalledWith(organization.id);
+    expect(result.presets).toEqual([
+      {
+        id: "RESTRICTED_TEST_PRESET",
+        label: "Restricted access",
+        description: "Restricted test access",
+        fullAccess: false,
+        usesTaskSelection: false,
+        available: true,
+      },
+    ]);
     expect(result.rootApiKey?.obfuscated).toBe(`tr_prod_••••••••${environment.apiKey.slice(-4)}`);
     expect(keysByName.get("Full access")?.obfuscated).toBe("tr_prod_sk_••••••••full");
     expect(keysByName.get("Full access")?.access).toMatchObject({
       presetId: null,
       label: "Full access",
+      isCustom: false,
       usesTaskSelection: false,
     });
     expect(keysByName.get("Restricted access")?.access).toMatchObject({
       presetId: "RESTRICTED_TEST_PRESET",
       label: "Restricted access",
+      isCustom: false,
       usesTaskSelection: false,
+      presetDeleted: false,
     });
     expect(keysByName.get("Restricted without preset")?.access).toMatchObject({
       presetId: null,
       label: "Custom",
+      isCustom: true,
       usesTaskSelection: false,
+      presetDeleted: false,
     });
     expect(keysByName.get("Unknown preset")?.access).toEqual({
       presetId: "REMOVED_PRESET",
       label: "Custom",
+      isCustom: true,
+      isOrganizationPreset: false,
+      // Catches: a key whose saved preset was deleted reading as a plain custom key.
+      presetDeleted: true,
       taskIdentifiers: ["send-email"],
+      fullAccess: false,
       usesTaskSelection: true,
+      drift: [],
+      matchesPreset: false,
     });
     expect(keysByName.get("Full access")).not.toHaveProperty("scopes");
     expect(keysByName.get("Restricted access")).not.toHaveProperty("scopes");
@@ -156,7 +185,7 @@ containerTest(
 );
 
 containerTest(
-  "does not return hidden root key material and preserves additional keys",
+  "masks a hidden root key to its last four characters and preserves additional keys",
   async ({ prisma }) => {
     const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
     const environment = await createRuntimeEnvironment(prisma, {
@@ -179,7 +208,7 @@ containerTest(
       },
     });
     const presenter = new ApiKeysPresenter(prisma, {
-      apiKeyPresets: async () => [],
+      apiKeyAccessOptions: async () => null,
       describeApiKeyPolicy: async () => ({}),
     });
 
@@ -191,14 +220,52 @@ containerTest(
     });
     const serialized = JSON.stringify(result);
 
-    expect(result.rootApiKey).toBeNull();
+    expect(result.rootApiKey).toEqual({
+      id: environment.id,
+      name: "Root API key",
+      value: null,
+      obfuscated: "tr_prod_••••••••xQ9Z",
+      isHidden: true,
+    });
     expect(result.environment.apiKey).toBeNull();
     expect(result.apiKeys).toHaveLength(1);
     expect(result.apiKeys[0]?.name).toBe("Application key");
     expect(serialized).not.toContain(environment.apiKey);
-    expect(serialized).not.toContain(environment.apiKey.slice(-4));
+    expect(serialized).not.toContain(environment.apiKey.slice("tr_prod_".length, -4));
+    expect(serialized).not.toContain(environment.apiKey.slice(-5));
   }
 );
+
+containerTest("returns a visible root key in full alongside its mask", async ({ prisma }) => {
+  const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
+  const environment = await createRuntimeEnvironment(prisma, {
+    projectId: project.id,
+    organizationId: organization.id,
+    type: "PRODUCTION",
+    slug: uniqueId("prod"),
+    apiKey: `tr_prod_${uniqueId("visible-root")}_aB3c`,
+  });
+  const presenter = new ApiKeysPresenter(prisma, {
+    apiKeyAccessOptions: async () => null,
+    describeApiKeyPolicy: async () => ({}),
+  });
+
+  const result = await presenter.call({
+    userId: user.id,
+    organizationSlug: organization.slug,
+    projectSlug: project.slug,
+    environmentSlug: environment.slug,
+  });
+
+  expect(result.rootApiKey).toEqual({
+    id: environment.id,
+    name: "Root API key",
+    value: environment.apiKey,
+    obfuscated: "tr_prod_••••••••aB3c",
+    isHidden: false,
+  });
+  expect(result.environment.apiKey).toBe(environment.apiKey);
+});
 
 containerTest(
   "uses the parent environment's root key visibility for branches",
@@ -232,9 +299,17 @@ containerTest(
       projectSlug: project.slug,
       environmentSlug: branch.slug,
     });
+    const serialized = JSON.stringify(result);
 
-    expect(result.rootApiKey).toBeNull();
+    expect(result.rootApiKey).toMatchObject({
+      id: parent.id,
+      value: null,
+      obfuscated: `tr_preview_••••••••${parent.apiKey.slice(-4)}`,
+      isHidden: true,
+    });
     expect(result.environment.apiKey).toBeNull();
+    expect(serialized).not.toContain(parent.apiKey);
+    expect(serialized).not.toContain(branch.apiKey);
   }
 );
 
@@ -283,3 +358,160 @@ containerTest(
     ).rejects.toThrow("Environment not found");
   }
 );
+
+containerTest("marks only keys missing access their preset grants today", async ({ prisma }) => {
+  const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
+  const environment = await createRuntimeEnvironment(prisma, {
+    projectId: project.id,
+    organizationId: organization.id,
+    type: "PRODUCTION",
+    slug: uniqueId("prod"),
+  });
+  const keys: [string, string, string[]][] = [
+    ["Older operator", "OPERATOR", ["read:tasks"]],
+    ["Operator", "OPERATOR", ["read:tasks", "trigger:tasks"]],
+    ["Extended operator", "OPERATOR", ["read:tasks", "trigger:tasks", "read:deployments"]],
+    ["Custom", "CUSTOM", ["read:tasks"]],
+    ["Deleted preset", "apikeypreset_gone", ["read:tasks"]],
+  ];
+  for (const [name, presetId, scopes] of keys) {
+    await prisma.apiKey.create({
+      data: {
+        name,
+        keyHash: uniqueId("hash"),
+        lastFour: "drft",
+        runtimeEnvironmentId: environment.id,
+        createdByUserId: user.id,
+        presetId,
+        scopes,
+      },
+    });
+  }
+  const catalogue: ApiKeyCapabilityCatalogue = {
+    available: true,
+    capabilities: [
+      {
+        id: "tasks",
+        label: "Tasks",
+        levels: [
+          { id: "none", label: "None", scopes: [] },
+          { id: "read", label: "Read", scopes: ["read:tasks"] },
+          {
+            id: "readTrigger",
+            label: "Read and trigger",
+            scopes: ["read:tasks", "trigger:tasks"],
+          },
+        ],
+      },
+      {
+        id: "deployments",
+        label: "Deployments",
+        levels: [
+          { id: "none", label: "None", scopes: [] },
+          { id: "read", label: "Read", scopes: ["read:deployments"] },
+        ],
+      },
+    ],
+  };
+  const presenter = new ApiKeysPresenter(prisma, {
+    apiKeyAccessOptions: async () => ({
+      presets: [
+        {
+          id: "OPERATOR",
+          label: "Operator",
+          description: "",
+          scopes: ["read:tasks", "trigger:tasks"],
+          usesTaskSelection: false,
+          available: true,
+          capabilities: { tasks: "readTrigger" },
+        },
+      ],
+      catalogue,
+    }),
+    describeApiKeyPolicy: async ({ scopes }) => ({
+      capabilities: {
+        tasks: scopes.includes("trigger:tasks") ? "readTrigger" : "read",
+        ...(scopes.includes("read:deployments") ? { deployments: "read" } : {}),
+      },
+      unmatchedScopes: [],
+    }),
+  });
+
+  const result = await presenter.call({
+    userId: user.id,
+    organizationSlug: organization.slug,
+    projectSlug: project.slug,
+    environmentSlug: environment.slug,
+  });
+  const access = Object.fromEntries(
+    result.apiKeys.map((key) => [
+      key.name,
+      { label: key.access.label, drift: key.access.drift, matchesPreset: key.access.matchesPreset },
+    ])
+  );
+
+  expect(access).toEqual({
+    "Older operator": {
+      label: "Operator",
+      drift: [
+        { capabilityId: "tasks", from: "read", to: "readTrigger", gains: true, loses: false },
+      ],
+      matchesPreset: false,
+    },
+    Operator: { label: "Operator", drift: [], matchesPreset: true },
+    "Extended operator": { label: "Operator", drift: [], matchesPreset: false },
+    Custom: { label: "Custom", drift: [], matchesPreset: false },
+    "Deleted preset": { label: "Custom", drift: [], matchesPreset: false },
+  });
+});
+
+containerTest("never lists system-issued keys", async ({ prisma }) => {
+  const { organization, project, user } = await createTestOrgProjectWithMember(prisma);
+  const environment = await createRuntimeEnvironment(prisma, {
+    projectId: project.id,
+    organizationId: organization.id,
+    type: "PRODUCTION",
+    slug: uniqueId("prod"),
+  });
+  const userKey = await prisma.apiKey.create({
+    data: {
+      name: "User key",
+      keyHash: uniqueId("user-hash"),
+      lastFour: "user",
+      runtimeEnvironmentId: environment.id,
+      createdByUserId: user.id,
+      presetId: null,
+      scopes: ["read:deployments"],
+    },
+  });
+  const createSystemKey = (name: string, revokedAt: Date | null) =>
+    prisma.apiKey.create({
+      data: {
+        name,
+        keyHash: uniqueId(`${name}-hash`),
+        lastFour: "sysk",
+        runtimeEnvironmentId: environment.id,
+        presetId: "DEPLOY_ONLY",
+        scopes: ["read:deployments"],
+        issuedBy: "SYSTEM",
+        revokedAt,
+      },
+    });
+  await createSystemKey("Build key", null);
+  await createSystemKey("Revoked build key", new Date());
+  const presenter = new ApiKeysPresenter(prisma, {
+    apiKeyAccessOptions: async () => null,
+    describeApiKeyPolicy: async () => ({}),
+  });
+  const list = (showRevoked: boolean) =>
+    presenter.call({
+      userId: user.id,
+      organizationSlug: organization.slug,
+      projectSlug: project.slug,
+      environmentSlug: environment.slug,
+      showRevoked,
+    });
+
+  expect((await list(false)).apiKeys.map((key) => key.id)).toEqual([userKey.id]);
+  expect((await list(true)).apiKeys.map((key) => key.id)).toEqual([userKey.id]);
+});

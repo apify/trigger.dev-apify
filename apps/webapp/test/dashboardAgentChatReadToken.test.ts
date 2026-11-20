@@ -19,9 +19,6 @@ vi.mock("~/services/session.server", () => ({
 vi.mock("~/v3/canAccessDashboardAgent.server", () => ({
   canAccessDashboardAgent: async () => true,
 }));
-vi.mock("~/v3/canUseDashboardAgentWatches.server", () => ({
-  canUseDashboardAgentWatches: async () => false,
-}));
 vi.mock("~/models/project.server", () => ({
   findProjectWithOrgFlagsBySlug: async () => ({
     id: "proj_real",
@@ -94,6 +91,7 @@ describe("dashboard agent chat read: session token", () => {
     expect(body.session.publicAccessToken).toBe("pat_minted_for_browser");
     expect(body.session.lastEventId).toBe("84");
     expect(JSON.stringify(body)).not.toContain("pat_agent_run_broad");
+    expect(JSON.stringify(body)).not.toContain("run_abc");
     expect(mocks.mint).toHaveBeenCalledWith("chat_abc");
   });
 

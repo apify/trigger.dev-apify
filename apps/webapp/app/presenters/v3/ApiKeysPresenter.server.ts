@@ -1,4 +1,12 @@
 import { type RuntimeEnvironment } from "@trigger.dev/database";
+import {
+  type ApiKeyCapabilityCatalogue,
+  type ApiKeyCapabilityDifference,
+  type ApiKeyCapabilityMap,
+  apiKeyCapabilityDifferences,
+  apiKeyCapabilitiesForKey,
+  CUSTOM_API_KEY_PRESET_ID,
+} from "@trigger.dev/plugins";
 import { scopesGrantFullAccess, type HostRbacController } from "@trigger.dev/rbac";
 import { type PrismaReplicaClient, $replica } from "~/db.server";
 import { type Project } from "~/models/project.server";
@@ -6,7 +14,10 @@ import { type User } from "~/models/user.server";
 import { rbac } from "~/services/rbac.server";
 import { obfuscateApiKey } from "~/utils/apiKeys";
 
-type ApiKeyPolicyPresenter = Pick<HostRbacController, "apiKeyPresets" | "describeApiKeyPolicy">;
+type ApiKeyPolicyPresenter = Pick<
+  HostRbacController,
+  "apiKeyAccessOptions" | "describeApiKeyPolicy"
+>;
 
 export class ApiKeysPresenter {
   // Read-only presenter for a dashboard page — all queries below are reads, so
@@ -73,15 +84,21 @@ export class ApiKeysPresenter {
           rootApiKeyHiddenAt: true,
           type: true,
           apiKeys: {
-            where: showRevoked ? undefined : { revokedAt: null },
+            where: {
+              revokedAt: showRevoked ? undefined : null,
+              issuedBy: "USER",
+            },
             orderBy: { createdAt: "desc" },
             select: {
               id: true,
               name: true,
+              description: true,
               lastFour: true,
               presetId: true,
               scopes: true,
               lastUsedAt: true,
+              lastUsedIp: true,
+              allowedIpRanges: true,
               revokedAt: true,
               expiresAt: true,
               createdAt: true,
@@ -107,8 +124,8 @@ export class ApiKeysPresenter {
       }),
     ]);
 
-    const [presets, policyDescriptions] = await Promise.all([
-      this.#rbac.apiKeyPresets(environment.organizationId),
+    const [accessOptions, policyDescriptions] = await Promise.all([
+      this.#rbac.apiKeyAccessOptions(environment.organizationId),
       Promise.all(
         keyEnvironment.apiKeys.map((apiKey) =>
           this.#rbac.describeApiKeyPolicy({
@@ -118,21 +135,23 @@ export class ApiKeysPresenter {
         )
       ),
     ]);
+    const presets = accessOptions?.presets ?? null;
+    const capabilityCatalogue = accessOptions?.catalogue ?? null;
     const presetsById = new Map(presets?.map((preset) => [preset.id, preset]));
     const { taskIdentifiers, organizationId: _organizationId, ...environmentData } = environment;
-    const rootApiKey = keyEnvironment.rootApiKeyHiddenAt
-      ? null
-      : {
-          id: keyEnvironment.id,
-          name: "Root API key",
-          value: keyEnvironment.apiKey,
-          obfuscated: obfuscateApiKey(keyEnvironment.type, keyEnvironment.apiKey.slice(-4)),
-        };
+    const isRootApiKeyHidden = keyEnvironment.rootApiKeyHiddenAt !== null;
+    const rootApiKey = {
+      id: keyEnvironment.id,
+      name: "Root API key",
+      value: isRootApiKeyHidden ? null : keyEnvironment.apiKey,
+      obfuscated: obfuscateApiKey(keyEnvironment.type, keyEnvironment.apiKey.slice(-4)),
+      isHidden: isRootApiKeyHidden,
+    };
 
     return {
       environment: {
         ...environmentData,
-        apiKey: rootApiKey?.value ?? null,
+        apiKey: rootApiKey.value,
         keyEnvironmentId,
       },
       availableTasks: taskIdentifiers.map((task) => task.slug),
@@ -142,21 +161,68 @@ export class ApiKeysPresenter {
         const description = policyDescriptions[index];
         const preset = presetId ? presetsById.get(presetId) : undefined;
         const isFullAccess = scopesGrantFullAccess(scopes);
+        const isCustom = !preset && !(presetId === null && isFullAccess);
+        const differences = preset
+          ? presetDifferences(
+              capabilityCatalogue,
+              preset,
+              description.capabilities,
+              description.taskIdentifiers
+            )
+          : [];
+        const matchesPreset =
+          preset !== undefined &&
+          differences.length === 0 &&
+          (description.unmatchedScopes?.length ?? 0) === 0;
 
         return {
           ...apiKeyData,
           access: {
             presetId,
-            label: preset?.label ?? (presetId === null && isFullAccess ? "Full access" : "Custom"),
+            label: preset?.label ?? (isCustom ? "Custom" : "Full access"),
+            isCustom,
+            isOrganizationPreset: preset?.source === "organization",
+            // A saved preset the key was made from has since been deleted.
+            presetDeleted:
+              presets !== null &&
+              presetId !== null &&
+              presetId !== CUSTOM_API_KEY_PRESET_ID &&
+              preset === undefined,
             taskIdentifiers: description.taskIdentifiers,
+            fullAccess: isFullAccess,
+            capabilities: description.capabilities,
+            unmatchedScopes: description.unmatchedScopes,
             usesTaskSelection:
               preset?.usesTaskSelection ?? description.taskIdentifiers !== undefined,
+            drift: differences.filter((difference) => difference.gains),
+            matchesPreset,
           },
           obfuscated: obfuscateApiKey(keyEnvironment.type, apiKey.lastFour, "additional"),
         };
       }),
-      presets,
+      presets:
+        presets?.map(({ scopes, ...preset }) => ({
+          ...preset,
+          fullAccess: scopesGrantFullAccess(scopes),
+        })) ?? null,
+      capabilityCatalogue,
       hasVercelIntegration: vercelIntegration !== null,
     };
   }
+}
+
+function presetDifferences(
+  catalogue: ApiKeyCapabilityCatalogue | null,
+  preset: { id: string; capabilities?: ApiKeyCapabilityMap },
+  stored: ApiKeyCapabilityMap | undefined,
+  taskIdentifiers: string[] | undefined
+): ApiKeyCapabilityDifference[] {
+  if (!catalogue || !stored || !preset.capabilities || preset.id === CUSTOM_API_KEY_PRESET_ID) {
+    return [];
+  }
+  return apiKeyCapabilityDifferences(
+    catalogue.capabilities,
+    stored,
+    apiKeyCapabilitiesForKey(catalogue.capabilities, preset.capabilities, taskIdentifiers)
+  );
 }

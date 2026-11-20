@@ -36,7 +36,7 @@ import {
   TableRow,
 } from "~/components/primitives/Table";
 import { DeploymentError } from "~/components/runs/v3/DeploymentError";
-import { DeploymentStatus } from "~/components/runs/v3/DeploymentStatus";
+import { DeploymentStatus, deploymentDisplayStatus } from "~/components/runs/v3/DeploymentStatus";
 import {
   Tooltip,
   TooltipContent,
@@ -49,7 +49,13 @@ import { useProject } from "~/hooks/useProject";
 import { DeploymentPresenter } from "~/presenters/v3/DeploymentPresenter.server";
 import { requireUserId } from "~/services/session.server";
 import { cn } from "~/utils/cn";
-import { v3DeploymentParams, v3DeploymentsPath, v3RunsPath } from "~/utils/pathBuilder";
+import {
+  v3DeploymentParams,
+  v3DeploymentPath,
+  v3DeploymentVersionPath,
+  v3DeploymentsPath,
+  v3RunsPath,
+} from "~/utils/pathBuilder";
 import { capitalizeWord } from "~/utils/string";
 import { UserTag } from "../_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.deployments/route";
 import { useDeploymentLogs } from "~/hooks/useDeploymentLogs";
@@ -296,16 +302,51 @@ export default function Page() {
                 <Property.Label>Version</Property.Label>
                 <Property.Value>{deployment.version}</Property.Value>
               </Property.Item>
+              {deployment.redeployOf && (
+                <Property.Item>
+                  <Property.Label>Redeploy of</Property.Label>
+                  <Property.Value>
+                    <TextLink
+                      to={v3DeploymentPath(
+                        organization,
+                        project,
+                        environment,
+                        { shortCode: deployment.redeployOf },
+                        0
+                      )}
+                    >
+                      {deployment.redeployOf}
+                    </TextLink>
+                  </Property.Value>
+                </Property.Item>
+              )}
               <Property.Item>
                 <Property.Label>Status</Property.Label>
                 <Property.Value>
                   <DeploymentStatus
-                    status={deployment.status}
+                    status={deploymentDisplayStatus(deployment.status, !!deployment.supersededBy)}
                     isBuilt={deployment.isBuilt}
                     className="text-sm"
                   />
                 </Property.Value>
               </Property.Item>
+              {deployment.supersededBy && (
+                <Property.Item>
+                  <Property.Label>Superseded by</Property.Label>
+                  <Property.Value>
+                    <TextLink
+                      to={v3DeploymentVersionPath(
+                        organization,
+                        project,
+                        environment,
+                        deployment.supersededBy.version
+                      )}
+                    >
+                      {deployment.supersededBy.version}
+                    </TextLink>
+                  </Property.Value>
+                </Property.Item>
+              )}
               {!logsDisabled && (
                 <Property.Item>
                   <Property.Label>Logs</Property.Label>
@@ -330,7 +371,7 @@ export default function Page() {
                   </Property.Value>
                 </Property.Item>
               )}
-              {deployment.canceledReason && (
+              {deployment.canceledReason && !deployment.supersededBy && (
                 <Property.Item>
                   <Property.Label>Cancelation reason</Property.Label>
                   <Property.Value>{deployment.canceledReason}</Property.Value>

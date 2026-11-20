@@ -1,15 +1,34 @@
 import { getMeter } from "@internal/tracing";
+import { ROOT_CONTEXT } from "@opentelemetry/api";
 import { isAdditionalApiKey } from "@trigger.dev/core/v3/apiKeys";
-import { isPublicJWT } from "@trigger.dev/core/v3/jwt";
-import type { BearerAuthOptions } from "@trigger.dev/plugins";
+import type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
+import {
+  isSdkCredentialTelemetryOperation,
+  isSdkCredentialTelemetryReason,
+  SDK_CREDENTIAL_OPERATION_HEADER,
+  SDK_CREDENTIAL_REASON_HEADER,
+} from "@trigger.dev/core/v3";
+import { extractJWTSub, isPublicJWT } from "@trigger.dev/core/v3/jwt";
+import { isDefaultDevBranch, sanitizeBranchName } from "@trigger.dev/core/v3/utils/gitBranch";
+import type { BearerAuthOptions, BearerAuthResult } from "@trigger.dev/plugins";
 import type {
   BearerCredentialKind,
   BearerLookupPath,
+  BearerResolution,
   HostBearerAuthResult,
   RbacResource,
+  RoleBaseAccessController,
 } from "@trigger.dev/rbac";
+import { clientIpFromHeaders, isSealedPublicTokenSubject } from "@trigger.dev/rbac";
+import { noteBearerAuthentication } from "~/services/auditLogs/auditContext.server";
+import { recordRootKeyUsage } from "~/services/rootKeyUsage.server";
+import { authenticateRunToken } from "~/services/oidc/runTokenAuth.server";
+import { isRunTokenFormat } from "~/services/oidc/runTokenVerify";
+import { logger } from "~/services/logger.server";
 import { rbac } from "~/services/rbac.server";
 import { singleton } from "~/utils/singleton";
+import { sdkDefaultAttribution } from "./sdkDefaultAttribution.server";
+import { SEMINTATTRS_FORCE_RECORDING, tracer } from "~/v3/tracer.server";
 
 type ApiAuthResult = "success" | "invalid" | "forbidden" | "error";
 
@@ -23,19 +42,36 @@ const telemetry = singleton("apiAuthTelemetry", () => {
     unit: "ms",
   });
 
-  return { attempts, duration };
+  const sdkCredentialSelections = meter.createCounter("api_auth.sdk_credential_selections", {
+    description: "SDK credential selections reported on API authentication attempts",
+  });
+
+  const sdkDefaultDestinations = meter.createCounter("api_auth.sdk_default_destinations", {
+    description: "SDK default credential selections by matched HTTP destination",
+  });
+
+  return {
+    attempts,
+    duration,
+    sdkCredentialSelections,
+    sdkDefaultDestinations,
+  };
 });
 
 export async function authenticateBearerWithTelemetry(
   request: Request,
-  options: BearerAuthOptions
+  options: BearerAuthOptions,
+  controller: Pick<RoleBaseAccessController, "authenticateBearer"> = rbac
 ): Promise<HostBearerAuthResult> {
   const startedAt = performance.now();
   const classified = classifyCredential(request, options.allowJWT ?? false);
   let final = { ...classified, result: "error" as ApiAuthResult };
 
   try {
-    const result = await rbac.authenticateBearer(request, options);
+    const result: BearerAuthResult & { resolution?: BearerResolution } =
+      classified.credentialKind === "run_token"
+        ? await authenticateRunTokenBearer(request)
+        : await controller.authenticateBearer(request, options);
     // The host LazyController always attaches `resolution`; fall back to the
     // format-based classification if a caller (e.g. a test double) omits it.
     const resolution = result.resolution ?? classified;
@@ -45,11 +81,23 @@ export async function authenticateBearerWithTelemetry(
       result: result.ok ? "success" : result.status === 403 ? "forbidden" : "invalid",
     };
     recordAuthAttempt("rbac", final.credentialKind, final.lookupPath, final.result);
-    return result;
+    if (final.lookupPath === "ip_not_allowed") {
+      // The caller only sees "Invalid API key"; keep the real reason in our logs.
+      logger.info("API key used from a disallowed IP", {
+        clientIp: clientIpFromHeaders(request.headers),
+      });
+    }
+    const authenticated: HostBearerAuthResult = { ...result, resolution };
+    noteBearerAuthentication(request, authenticated);
+    if (authenticated.ok) {
+      recordRootKeyUsage(request, resolution.credentialKind, authenticated.environment);
+    }
+    return authenticated;
   } catch (error) {
     recordAuthAttempt("rbac", final.credentialKind, final.lookupPath, final.result);
     throw error;
   } finally {
+    recordSdkCredentialSelection(request, final.credentialKind);
     telemetry.duration.record(performance.now() - startedAt, {
       resolver: "rbac",
       credential_kind: final.credentialKind,
@@ -57,6 +105,55 @@ export async function authenticateBearerWithTelemetry(
       lookup_path: final.lookupPath,
     });
   }
+}
+
+const RUN_TOKEN_RESOLUTION = { credentialKind: "run_token", lookupPath: "run_token" } as const;
+
+// Run tokens are host-owned and verified locally, so they never reach the RBAC controller.
+async function authenticateRunTokenBearer(request: Request): Promise<HostBearerAuthResult> {
+  const result = await authenticateRunToken(bearerToken(request) ?? "");
+  if (!result.ok) {
+    return { ...result, resolution: RUN_TOKEN_RESOLUTION };
+  }
+
+  const rawBranch = request.headers.get("x-trigger-branch");
+  const branch = sanitizeBranchName(rawBranch);
+  const environment = result.environment;
+  const requestedBranch =
+    environment.type === "DEVELOPMENT" && isDefaultDevBranch(branch) ? null : branch;
+  if (
+    (environment.type === "PREVIEW" || environment.type === "DEVELOPMENT") &&
+    rawBranch &&
+    (branch === null || requestedBranch !== environment.branchName)
+  ) {
+    return {
+      ok: false,
+      status: 401,
+      error: "x-trigger-branch does not match the run token environment",
+      resolution: RUN_TOKEN_RESOLUTION,
+    };
+  }
+
+  return {
+    ok: true,
+    environment: result.environment,
+    subject: {
+      type: "runToken",
+      runId: result.claims.run_id,
+      environmentId: result.environment.id,
+      organizationId: result.environment.organizationId,
+      projectId: result.environment.projectId,
+    },
+    ability: result.ability,
+    resolution: RUN_TOKEN_RESOLUTION,
+  };
+}
+
+function bearerToken(request: Request): string | undefined {
+  return request.headers
+    .get("Authorization")
+    ?.replace(/^Bearer /, "")
+    .trim();
 }
 
 export async function authenticateAuthorizeBearerWithTelemetry(
@@ -78,10 +175,9 @@ export async function authenticateAuthorizeBearerWithTelemetry(
   return result;
 }
 
-export async function observeLegacyBearerAuthentication<T extends { ok: boolean } | undefined>(
-  request: Request,
-  operation: () => Promise<T>
-): Promise<T> {
+export async function observeLegacyBearerAuthentication<
+  T extends { ok: boolean; environment?: AuthenticatedEnvironment } | undefined,
+>(request: Request, operation: () => Promise<T>): Promise<T> {
   const startedAt = performance.now();
   const classified = classifyCredential(request, true);
   let result: ApiAuthResult = "error";
@@ -90,17 +186,64 @@ export async function observeLegacyBearerAuthentication<T extends { ok: boolean 
     const value = await operation();
     result = value?.ok ? "success" : "invalid";
     recordAuthAttempt("legacy", classified.credentialKind, classified.lookupPath, result);
+    if (value?.ok && value.environment) {
+      recordRootKeyUsage(request, classified.credentialKind, value.environment);
+    }
     return value;
   } catch (error) {
     recordAuthAttempt("legacy", classified.credentialKind, classified.lookupPath, result);
     throw error;
   } finally {
+    recordSdkCredentialSelection(request, classified.credentialKind);
     telemetry.duration.record(performance.now() - startedAt, {
       resolver: "legacy",
       credential_kind: classified.credentialKind,
       result,
       lookup_path: classified.lookupPath,
     });
+  }
+}
+
+const sdkTelemetryRecorded = new WeakSet<Request>();
+
+function recordSdkCredentialSelection(request: Request, credentialKind: BearerCredentialKind) {
+  if (sdkTelemetryRecorded.has(request)) return;
+  const operation = request.headers.get(SDK_CREDENTIAL_OPERATION_HEADER);
+  const reason = request.headers.get(SDK_CREDENTIAL_REASON_HEADER);
+  if (!isSdkCredentialTelemetryOperation(operation) || !isSdkCredentialTelemetryReason(reason))
+    return;
+
+  sdkTelemetryRecorded.add(request);
+  telemetry.sdkCredentialSelections.add(1, {
+    operation,
+    reason,
+    credential_kind: credentialKind,
+  });
+
+  if (operation === "default") {
+    const { attributes, diagnostic } = sdkDefaultAttribution(request);
+    telemetry.sdkDefaultDestinations.add(1, {
+      ...attributes,
+      reason,
+      credential_kind: credentialKind,
+    });
+    if (diagnostic) {
+      tracer
+        .startSpan(
+          "api_auth.sdk_default_destination",
+          {
+            attributes: {
+              [SEMINTATTRS_FORCE_RECORDING]: true,
+              ...diagnostic,
+              operation,
+              reason,
+              credential_kind: credentialKind,
+            },
+          },
+          ROOT_CONTEXT
+        )
+        .end();
+    }
   }
 }
 
@@ -126,16 +269,18 @@ function classifyCredential(
   request: Request,
   allowJWT: boolean
 ): { credentialKind: BearerCredentialKind; lookupPath: BearerLookupPath } {
-  const token = request.headers
-    .get("Authorization")
-    ?.replace(/^Bearer /, "")
-    .trim();
+  const token = bearerToken(request);
   if (!token) return { credentialKind: "unknown", lookupPath: "not_found" };
+  if (isRunTokenFormat(token)) return RUN_TOKEN_RESOLUTION;
   if (token.startsWith("pk_")) {
     return { credentialKind: "legacy_public_key", lookupPath: "legacy_public" };
   }
   if (allowJWT && isPublicJWT(token)) {
-    return { credentialKind: "public_jwt", lookupPath: "jwt_current" };
+    const sub = extractJWTSub(token);
+    return {
+      credentialKind: "public_jwt",
+      lookupPath: sub && !isSealedPublicTokenSubject(sub) ? "jwt_legacy_subject" : "jwt_current",
+    };
   }
   if (isAdditionalApiKey(token)) {
     return { credentialKind: "additional_api_key", lookupPath: "additional" };

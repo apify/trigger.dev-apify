@@ -8,11 +8,13 @@ import isbot from "isbot";
 import { renderToPipeableStream } from "react-dom/server";
 import { PassThrough } from "stream";
 import { initMollifierDrainerWorker } from "~/v3/mollifierDrainerWorker.server";
+import { initSnapshotRecoveryWorker } from "~/v3/snapshotRecoveryWorker.server";
 import { initMollifierStaleSweepWorker } from "~/v3/mollifierStaleSweepWorker.server";
 import { initBillingLimitWorker } from "~/v3/billingLimitWorker.server";
-import { initLogsSearchProjectorWorker } from "~/v3/logsSearchProjectorWorker.server";
+import { initAlertEngineWorker } from "~/v3/alertEngineWorker.server";
 import { initQueueMetricsConsumer, initQueueMetricsEmitter } from "~/v3/queueMetrics.server";
 import { initApiRateLimitMetrics } from "~/services/apiRateLimitMetrics.server";
+import { initWebhookMetrics } from "~/services/webhookMetrics.server";
 import { bootstrap } from "./bootstrap";
 import { LocaleContextProvider } from "./components/primitives/LocaleProvider";
 import type { OperatingSystemPlatform } from "./components/primitives/OperatingSystemProvider";
@@ -21,9 +23,22 @@ import { assertRunOpsSplitSentinel, Prisma } from "./db.server";
 import { env } from "./env.server";
 import { eventLoopMonitor, eventLoopUtilizationMonitor } from "./eventLoopMonitor.server";
 import { logger } from "./services/logger.server";
+import { createMcpBearerAuthenticator } from "./mcp/auth/bearer.server";
+import { MCP_SCOPES, mcpResource } from "./services/oauth/metadata.server";
+import { createMcpProtectedResourceHandler } from "./mcp/protectedResource.server";
+import { createMcpRouter } from "./mcp/server.server";
+import {
+  personalAccessTokenAuthFailureBody,
+  resolveAndRecheckUserActorClaims,
+  updateLastAccessedAtIfStale,
+} from "./services/personalAccessToken.server";
+import { createMcpPreAuthRateLimit } from "./mcp/preAuthRateLimit.server";
+import { createMcpRateLimiter } from "./services/apiRateLimit.server";
+import { rbac } from "./services/rbac.server";
 import { buildImgSrcDirective, parseCspImageOrigins, withImgSrc } from "./utils/cspImageOrigins";
 import { singleton } from "./utils/singleton";
 import { remoteBuildsEnabled } from "./v3/remoteImageBuilder.server";
+import { legacyEventStoreWarning } from "./v3/eventRepository/effectiveEventStore";
 import {
   registerRunEngineEventBusHandlers,
   setupBatchQueueCallbacks,
@@ -86,6 +101,19 @@ const IMG_SRC_DIRECTIVE = buildImgSrcDirective(
   })
 );
 
+singleton("LegacyEventStoreWarning", () => {
+  const warning = legacyEventStoreWarning(
+    env.EVENT_REPOSITORY_DEFAULT_STORE,
+    env.EVENT_REPOSITORY_V1_REROUTE_ENABLED
+  );
+
+  if (warning) {
+    logger.warn(warning);
+  }
+
+  return warning;
+});
+
 export default function handleRequest(
   request: Request,
   responseStatusCode: number,
@@ -103,6 +131,15 @@ export default function handleRequest(
   if (url.pathname.startsWith("/login")) {
     responseHeaders.set("X-Frame-Options", "SAMEORIGIN");
     responseHeaders.set("Content-Security-Policy", "frame-ancestors 'self'");
+  }
+
+  if (url.pathname.startsWith("/mcp/confirm")) {
+    responseHeaders.set("Content-Security-Policy", "frame-ancestors 'none'");
+  }
+
+  if (url.pathname.startsWith("/account/authorization-code/")) {
+    responseHeaders.set("X-Frame-Options", "DENY");
+    responseHeaders.set("Content-Security-Policy", "frame-ancestors 'none'");
   }
 
   responseHeaders.set(
@@ -161,7 +198,7 @@ function handleBotRequest(
     const { pipe, abort } = renderToPipeableStream(
       <OperatingSystemContextProvider platform={platform}>
         <LocaleContextProvider locales={locales}>
-          <RemixServer context={remixContext} url={request.url} abortDelay={ABORT_DELAY} />,
+          <RemixServer context={remixContext} url={request.url} abortDelay={ABORT_DELAY} />
         </LocaleContextProvider>
       </OperatingSystemContextProvider>,
       {
@@ -277,12 +314,14 @@ export const handleError = wrapHandleErrorWithSentry((error, { request }) => {
 });
 
 initMollifierDrainerWorker();
+initSnapshotRecoveryWorker();
 initMollifierStaleSweepWorker();
 initBillingLimitWorker();
-initLogsSearchProjectorWorker();
+initAlertEngineWorker();
 initQueueMetricsEmitter();
 initQueueMetricsConsumer();
 initApiRateLimitMetrics();
+initWebhookMetrics();
 
 bootstrap().catch((error) => {
   logError(error);
@@ -359,15 +398,47 @@ singleton("SentryTenantContextProcessor", () => {
 });
 
 export { apiRateLimiter } from "./services/apiRateLimit.server";
-export { dashboardAgentBodyCap } from "./services/dashboardAgentBodyCap.server";
+export { flushAuditLogs } from "./services/auditLogs/auditLogs.server";
+export { ignoreRefusedBodyErrors } from "./services/ingressBodyCap.server";
+export { createIngressBodyCapMiddleware } from "./services/ingressBodyCapMiddleware.server";
 export { deploymentRateLimiter } from "./services/deploymentRateLimit.server";
 export { engineRateLimiter } from "./services/engineRateLimit.server";
 export { otlpRateLimiter } from "./services/otlpRateLimit.server";
 export { runWithHttpContext } from "./services/httpAsyncStorage.server";
+export { configureSdkDefaultAttribution } from "./services/sdkDefaultAttribution.server";
 export { tenantContextMiddleware } from "./services/tenantContextResolver.server";
-export { webhookIngressIpRateLimiter } from "./services/webhookIngressIpRateLimit.server";
 export { socketIo } from "./v3/handleSocketIo.server";
-export { wss } from "./v3/handleWebsockets.server";
+export const mcpRouter = env.MCP_SERVER_ENABLED
+  ? createMcpRouter({
+      allowedOrigin: env.MCP_ORIGIN,
+      authenticate: createMcpBearerAuthenticator({
+        rbac,
+        failureBody: personalAccessTokenAuthFailureBody,
+        recheckUserActorClaims: resolveAndRecheckUserActorClaims,
+        touchPat: updateLastAccessedAtIfStale,
+        resourceMetadataUrl: `${env.APP_ORIGIN}/.well-known/oauth-protected-resource`,
+        audience: mcpResource(),
+      }),
+      rateLimit: createMcpRateLimiter(),
+      preAuth: createMcpPreAuthRateLimit({
+        redis: {
+          port: env.RATE_LIMIT_REDIS_PORT,
+          host: env.RATE_LIMIT_REDIS_HOST,
+          username: env.RATE_LIMIT_REDIS_USERNAME,
+          password: env.RATE_LIMIT_REDIS_PASSWORD,
+          tlsDisabled: env.RATE_LIMIT_REDIS_TLS_DISABLED === "true",
+          clusterMode: env.RATE_LIMIT_REDIS_CLUSTER_MODE_ENABLED === "1",
+        },
+      }),
+    })
+  : undefined;
+export const mcpProtectedResource = env.MCP_SERVER_ENABLED
+  ? createMcpProtectedResourceHandler({
+      origin: env.MCP_ORIGIN,
+      authorizationServers: [env.APP_ORIGIN],
+      scopes: MCP_SCOPES,
+    })
+  : undefined;
 
 if (env.EVENT_LOOP_MONITOR_ENABLED === "1") {
   eventLoopMonitor.enable();

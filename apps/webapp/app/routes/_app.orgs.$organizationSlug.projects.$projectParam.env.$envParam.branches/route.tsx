@@ -1,6 +1,6 @@
 import { AutoArchiveSettings } from "~/routes/resources.branches.auto-archive";
 import { getFormProps, getInputProps, useForm } from "@conform-to/react";
-import { parseWithZod } from "@conform-to/zod/v4";
+import { parseWithZod } from "~/utils/conform";
 import { ArrowUpCircleIcon, CheckIcon, EnvelopeIcon, PlusIcon } from "@heroicons/react/20/solid";
 import { BookOpenIcon } from "@heroicons/react/24/solid";
 import { DialogClose } from "@radix-ui/react-dialog";
@@ -78,7 +78,7 @@ import { formatCurrency, formatNumber } from "~/utils/numberFormatter";
 import { SetBranchesAddOnService } from "~/v3/services/setBranchesAddOn.server";
 import { useCurrentPlan } from "../_app.orgs.$organizationSlug/route";
 import { ArchiveButton } from "../resources.branches.archive";
-import { NewBranchPanel } from "~/routes/resources.branches.create";
+import { NewBranchPanel } from "~/components/branches/NewBranchPanel";
 import { BranchesOptions } from "~/utils/branches";
 import { IconArrowBearRight2 } from "@tabler/icons-react";
 import { branchesAgentPageContext } from "~/components/dashboard-agent/suggested-prompts";

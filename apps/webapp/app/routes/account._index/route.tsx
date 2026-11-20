@@ -8,9 +8,6 @@ import {
 } from "@remix-run/server-runtime";
 import { z } from "zod";
 import { EditPencilIcon } from "~/assets/icons/EditPencilIcon";
-import { ChatFloatingPanel } from "~/assets/icons/ChatFloatingPanel";
-import { ChatFullScreen } from "~/assets/icons/ChatFullScreen";
-import { ChatRightPanel } from "~/assets/icons/ChatRightPanel";
 import { UserProfilePhoto } from "~/components/UserProfilePhoto";
 import {
   MainHorizontallyCenteredContainer,
@@ -78,6 +75,8 @@ import {
   resendEmailChange,
 } from "~/services/emailChange.server";
 import { logger } from "~/services/logger.server";
+import { isExternalOidcEnabled } from "~/services/oidc/externalOidc.server";
+import { isTrustedDeploysEnabled } from "~/services/trustedDeploys/featureFlag.server";
 import { type EmailOwnership } from "~/services/ssoManagedIdentity.server";
 import {
   updateContrastPreference,
@@ -86,6 +85,7 @@ import {
   updateThemePreference,
   updateUnderlineLinksPreference,
 } from "~/services/dashboardPreferences.server";
+import { CHAT_MODE_OPTIONS } from "~/components/dashboard-agent/chat-mode-options";
 import { useChatOpenModePicker } from "~/components/dashboard-agent/use-chat-open-mode-picker";
 import type { ChatOpenMode } from "~/utils/dashboardPreferences";
 import {
@@ -253,7 +253,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
     // Resolved here, not from route matches: /account sits outside an org, so
     // `useFeatureFlags` would see none and the dialog would offer a shorter
     // section list than the side menu - and saving it drops the rest.
-    featureFlags: Awaited<ReturnType<typeof resolveOrganizationFeatureFlags>>;
+    featureFlags: Awaited<ReturnType<typeof resolveOrganizationFeatureFlags>> & {
+      oidcEnabled: boolean;
+    };
   } | null = null;
   try {
     const { organization, project, environment } = await new SelectBestEnvironmentPresenter().call({
@@ -263,7 +265,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
       organization: { slug: organization.slug },
       project: { slug: project.slug },
       environment: { slug: environment.slug },
-      featureFlags: await resolveOrganizationFeatureFlags(organization.featureFlags),
+      featureFlags: {
+        ...(await resolveOrganizationFeatureFlags(organization.featureFlags)),
+        oidcEnabled: await isExternalOidcEnabled(organization.featureFlags),
+        trustedDeploysEnabled: await isTrustedDeploysEnabled(organization.featureFlags),
+      },
     };
   } catch (error) {
     logger.debug("Account page: no sidebar context for this user", {
@@ -727,7 +733,7 @@ function CustomizeSidebarButton({
 }) {
   const user = useUser();
   const isAdmin = useHasAdminAccess();
-  const { isManagedCloud } = useFeatures();
+  const { isManagedCloud, alertsConfigured } = useFeatures();
   const favorites = useFavorites();
   const [isOpen, setIsOpen] = useState(false);
   const [isConfirming, setIsConfirming] = useState(false);
@@ -769,16 +775,18 @@ function CustomizeSidebarButton({
           },
         ]
       : []),
-    ...buildSideMenuSections({ ...context, isAdmin, isManagedCloud }).map((section) => ({
-      id: section.id,
-      title: section.title,
-      items: section.items.map((item) => ({
-        id: item.id,
-        name: item.name,
-        icon: item.icon,
-        defaultHidden: item.defaultHidden,
-      })),
-    })),
+    ...buildSideMenuSections({ ...context, isAdmin, alertsConfigured, isManagedCloud }).map(
+      (section) => ({
+        id: section.id,
+        title: section.title,
+        items: section.items.map((item) => ({
+          id: item.id,
+          name: item.name,
+          icon: item.icon,
+          defaultHidden: item.defaultHidden,
+        })),
+      })
+    ),
   ];
 
   return (
@@ -821,16 +829,6 @@ function CustomizeSidebarButton({
   );
 }
 
-const CHAT_OPEN_MODE_OPTIONS: {
-  mode: ChatOpenMode;
-  label: string;
-  Icon: typeof ChatFloatingPanel;
-}[] = [
-  { mode: "floating", label: "Floating", Icon: ChatFloatingPanel },
-  { mode: "rightPanel", label: "Right panel", Icon: ChatRightPanel },
-  { mode: "fullscreen", label: "Fullscreen", Icon: ChatFullScreen },
-];
-
 /** The mode Ask Trigger opens in; in-chat mode switches stay transient and don't change this. */
 function ChatOpenModePicker({
   value,
@@ -844,7 +842,7 @@ function ChatOpenModePicker({
       name="chat-open-mode"
       variant="secondary/small"
       value={value}
-      options={CHAT_OPEN_MODE_OPTIONS.map(({ mode, label, Icon }) => ({
+      options={CHAT_MODE_OPTIONS.map(({ mode, label, Icon }) => ({
         value: mode,
         label: (
           <SimpleTooltip
@@ -902,8 +900,8 @@ export default function Page() {
     onError: useCallback((message: string) => toast.error(message), [toast]),
   });
   const currentChatModeLabel =
-    CHAT_OPEN_MODE_OPTIONS.find((option) => option.mode === desiredChatOpenMode)?.label ??
-    CHAT_OPEN_MODE_OPTIONS[0].label;
+    CHAT_MODE_OPTIONS.find((option) => option.mode === desiredChatOpenMode)?.label ??
+    CHAT_MODE_OPTIONS[0].label;
   const pendingTheme = themeFetcher.formData?.get("theme");
   const pendingContrast = contrastFetcher.formData?.get("contrast");
   const contrast =

@@ -10,9 +10,12 @@ import { apiCors } from "~/utils/apiCors";
 import { logger } from "../logger.server";
 import { rbac } from "../rbac.server";
 import { authenticateBearerWithTelemetry } from "~/services/authTelemetry.server";
+import { notePersonalAccessTokenAuthentication } from "~/services/auditLogs/auditContext.server";
 import type { RbacAbility, RbacResource } from "@trigger.dev/rbac";
+import type { RbacSubject } from "@trigger.dev/plugins";
 import { isUserActorToken } from "@trigger.dev/rbac";
 import {
+  personalAccessTokenAuthFailureBody,
   resolveAndRecheckUserActorClaims,
   updateLastAccessedAtIfStale,
 } from "../personalAccessToken.server";
@@ -26,8 +29,12 @@ import { getApiVersion } from "~/api/versions";
 import { WORKER_HEADERS } from "@trigger.dev/core/v3/runEngineWorker";
 import { ServiceValidationError } from "~/v3/services/common.server";
 import { EngineServiceValidationError } from "@internal/run-engine";
+import { bearerPublicJwtActor } from "~/services/publicJwtActor.server";
+import { publicTokenSecret } from "~/services/publicTokenSubject.server";
 import { unroutableIdResponse } from "./unroutableId.server";
+import { keyedWaitpointBudgetResponse } from "./keyedWaitpointBudget.server";
 import { tenantContext, tenantContextFromAuthEnvironment } from "~/services/tenantContext.server";
+import { withRequestFeature, type RequestFeatureName } from "~/services/requestFeature.server";
 
 // Client aborts and service-level validation errors aren't bugs — they're
 // expected at API boundaries. Log them at `warn` so they stay in stdout
@@ -113,6 +120,7 @@ async function authenticateRequestForApiBuilder(
       authentication: ApiAuthenticationResultSuccess;
       ability: RbacAbility;
       restrictedApiKey: boolean;
+      subject: RbacSubject;
     }
 > {
   const result = await authenticateBearerWithTelemetry(request, { allowJWT });
@@ -126,23 +134,31 @@ async function authenticateRequestForApiBuilder(
   // Plugins return the full AuthenticatedEnvironment shape directly — no
   // follow-up DB lookup. The fallback fetches via Prisma, the cloud plugin
   // via Drizzle; both produce the same slim contract type.
+  // Scoped credentials must fail closed on routes without an authorization check.
+  const restrictedApiKey =
+    (result.subject.type === "apiKey" && result.subject.restricted) ||
+    result.subject.type === "publicJWT" ||
+    result.subject.type === "runToken";
   const authentication: ApiAuthenticationResultSuccess = {
     ok: true,
     apiKey: result.environment.apiKey,
     type: result.subject.type === "publicJWT" ? "PUBLIC_JWT" : "PRIVATE",
+    environmentScoped: restrictedApiKey,
+    credentialKind: result.resolution.credentialKind,
     environment: result.environment,
     realtime: result.jwt?.realtime,
     oneTimeUse: result.jwt?.oneTimeUse,
     // Surface the delegation actor (PAT/UAT-exchanged JWT) so handlers can
     // attribute writes to the acting user.
-    actor: result.jwt?.act,
+    actor: bearerPublicJwtActor(publicTokenSecret(), result.environment.id, result.jwt),
   };
 
   return {
     ok: true,
     authentication,
     ability: result.ability,
-    restrictedApiKey: result.subject.type === "apiKey" && result.subject.restricted,
+    restrictedApiKey,
+    subject: result.subject,
   };
 }
 
@@ -247,6 +263,26 @@ function isEveryResource(value: unknown): value is EveryResourceAuth {
 
 type AuthResource = RbacResource | AnyResourceAuth | EveryResourceAuth;
 
+export function scopeAuthorizationError(action: string, resource: AuthResource): string {
+  const describe = (target: RbacResource) =>
+    `${action}:${target.type}${target.id === undefined ? "" : `:${target.id}`}`;
+  const list = (targets: readonly RbacResource[], separator: string) =>
+    [...new Set(targets.map(describe))].join(separator);
+  let required: string;
+  if (isEveryResource(resource)) {
+    required = list(resource.resources, " and ");
+    if (resource.orResources.length > 0) {
+      required = `(${required}) or ${list(resource.orResources, " or ")}`;
+    }
+  } else if (isAnyResource(resource)) {
+    required = list(resource.resources, " or ");
+  } else {
+    required = describe(resource);
+  }
+
+  return `Unauthorized. Missing permission: ${required || action}`;
+}
+
 export function checkAuth(ability: RbacAbility, action: string, resource: AuthResource): boolean {
   if (isEveryResource(resource)) {
     // A broad collection grant may be supplied as an alternative to all
@@ -297,6 +333,8 @@ type ApiKeyRouteBuilderOptions<
       : undefined
   ) => Promise<TResource | undefined>;
   shouldRetryNotFound?: boolean;
+  // Opt-in metrics label for the request and its ClickHouse queries.
+  feature?: RequestFeatureName;
   authorization?: {
     action: string;
     resource: (
@@ -349,18 +387,20 @@ export function createLoaderApiRoute<
   options: ApiKeyRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>,
   handler: ApiKeyHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema, TResource>
 ) {
-  return async function loader({ request, params }: LoaderFunctionArgs) {
-    const {
-      params: paramsSchema,
-      searchParams: searchParamsSchema,
-      headers: headersSchema,
-      allowJWT = false,
-      corsStrategy = "none",
-      authorization,
-      findResource,
-      shouldRetryNotFound,
-    } = options;
+  // Read the options once, when the route is created.
+  const {
+    params: paramsSchema,
+    searchParams: searchParamsSchema,
+    headers: headersSchema,
+    allowJWT = false,
+    corsStrategy = "none",
+    authorization,
+    findResource,
+    shouldRetryNotFound,
+    feature,
+  } = options;
 
+  const loader = async function ({ request, params }: LoaderFunctionArgs) {
     if (corsStrategy !== "none" && request.method.toUpperCase() === "OPTIONS") {
       return apiCors(request, json({}));
     }
@@ -461,7 +501,7 @@ export function createLoaderApiRoute<
             request,
             json(
               {
-                error: "Unauthorized",
+                error: scopeAuthorizationError(action, $authResource),
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -522,6 +562,8 @@ export function createLoaderApiRoute<
       }
     }
   };
+
+  return (args: LoaderFunctionArgs) => withRequestFeature(feature, () => loader(args));
 }
 
 // `environmentId` is checked against a user-actor token's environment claim, so an env-scoped
@@ -617,18 +659,19 @@ export function createLoaderPATApiRoute<
   options: PATLoaderRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema>,
   handler: PATHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema>
 ) {
-  return async function loader({ request, params }: LoaderFunctionArgs) {
-    const {
-      params: paramsSchema,
-      searchParams: searchParamsSchema,
-      headers: headersSchema,
-      corsStrategy = "none",
-      context: contextFn,
-      identityOnly,
-      organizationScoped,
-      authorization,
-    } = options;
+  // Read the options once, when the route is created.
+  const {
+    params: paramsSchema,
+    searchParams: searchParamsSchema,
+    headers: headersSchema,
+    corsStrategy = "none",
+    context: contextFn,
+    identityOnly,
+    organizationScoped,
+    authorization,
+  } = options;
 
+  return async function loader({ request, params }: LoaderFunctionArgs) {
     if (corsStrategy !== "none" && request.method.toUpperCase() === "OPTIONS") {
       return apiCors(request, json({}));
     }
@@ -731,6 +774,7 @@ export function createLoaderPATApiRoute<
         }
         await assertUserActorScope(claims, ctx, { identityOnly, organizationScoped });
         authenticationResult = { userId: uatAuth.userId, userActor: claims };
+        notePersonalAccessTokenAuthentication(request, authenticationResult);
         ability = uatAuth.ability;
       } else {
         // PAT: validate + compute the cap-and-floor ability in one query.
@@ -738,11 +782,15 @@ export function createLoaderPATApiRoute<
         if (!patAuth.ok) {
           return await wrapResponse(
             request,
-            json({ error: patAuth.error }, { status: patAuth.status }),
+            json(personalAccessTokenAuthFailureBody(patAuth), { status: patAuth.status }),
             corsStrategy !== "none"
           );
         }
         authenticationResult = { userId: patAuth.userId };
+        notePersonalAccessTokenAuthentication(request, {
+          userId: patAuth.userId,
+          tokenId: patAuth.tokenId,
+        });
         ability = patAuth.ability;
         // Throttled in the helper (no DB write when the cached value is fresh).
         await updateLastAccessedAtIfStale(patAuth.tokenId, patAuth.lastAccessedAt);
@@ -775,7 +823,7 @@ export function createLoaderPATApiRoute<
             request,
             json(
               {
-                error: "Unauthorized",
+                error: scopeAuthorizationError(authorization.action, $resource),
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -848,6 +896,7 @@ type PATActionRouteBuilderOptions<
   // A single verb, or a list for multi-method routes (e.g. ["PATCH", "DELETE"]).
   method?: PATActionMethod | PATActionMethod[];
   body?: TBodySchema;
+  maxContentLength?: number;
   // `identityOnly` waives the contextless refusal for reads that mutate nothing. An action
   // never qualifies, so it cannot be declared here.
   identityOnly?: never;
@@ -893,18 +942,20 @@ export function createActionPATApiRoute<
   >,
   handler: PATActionHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema, TBodySchema>
 ) {
-  return async function action({ request, params }: ActionFunctionArgs) {
-    const {
-      params: paramsSchema,
-      searchParams: searchParamsSchema,
-      headers: headersSchema,
-      body: bodySchema,
-      corsStrategy = "none",
-      context: contextFn,
-      authorization,
-      method,
-    } = options;
+  // Read the options once, when the route is created.
+  const {
+    params: paramsSchema,
+    searchParams: searchParamsSchema,
+    headers: headersSchema,
+    body: bodySchema,
+    corsStrategy = "none",
+    context: contextFn,
+    authorization,
+    method,
+    maxContentLength,
+  } = options;
 
+  return async function action({ request, params }: ActionFunctionArgs) {
     if (corsStrategy !== "none" && request.method.toUpperCase() === "OPTIONS") {
       return apiCors(request, json({}));
     }
@@ -972,37 +1023,6 @@ export function createActionPATApiRoute<
         parsedHeaders = headers.data;
       }
 
-      let parsedBody: any = undefined;
-      if (bodySchema) {
-        const rawBody = await request.text();
-        if (rawBody.length === 0) {
-          return await wrapResponse(
-            request,
-            json({ error: "Request body is empty" }, { status: 400 }),
-            corsStrategy !== "none"
-          );
-        }
-
-        const rawParsedJson = safeJsonParse(rawBody);
-        if (!rawParsedJson) {
-          return await wrapResponse(
-            request,
-            json({ error: "Invalid JSON" }, { status: 400 }),
-            corsStrategy !== "none"
-          );
-        }
-
-        const body = bodySchema.safeParse(rawParsedJson);
-        if (!body.success) {
-          return await wrapResponse(
-            request,
-            json({ error: fromZodError(body.error).toString() }, { status: 400 }),
-            corsStrategy !== "none"
-          );
-        }
-        parsedBody = body.data;
-      }
-
       const apiVersion = getApiVersion(request);
 
       // `context` resolves the target org/project so the plugin can compute the
@@ -1035,17 +1055,22 @@ export function createActionPATApiRoute<
         }
         await assertUserActorScope(claims, ctx);
         authenticationResult = { userId: uatAuth.userId, userActor: claims };
+        notePersonalAccessTokenAuthentication(request, authenticationResult);
         ability = uatAuth.ability;
       } else {
         const patAuth = await rbac.authenticatePat(request, ctx);
         if (!patAuth.ok) {
           return await wrapResponse(
             request,
-            json({ error: patAuth.error }, { status: patAuth.status }),
+            json(personalAccessTokenAuthFailureBody(patAuth), { status: patAuth.status }),
             corsStrategy !== "none"
           );
         }
         authenticationResult = { userId: patAuth.userId };
+        notePersonalAccessTokenAuthentication(request, {
+          userId: patAuth.userId,
+          tokenId: patAuth.tokenId,
+        });
         ability = patAuth.ability;
         await updateLastAccessedAtIfStale(patAuth.tokenId, patAuth.lastAccessedAt);
       }
@@ -1057,7 +1082,7 @@ export function createActionPATApiRoute<
             request,
             json(
               {
-                error: "Unauthorized",
+                error: scopeAuthorizationError(authorization.action, $resource),
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -1067,6 +1092,49 @@ export function createActionPATApiRoute<
             corsStrategy !== "none"
           );
         }
+      }
+
+      if (maxContentLength) {
+        const contentLength = request.headers.get("content-length");
+
+        if (!contentLength || parseInt(contentLength) > maxContentLength) {
+          return await wrapResponse(
+            request,
+            json({ error: "Request body too large" }, { status: 413 }),
+            corsStrategy !== "none"
+          );
+        }
+      }
+
+      let parsedBody: any = undefined;
+      if (bodySchema) {
+        const rawBody = await request.text();
+        if (rawBody.length === 0) {
+          return await wrapResponse(
+            request,
+            json({ error: "Request body is empty" }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+
+        const rawParsedJson = safeJsonParse(rawBody);
+        if (!rawParsedJson) {
+          return await wrapResponse(
+            request,
+            json({ error: "Invalid JSON" }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+
+        const body = bodySchema.safeParse(rawParsedJson);
+        if (!body.success) {
+          return await wrapResponse(
+            request,
+            json({ error: fromZodError(body.error).toString() }, { status: 400 }),
+            corsStrategy !== "none"
+          );
+        }
+        parsedBody = body.data;
       }
 
       // PAT auth carries `userId` but no environment — enrich the scope the
@@ -1200,6 +1268,8 @@ type ApiKeyActionHandlerFunction<
     ? z.infer<TBodySchema>
     : undefined;
   authentication: ApiAuthenticationResultSuccess;
+  restrictedApiKey: boolean;
+  subject: RbacSubject;
   ability: RbacAbility;
   request: Request;
   resource?: TResource;
@@ -1236,6 +1306,8 @@ export function createActionApiRoute<
     corsStrategy = "none",
     authorization,
     maxContentLength,
+    method,
+    findResource,
   } = options;
 
   async function loader({ request, params }: LoaderFunctionArgs) {
@@ -1247,14 +1319,11 @@ export function createActionApiRoute<
   }
 
   async function action({ request, params }: ActionFunctionArgs) {
-    if (options.method) {
-      if (request.method.toUpperCase() !== options.method) {
+    if (method) {
+      if (request.method.toUpperCase() !== method) {
         return await wrapResponse(
           request,
-          json(
-            { error: "Method not allowed" },
-            { status: 405, headers: { Allow: options.method } }
-          ),
+          json({ error: "Method not allowed" }, { status: 405, headers: { Allow: method } }),
           corsStrategy !== "none"
         );
       }
@@ -1270,6 +1339,13 @@ export function createActionApiRoute<
         );
       }
       const { authentication: authenticationResult, ability } = authResult;
+      // The request's own context too, for what runs outside the handler.
+      tenantContext.enrich(
+        tenantContextFromAuthEnvironment(
+          authenticationResult.environment,
+          authenticationResult.actor
+        )
+      );
       const restrictedKeyRejection = await rejectRestrictedKeyWithoutAuthorization({
         request,
         restrictedApiKey: authResult.restrictedApiKey,
@@ -1377,8 +1453,8 @@ export function createActionApiRoute<
       // is addressable by both `friendlyId` and `externalId` and a JWT minted
       // for either form should authorize both URL forms). Mirrors the
       // ordering in `createLoaderApiRoute`.
-      const resource = options.findResource
-        ? await options.findResource(parsedParams, authenticationResult, parsedSearchParams)
+      const resource = findResource
+        ? await findResource(parsedParams, authenticationResult, parsedSearchParams)
         : undefined;
 
       // Run authorization first — but with the resolved resource available
@@ -1405,7 +1481,7 @@ export function createActionApiRoute<
             request,
             json(
               {
-                error: "Unauthorized",
+                error: scopeAuthorizationError(action, $resource),
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -1417,7 +1493,7 @@ export function createActionApiRoute<
         }
       }
 
-      if (options.findResource && !resource) {
+      if (findResource && !resource) {
         return await wrapResponse(
           request,
           json({ error: "Resource not found" }, { status: 404 }),
@@ -1437,6 +1513,8 @@ export function createActionApiRoute<
             headers: parsedHeaders,
             body: parsedBody,
             authentication: authenticationResult,
+            restrictedApiKey: authResult.restrictedApiKey,
+            subject: authResult.subject,
             ability,
             request,
             resource,
@@ -1454,6 +1532,9 @@ export function createActionApiRoute<
           logBoundaryError("Unroutable id", error, request.url);
           return await wrapResponse(request, unroutable, corsStrategy !== "none");
         }
+
+        const busy = keyedWaitpointBudgetResponse(error, { url: sanitizeHttpUrl(request.url) });
+        if (busy) return await wrapResponse(request, busy, corsStrategy !== "none");
 
         logBoundaryError("Error in action", error, request.url);
 
@@ -1575,6 +1656,13 @@ export function createMultiMethodApiRoute<
         );
       }
       const { authentication: authenticationResult, ability } = authResult;
+      // The request's own context too, for what runs outside the handler.
+      tenantContext.enrich(
+        tenantContextFromAuthEnvironment(
+          authenticationResult.environment,
+          authenticationResult.actor
+        )
+      );
       const restrictedKeyRejection = await rejectRestrictedKeyWithoutAuthorization({
         request,
         restrictedApiKey: authResult.restrictedApiKey,
@@ -1657,7 +1745,7 @@ export function createMultiMethodApiRoute<
             request,
             json(
               {
-                error: "Unauthorized",
+                error: scopeAuthorizationError(action, $resource),
                 code: "unauthorized",
                 param: "access_token",
                 type: "authorization",
@@ -1792,6 +1880,7 @@ type WorkerLoaderHandlerFunction<
     : undefined;
   runnerId?: string;
   environmentId?: string;
+  sandboxRunId?: string;
 }) => Promise<Response>;
 
 export function createLoaderWorkerApiRoute<
@@ -1802,13 +1891,14 @@ export function createLoaderWorkerApiRoute<
   options: WorkerLoaderRouteBuilderOptions<TParamsSchema, TSearchParamsSchema, THeadersSchema>,
   handler: WorkerLoaderHandlerFunction<TParamsSchema, TSearchParamsSchema, THeadersSchema>
 ) {
-  return async function loader({ request, params }: LoaderFunctionArgs) {
-    const {
-      params: paramsSchema,
-      searchParams: searchParamsSchema,
-      headers: headersSchema,
-    } = options;
+  // Read the options once, when the route is created.
+  const {
+    params: paramsSchema,
+    searchParams: searchParamsSchema,
+    headers: headersSchema,
+  } = options;
 
+  return async function loader({ request, params }: LoaderFunctionArgs) {
     try {
       const service = new WorkerGroupTokenService();
       const authenticationResult = await service.authenticate(request);
@@ -1858,6 +1948,7 @@ export function createLoaderWorkerApiRoute<
       const runnerId = request.headers.get(WORKER_HEADERS.RUNNER_ID) ?? undefined;
       // `|| undefined` so a blank header can't become a zero-match snapshot filter (→ false reject).
       const environmentId = request.headers.get(WORKER_HEADERS.ENVIRONMENT_ID) || undefined;
+      const sandboxRunId = request.headers.get(WORKER_HEADERS.SANDBOX_RUN_ID) || undefined;
 
       const result = await handler({
         params: parsedParams,
@@ -1867,6 +1958,7 @@ export function createLoaderWorkerApiRoute<
         headers: parsedHeaders,
         runnerId,
         environmentId,
+        sandboxRunId,
       });
       return result;
     } catch (error) {
@@ -1926,6 +2018,7 @@ type WorkerActionHandlerFunction<
     : undefined;
   runnerId?: string;
   environmentId?: string;
+  sandboxRunId?: string;
 }) => Promise<Response>;
 
 export function createActionWorkerApiRoute<
@@ -1947,22 +2040,22 @@ export function createActionWorkerApiRoute<
     TBodySchema
   >
 ) {
+  // Read the options once, when the route is created.
+  const {
+    params: paramsSchema,
+    searchParams: searchParamsSchema,
+    body: bodySchema,
+    headers: headersSchema,
+    method,
+    bodyValidationErrorStatus,
+  } = options;
+
   return async function action({ request, params }: ActionFunctionArgs) {
-    if (options.method) {
-      if (request.method.toUpperCase() !== options.method) {
-        return json(
-          { error: "Method not allowed" },
-          { status: 405, headers: { Allow: options.method } }
-        );
+    if (method) {
+      if (request.method.toUpperCase() !== method) {
+        return json({ error: "Method not allowed" }, { status: 405, headers: { Allow: method } });
       }
     }
-
-    const {
-      params: paramsSchema,
-      searchParams: searchParamsSchema,
-      body: bodySchema,
-      headers: headersSchema,
-    } = options;
 
     try {
       const service = new WorkerGroupTokenService();
@@ -2019,9 +2112,9 @@ export function createActionWorkerApiRoute<
             { error: "Body Error", details: fromZodError(parsed.error).details },
             {
               status:
-                typeof options.bodyValidationErrorStatus === "function"
-                  ? options.bodyValidationErrorStatus(parsed.error)
-                  : (options.bodyValidationErrorStatus ?? 400),
+                typeof bodyValidationErrorStatus === "function"
+                  ? bodyValidationErrorStatus(parsed.error)
+                  : (bodyValidationErrorStatus ?? 400),
             }
           );
         }
@@ -2031,6 +2124,7 @@ export function createActionWorkerApiRoute<
       const runnerId = request.headers.get(WORKER_HEADERS.RUNNER_ID) ?? undefined;
       // `|| undefined` so a blank header can't become a zero-match snapshot filter (→ false reject).
       const environmentId = request.headers.get(WORKER_HEADERS.ENVIRONMENT_ID) || undefined;
+      const sandboxRunId = request.headers.get(WORKER_HEADERS.SANDBOX_RUN_ID) || undefined;
 
       const result = await handler({
         params: parsedParams,
@@ -2041,6 +2135,7 @@ export function createActionWorkerApiRoute<
         headers: parsedHeaders,
         runnerId,
         environmentId,
+        sandboxRunId,
       });
       return result;
     } catch (error) {

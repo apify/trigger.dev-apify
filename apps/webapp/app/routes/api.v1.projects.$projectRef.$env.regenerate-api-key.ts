@@ -8,10 +8,15 @@ import {
 } from "~/services/apiAuth.server";
 import { authorizePatEnvironmentAccess } from "~/services/environmentVariableApiAccess.server";
 import { logger } from "~/services/logger.server";
+import { personalAccessTokenUnauthorizedResponse } from "~/services/personalAccessToken.server";
 
 const ParamsSchema = z.object({
   projectRef: z.string(),
   env: z.enum(["dev", "staging", "prod", "preview"]),
+});
+
+const BodySchema = z.object({
+  revokeImmediately: z.boolean().default(false),
 });
 
 export async function action({ request, params }: ActionFunctionArgs) {
@@ -35,12 +40,30 @@ export async function action({ request, params }: ActionFunctionArgs) {
     });
 
     if (!authenticationResult) {
-      return json({ error: "Invalid or Missing Access Token" }, { status: 401 });
+      return personalAccessTokenUnauthorizedResponse(request);
     }
 
     if (request.headers.has("x-trigger-branch")) {
       return json({ error: "Branch-scoped key rotation is not supported" }, { status: 400 });
     }
+
+    const rawBody = await request.text();
+    let body: unknown = {};
+    if (rawBody.trim().length > 0) {
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return json({ error: "Invalid JSON body" }, { status: 400 });
+      }
+    }
+
+    const parsedBody = BodySchema.safeParse(body);
+
+    if (!parsedBody.success) {
+      return json({ error: "Invalid Body" }, { status: 400 });
+    }
+
+    const { revokeImmediately } = parsedBody.data;
 
     const environment = await authenticatedEnvironmentForAuthentication(
       authenticationResult,
@@ -65,6 +88,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const updatedEnvironment = await regenerateApiKey({
       userId: authenticationResult.result.userId,
       environmentId: environment.id,
+      revokeImmediately,
     });
 
     return json({ apiKey: updatedEnvironment.apiKey });

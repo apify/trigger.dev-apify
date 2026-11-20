@@ -7,6 +7,8 @@ import type {
   User,
 } from "@trigger.dev/database";
 import { tryCatch } from "@trigger.dev/core/utils";
+import type { AuditLogActor } from "@trigger.dev/plugins";
+import cuid from "cuid";
 import { customAlphabet } from "nanoid";
 import { generate } from "random-words";
 import slug from "slug";
@@ -26,8 +28,10 @@ import {
   setBillingAlert,
 } from "~/services/platform.v3.server";
 import { buildDefaultBillingAlerts } from "~/services/billingAlertsDefaults.server";
-import { enqueueAttioWorkspaceSync } from "~/services/attio.server";
+import { enqueueAttioMemberSync, enqueueAttioWorkspaceSync } from "~/services/attio.server";
 import { provisionBillingCustomerForOrg } from "~/services/billingPlugin.server";
+import { saveRootApiKeyFingerprint } from "~/services/credentialFingerprints.server";
+import type { OrgMemberJoinMethod } from "~/models/member.server";
 import { logger } from "~/services/logger.server";
 import { telemetry } from "~/services/telemetry.server";
 import {
@@ -142,6 +146,7 @@ export async function createOrganization(
         create: {
           userId: userId,
           role: "ADMIN",
+          joinMethod: "created" satisfies OrgMemberJoinMethod,
         },
       },
       // Managed-cloud orgs start deactivated so they're routed through
@@ -165,6 +170,7 @@ export async function createOrganization(
     createdAt: organization.createdAt,
     adminUserId: userId,
   });
+  void enqueueAttioMemberSync({ organizationId: organization.id, userId });
 
   telemetry.organization.new({ userId, organization });
 
@@ -210,6 +216,7 @@ export async function createEnvironment({
   prismaClient = prisma,
   /** When set, skips billing lookup — caller must supply the limit for this org + type. */
   maximumConcurrencyLimit,
+  createdBy = null,
 }: {
   organization: Pick<Organization, "id" | "maximumConcurrencyLimit">;
   project: Pick<Project, "id">;
@@ -218,6 +225,8 @@ export async function createEnvironment({
   member?: OrgMember;
   prismaClient?: PrismaClientOrTransaction;
   maximumConcurrencyLimit?: number;
+  /** Who created the environment, for its root key's audit fingerprint. */
+  createdBy?: AuditLogActor | null;
 }) {
   const slug = envSlug(type);
   const apiKey = createApiKeyForEnv(type);
@@ -228,8 +237,17 @@ export async function createEnvironment({
     maximumConcurrencyLimit ?? (await getDefaultEnvironmentConcurrencyLimit(organization.id, type));
   const billingPause = await getInitialEnvPauseStateForBillingLimit(organization.id, type);
 
+  // The id is chosen here so the root key's fingerprint can name its environment.
+  const environmentId = cuid();
+  await saveRootApiKeyFingerprint(
+    apiKey,
+    { id: environmentId, organizationId: organization.id, projectId: project.id },
+    createdBy
+  );
+
   const environment = await prismaClient.runtimeEnvironment.create({
     data: {
+      id: environmentId,
       slug,
       apiKey,
       pkApiKey,
@@ -295,11 +313,13 @@ export async function createDevelopmentEnvironmentForMember({
   project,
   member,
   maximumConcurrencyLimit,
+  createdBy = null,
 }: {
   organization: Pick<Organization, "id" | "maximumConcurrencyLimit">;
   project: Pick<Project, "id">;
   member: OrgMember;
   maximumConcurrencyLimit?: number;
+  createdBy?: AuditLogActor | null;
 }): Promise<{ created: boolean }> {
   try {
     await createEnvironment({
@@ -309,6 +329,7 @@ export async function createDevelopmentEnvironmentForMember({
       isBranchableEnvironment: true,
       member,
       maximumConcurrencyLimit,
+      createdBy,
     });
     return { created: true };
   } catch (error) {

@@ -3,10 +3,9 @@
  * (emit/persist), envelope optional (`legacy*`, which must keep parsing forever).
  */
 import { evidenceRefSchema, evidenceSchema } from "./evidence.js";
-import { agentIntentSchema } from "./intent.js";
+import { agentIntentSchema, legacyWatchIntentSchema } from "./intent.js";
 import { runFiltersSchema } from "./run-filters.js";
 import { triggerUriSchema } from "./trigger-uri.js";
-import { watchSpecSchema } from "./watch.js";
 import { z } from "zod";
 
 /**
@@ -200,39 +199,53 @@ export const chartBlockBodySchema = z.object({
  * Same lenient navigate `target` as `chartActionIntentSchema`. `propose_fix` is
  * absent on purpose: it is reserved, so a button can never carry it.
  */
+const askActionIntentSchema = z.object({
+  kind: z.literal("ask"),
+  prompt: z.string().min(1),
+});
+
+const navigateActionIntentSchema = z.object({
+  kind: z.literal("navigate"),
+  target: z.string().min(1),
+  filters: runFiltersSchema.optional(),
+});
+
 const actionIntentSchema = z.union([
-  z.object({
-    kind: z.literal("ask"),
-    prompt: z.string().min(1),
-  }),
-  z.object({
-    kind: z.literal("navigate"),
-    target: z.string().min(1),
-    filters: runFiltersSchema.optional(),
-  }),
-  z.object({
-    kind: z.literal("watch"),
-    spec: watchSpecSchema,
-  }),
+  askActionIntentSchema,
+  navigateActionIntentSchema,
+  legacyWatchIntentSchema,
 ]);
 
+const ASK_NAVIGATE_INTENT_DOC =
+  "`ask` sends the prompt as the user's next message, in their voice. `navigate` takes them to a page — ONLY with a canonical `trigger://` URI you already hold; an invalid target is silently dropped.";
+
 export const actionsBlockActionSchema = z.object({
-  label: z.string().min(1).describe("The button text, e.g. 'Set up a watch'."),
-  intent: actionIntentSchema.describe(
-    "What the button does. `watch` opens the watch configuration card pre-filled with your spec — the user confirming it is what starts the watch. `ask` sends the prompt as the user's next message, in their voice. `navigate` takes them to a page — ONLY with a canonical `trigger://` URI you already hold; an invalid target is silently dropped."
-  ),
+  label: z.string().min(1),
+  intent: actionIntentSchema,
 });
 
 export type ActionsBlockAction = z.infer<typeof actionsBlockActionSchema>;
 
 const actionsBlockBodySchema = z.object({
   type: z.literal("actions"),
+  actions: z.array(actionsBlockActionSchema).min(1).max(3),
+});
+
+const actionsBlockBodyInputSchema = z.object({
+  type: z.literal("actions"),
   actions: z
-    .array(actionsBlockActionSchema)
+    .array(
+      z.object({
+        label: z.string().min(1).describe("The button text, e.g. 'See its failed runs'."),
+        intent: z
+          .union([askActionIntentSchema, navigateActionIntentSchema])
+          .describe(`What the button does. ${ASK_NAVIGATE_INTENT_DOC}`),
+      })
+    )
     .min(1)
     .max(3)
     .describe(
-      "1-3 buttons, the one to take first. Keep labels short and imperative ('Set up a watch', 'See its failed runs')."
+      "1-3 buttons, the one to take first. Keep labels short and imperative ('See its failed runs')."
     ),
 });
 
@@ -585,40 +598,36 @@ const investigationBlockBodyInputSchema = z.object({
   investigation: investigationStateInputSchema,
 });
 
-/**
- * Host-emitted only, so it is absent from `viewBlockInputSchema`. Wording is
- * frozen at append time: the block carries final English, not a message key.
- */
-export const watchResultOutcomeSchema = z.enum(["watching", "already_true", "impossible"]);
-export type WatchResultOutcome = z.infer<typeof watchResultOutcomeSchema>;
+export const alertCreatedRowSchema = z.object({
+  label: z.string(),
+  value: z.string(),
+  expiresAt: z.string().optional(),
+});
+export type AlertCreatedRow = z.infer<typeof alertCreatedRowSchema>;
 
-const watchResultBlockBodySchema = z.object({
-  type: z.literal("watch_result"),
-  outcome: watchResultOutcomeSchema,
-  headline: z.string(),
-  /** Null on a one-shot result: nothing is watching. */
-  lifetime: z.string().nullable().default(null),
-  detail: z.string().nullable().default(null),
-  followUp: z.array(z.string()).max(4).default([]),
-  /** The live watch this confirms. Null on a one-shot result. */
-  watchId: z.string().nullable().default(null),
+const alertCreatedBlockBodySchema = z.object({
+  type: z.literal("alert_created"),
+  alertId: z.string(),
+  name: z.string(),
+  rows: z.array(alertCreatedRowSchema).default([]),
+  planItemKey: z.string().optional(),
 });
 
-export const watchResultBlockSchema = watchResultBlockBodySchema.merge(blockEnvelopeSchema);
-export const legacyWatchResultBlockSchema =
-  watchResultBlockBodySchema.extend(optionalEnvelopeShape);
+export const alertCreatedBlockSchema = alertCreatedBlockBodySchema.merge(blockEnvelopeSchema);
+export const legacyAlertCreatedBlockSchema =
+  alertCreatedBlockBodySchema.extend(optionalEnvelopeShape);
 
-export type EnvelopedWatchResultBlock = z.infer<typeof watchResultBlockSchema>;
-export type WatchResultBlock = z.infer<typeof legacyWatchResultBlockSchema>;
+export type EnvelopedAlertCreatedBlock = z.infer<typeof alertCreatedBlockSchema>;
+export type AlertCreatedBlock = z.infer<typeof legacyAlertCreatedBlockSchema>;
 
 /**
- * What `render_view` accepts from the model. `report` and `watch_result` are
+ * What `render_view` accepts from the model. `report` and `alert_created` are
  * host-emitted and so absent here.
  */
 export const viewBlockInputSchema = z.discriminatedUnion("type", [
   diagnosisBlockBodySchema,
   chartBlockBodySchema,
-  actionsBlockBodySchema,
+  actionsBlockBodyInputSchema,
   investigationBlockBodyInputSchema,
 ]);
 
@@ -663,7 +672,7 @@ export const viewBlockSchema = z.discriminatedUnion("type", [
   actionsBlockSchema,
   reportBlockSchema,
   investigationBlockSchema,
-  watchResultBlockSchema,
+  alertCreatedBlockSchema,
 ]);
 
 export type EnvelopedDiagnosisBlock = z.infer<typeof diagnosisBlockSchema>;
@@ -687,7 +696,7 @@ export const legacyViewBlockSchema = z.discriminatedUnion("type", [
   legacyActionsBlockSchema,
   legacyReportBlockSchema,
   legacyInvestigationBlockSchema,
-  legacyWatchResultBlockSchema,
+  legacyAlertCreatedBlockSchema,
 ]);
 
 /**

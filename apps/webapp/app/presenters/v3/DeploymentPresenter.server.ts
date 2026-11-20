@@ -18,6 +18,7 @@ import { env } from "~/env.server";
 import { createRedisClient } from "~/redis.server";
 import { tryCatch } from "@trigger.dev/core";
 import { logger } from "~/services/logger.server";
+import { redeployOfShortCode } from "~/v3/redeploy";
 
 const S2_TOKEN_KEY_PREFIX = "s2-token:project:";
 
@@ -128,6 +129,7 @@ export class DeploymentPresenter {
         installedAt: true,
         canceledAt: true,
         canceledReason: true,
+        supersededById: true,
         git: true,
         promotions: {
           select: {
@@ -163,6 +165,14 @@ export class DeploymentPresenter {
         triggeredVia: true,
       },
     });
+
+    const supersededBy =
+      deployment.status === "CANCELED" && deployment.supersededById
+        ? await this.#prismaClient.workerDeployment.findFirst({
+            where: { id: deployment.supersededById, environmentId: environment.id },
+            select: { shortCode: true, version: true },
+          })
+        : null;
 
     const gitMetadata = processGitMetadata(deployment.git);
 
@@ -252,6 +262,7 @@ export class DeploymentPresenter {
         deployedAt: deployment.deployedAt,
         canceledAt: deployment.canceledAt,
         canceledReason: deployment.canceledReason,
+        supersededBy,
         tasks: deployment.worker?.tasks,
         label: deployment.promotions?.[0]?.label,
         environment: {
@@ -278,6 +289,7 @@ export class DeploymentPresenter {
         externalId: deployment.externalId,
         git: gitMetadata,
         triggeredVia: deployment.triggeredVia,
+        redeployOf: redeployOfShortCode(deployment.buildServerMetadata),
         vercelDeploymentUrl,
       },
     };

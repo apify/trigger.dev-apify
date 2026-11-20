@@ -10,6 +10,17 @@ import {
 } from "@trigger.dev/plugins";
 import { createHash } from "node:crypto";
 import { buildJwtAbility, permissiveAbility } from "./ability.js";
+import { clientIpFromHeaders, isIpAllowed } from "./ipAllowlist.js";
+import {
+  sourcePersonalAccessTokenCheck,
+  sourcePersonalAccessTokenClaim,
+} from "./personalAccessTokenExpiry.js";
+import {
+  resolvePublicTokenSubject,
+  type PublicTokenSubjectCodec,
+  type SealedIdCodec,
+} from "./publicTokenSubject.js";
+import { recordingApiKeyAbility, type ApiKeyScopeRecorder } from "./scopeUsage.js";
 
 export type BearerCredentialClients = {
   // Used for the `lastUsedAt` telemetry write; reads go to the replica.
@@ -22,6 +33,7 @@ export type BearerCredentialKind =
   | "additional_api_key"
   | "public_jwt"
   | "legacy_public_key"
+  | "run_token"
   | "unknown";
 
 export type BearerLookupPath =
@@ -31,13 +43,21 @@ export type BearerLookupPath =
   | "additional"
   | "jwt_current"
   | "jwt_rotated"
+  | "jwt_legacy_subject"
   | "legacy_public"
+  | "run_token"
+  | "ip_not_allowed"
   | "not_found";
 
-// Telemetry-only
 export type BearerResolution = {
+  // Telemetry: bounded values only.
   credentialKind: BearerCredentialKind;
   lookupPath: BearerLookupPath;
+  // Attribution for a verified public JWT: the environment whose root key signed it (a branch's
+  // parent) and the last 4 characters of the key that verified it, which may be a rotated key
+  // still in its grace window. Never the key itself: `hash()` returns its SHA-256 hex on demand,
+  // so callers that don't need it pay nothing.
+  jwtSigningKey?: { environmentId: string; last4: string; hash(): string };
 };
 
 export type BearerCredentialResult = BearerAuthResult & {
@@ -66,18 +86,28 @@ export function resolveJwtSigningKey(env: {
  * Additional API-key credentials carry DB-persisted effective scopes, which
  * are compiled into their final ability here without a plugin policy lookup.
  */
+export type BearerCredentialResolverOptions = {
+  publicTokenSubjects?: PublicTokenSubjectCodec;
+  sourcePersonalAccessTokens?: SealedIdCodec;
+};
+
 export class BearerCredentialResolver {
   private readonly prisma: PrismaClient;
   private readonly replica: PrismaClient;
+  private readonly publicTokenSubjects?: PublicTokenSubjectCodec;
+  private readonly sourcePersonalAccessTokens?: SealedIdCodec;
 
-  constructor(clients: BearerCredentialClients) {
+  constructor(clients: BearerCredentialClients, options?: BearerCredentialResolverOptions) {
     this.prisma = clients.primary;
     this.replica = clients.replica;
+    this.publicTokenSubjects = options?.publicTokenSubjects;
+    this.sourcePersonalAccessTokens = options?.sourcePersonalAccessTokens;
   }
 
   async authenticate(
     request: Request,
-    options?: BearerAuthOptions
+    options?: BearerAuthOptions,
+    recordScopeUse?: ApiKeyScopeRecorder
   ): Promise<BearerCredentialResult> {
     // Deprecated public API keys (`pk_*` minted long before public JWTs
     // landed) are intentionally NOT handled here. That token format hasn't
@@ -97,8 +127,9 @@ export class BearerCredentialResolver {
     }
 
     if (options?.allowJWT && isPublicJWT(rawToken)) {
-      const envId = extractJWTSub(rawToken);
-      if (!envId) {
+      const sub = extractJWTSub(rawToken);
+      const subject = sub ? resolvePublicTokenSubject(sub, this.publicTokenSubjects) : undefined;
+      if (!subject) {
         return {
           ok: false,
           status: 401,
@@ -110,7 +141,7 @@ export class BearerCredentialResolver {
       // Match the include shape of the slim AuthenticatedEnvironment so
       // the bridge can use the returned env without a follow-up fetch.
       const env = await this.replica.runtimeEnvironment.findFirst({
-        where: { id: envId },
+        where: { id: subject.environmentId },
         include: {
           project: true,
           organization: true,
@@ -134,8 +165,9 @@ export class BearerCredentialResolver {
         };
       }
 
-      let lookupPath: BearerLookupPath = "jwt_current";
-      let result = await validateJWT(rawToken, resolveJwtSigningKey(env));
+      let lookupPath: BearerLookupPath = subject.legacy ? "jwt_legacy_subject" : "jwt_current";
+      let signingKey = resolveJwtSigningKey(env);
+      let result = await validateJWT(rawToken, signingKey);
 
       // Root-key rotation grace window, mirroring the bearer path below: a
       // rotated key keeps authenticating until its `RevokedApiKey` row expires,
@@ -158,12 +190,13 @@ export class BearerCredentialResolver {
           select: { apiKey: true },
         });
 
-        if (revoked.length > 0) lookupPath = "jwt_rotated";
+        if (revoked.length > 0 && !subject.legacy) lookupPath = "jwt_rotated";
 
         for (const candidate of revoked) {
           const retried = await validateJWT(rawToken, candidate.apiKey);
           if (retried.ok) {
             result = retried;
+            signingKey = candidate.apiKey;
             break;
           }
         }
@@ -184,9 +217,36 @@ export class BearerCredentialResolver {
       const realtime = result.payload.realtime as { skipColumns?: string[] } | undefined;
       const oneTimeUse = result.payload.otu === true;
       // A JWT minted from a PAT/UAT exchange stamps `act: { sub: userId }` for
-      // attribution. Surface it so write handlers can record the acting user.
-      const act = result.payload.act as { sub?: unknown } | undefined;
+      // attribution. Surface it so write handlers can record the acting user,
+      // with the host's signature on it for the host to check. The signature
+      // covers the token's claims too, so they're passed through as minted.
+      const act = result.payload.act as
+        | { sub?: unknown; client?: unknown; sig?: unknown }
+        | undefined;
       const actSub = typeof act?.sub === "string" ? act.sub : undefined;
+      const actClient = typeof act?.client === "string" ? act.client : undefined;
+      const actSig = typeof act?.sig === "string" ? act.sig : undefined;
+      const expiresAt = typeof result.payload.exp === "number" ? result.payload.exp : undefined;
+
+      // A JWT from the PAT/UAT exchange also names its source PAT, and dies with it.
+      const sourcePat = sourcePersonalAccessTokenClaim(
+        result.payload,
+        this.sourcePersonalAccessTokens
+      );
+      if (
+        sourcePat &&
+        !(
+          sourcePat.id &&
+          (await sourcePersonalAccessTokenCheck.isActive(this.replica, sourcePat.id))
+        )
+      ) {
+        return {
+          ok: false,
+          status: 401,
+          error: "Public Access Token is invalid",
+          resolution: { credentialKind: "public_jwt", lookupPath },
+        };
+      }
 
       return {
         ok: true,
@@ -198,15 +258,44 @@ export class BearerCredentialResolver {
           projectId: env.projectId,
         },
         ability: buildJwtAbility(scopes),
-        jwt: { realtime, oneTimeUse, ...(actSub ? { act: { sub: actSub } } : {}) },
-        resolution: { credentialKind: "public_jwt", lookupPath },
+        jwt: {
+          realtime,
+          oneTimeUse,
+          expiresAt,
+          scopes,
+          ...(actSub
+            ? {
+                act: {
+                  sub: actSub,
+                  ...(actClient ? { client: actClient } : {}),
+                  ...(actSig ? { sig: actSig } : {}),
+                  ...(sourcePat ? { pat: sourcePat.sealed } : {}),
+                },
+              }
+            : {}),
+        },
+        resolution: {
+          credentialKind: "public_jwt",
+          lookupPath,
+          jwtSigningKey: {
+            environmentId: env.parentEnvironment?.id ?? env.id,
+            last4: signingKey.slice(-4),
+            hash: () => createHash("sha256").update(signingKey, "utf8").digest("hex"),
+          },
+        },
       };
     }
 
     const branchName = sanitizeBranchName(request.headers.get("x-trigger-branch"));
 
     if (isAdditionalApiKey(rawToken)) {
-      return this.resolveAdditionalKey(rawToken, branchName, options?.allowPreviewParent);
+      return this.resolveAdditionalKey(
+        rawToken,
+        branchName,
+        clientIpFromHeaders(request.headers),
+        options?.allowPreviewParent,
+        recordScopeUse
+      );
     }
 
     return this.resolveRootKey(rawToken, branchName, options?.allowPreviewParent);
@@ -283,7 +372,9 @@ export class BearerCredentialResolver {
   private async resolveAdditionalKey(
     rawToken: string,
     branchName: string | null,
-    allowPreviewParent = false
+    clientIp: string | null,
+    allowPreviewParent = false,
+    recordScopeUse?: ApiKeyScopeRecorder
   ): Promise<BearerCredentialResult> {
     const resolution: BearerResolution = {
       credentialKind: "additional_api_key",
@@ -300,12 +391,23 @@ export class BearerCredentialResolver {
         id: true,
         lastUsedAt: true,
         scopes: true,
+        allowedIpRanges: true,
         runtimeEnvironment: { include: environmentInclude(branchName) },
       },
     });
 
     if (!match || match.runtimeEnvironment.project.deletedAt !== null) {
       return { ok: false, status: 401, error: "Invalid API key", resolution };
+    }
+
+    if (!isIpAllowed(match.allowedIpRanges, clientIp)) {
+      // Same response as an unknown key, so whoever holds a leaked key can't tell it is valid.
+      return {
+        ok: false,
+        status: 401,
+        error: "Invalid API key",
+        resolution: { credentialKind: "additional_api_key", lookupPath: "ip_not_allowed" },
+      };
     }
 
     const [branchError, resolvedEnvironment] = resolveBranch(
@@ -330,7 +432,7 @@ export class BearerCredentialResolver {
             revokedAt: null,
             OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
           },
-          data: { lastUsedAt: now },
+          data: { lastUsedAt: now, lastUsedIp: clientIp },
         });
       } catch {
         // Authentication should not fail because last-used telemetry could not be recorded.
@@ -347,7 +449,17 @@ export class BearerCredentialResolver {
         organizationId: resolvedEnvironment.organizationId,
         projectId: resolvedEnvironment.projectId,
       },
-      ability: buildJwtAbility(match.scopes),
+      ability: recordScopeUse
+        ? recordingApiKeyAbility(
+            match.scopes,
+            {
+              organizationId: resolvedEnvironment.organizationId,
+              environmentId: resolvedEnvironment.id,
+              apiKeyId: match.id,
+            },
+            recordScopeUse
+          )
+        : buildJwtAbility(match.scopes),
       resolution,
     };
   }

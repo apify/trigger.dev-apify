@@ -1,5 +1,265 @@
 # @trigger.dev/sdk
 
+## 4.8.7
+
+### Patch Changes
+
+- Fix `chat.agent` channels on AI SDK 7 failing the whole turn when a channel file can't be downloaded. A file the connector owns but can't read is now replaced with an `[Attached file "…" could not be loaded]` note and the agent still answers, as it does on AI SDK 6. AI SDK 7 describes a file's URL in a tagged form that the SDK didn't recognise, so the failed file was never found. ([`c888eb885`](https://github.com/triggerdotdev/trigger.dev/commit/c888eb885ea0ef04f777720df4c534eed80d1eec))
+
+  An inline `data:` file in a channel message is no longer passed to a connector's `download`, and on AI SDK 6 it reaches the model instead of failing the turn.
+
+- Fix two compaction problems on AI SDK 7. After a compaction, a `chat.agent` turn that continued a tool approval sent the model the full pre-compaction transcript instead of the summary, which undid the compaction (this also affected `chat.MessageAccumulator`). And between-turn compaction, in `chat.agent` and `chat.createSession`, was asked about the whole turn's token usage instead of the last step's, so `shouldCompact` thresholds triggered too early on multi-step turns. ([`c615d762e`](https://github.com/triggerdotdev/trigger.dev/commit/c615d762e4644f70c9b7e4420e8edc75fe97c8d1))
+
+  If you call `compactIfNeeded` on a `chat.MessageAccumulator`, pass it the last step's usage, `(await result.steps).at(-1)?.usage`. `result.usage` is the turn's sum on AI SDK 7.
+
+- Fix `chat.agent` steering on AI SDK 7. A steering message that `pendingMessages.prepare` turns into a `system` message no longer makes the step fail with an invalid-prompt error: `chat.toStreamTextOptions()` now sets `allowSystemInMessages: true`, as AI SDK 5 and 6 already behave (pass `allowSystemInMessages: false` after the spread to keep AI SDK 7's strict default). A turn whose stream ends on an error now reports `finishReason: "error"` in `onTurnComplete`, where it could be `undefined` or the previous step's reason. ([`53f17ee0b`](https://github.com/triggerdotdev/trigger.dev/commit/53f17ee0b9d7ca3be81b482f73f7fe15ba2f1f8a))
+- Fix a `chat.agent` tool result containing a `BigInt` failing the next turn's model call in apps that define `BigInt.prototype.toJSON`. It is now sent as the JSON that `toJSON` gives, in the next step and in later turns. ([`8167e49f3`](https://github.com/triggerdotdev/trigger.dev/commit/8167e49f3f7274757d8b3adf55b32f2390c4ada4))
+- Fix `chat.agent` failing the next step or turn with `AI_InvalidPromptError` ("The messages do not match the ModelMessage[] schema") when a tool returned a value that isn't plain JSON, such as a `Date` from an ORM row. On AI SDK 6, and AI SDK 7 before 7.0.101, tool results are now converted to JSON the way newer AI SDK versions do it, so a `Date` reaches the model as its ISO string. A value JSON can't hold, such as a `BigInt` or a circular reference, is replaced by an error result that names the tool and the field, and the same error is logged on the run. ([`49b3dc055`](https://github.com/triggerdotdev/trigger.dev/commit/49b3dc055da8ef8ee62cf860e9b4c57d1e751b7e))
+- Sessions and `chat.agent` now accept the object form of `concurrencyKey` in `triggerConfig`, giving each concurrency limit its own key, the same as `task.trigger()`. ([`767ab4521`](https://github.com/triggerdotdev/trigger.dev/commit/767ab452135fc9c0107f84ba56d0add7a8b65567))
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.7`
+
+## 4.8.6
+
+### Patch Changes
+
+- Fix `chat.agent` on AI SDK 7 sending the model the same input on every step. Once a step's `prepareStep` returned messages (a steering message, a mid-turn `chat.inject`, context compaction, or your own `prepareStep`), later steps no longer included the newest tool results, so the model kept repeating the same tool call until the step limit. ([`1a2c99034`](https://github.com/triggerdotdev/trigger.dev/commit/1a2c99034ee8741fabb2b500e2766f0ecd8fbdb1))
+
+  If you call `chat.compact()` from your own `prepareStep`, pass it the `responseMessages` your `prepareStep` receives (`chat.compact(messages, steps, { ...options, responseMessages })`) so steps after a compaction are rebuilt correctly on AI SDK 7.
+
+- `chat.agent` now passes `chatId`, `turn` and `clientData` to the callbacks an agent can call a model from, so a mock model injected through `clientData` reaches them. The compaction `summarize` that runs through `chat.MessageAccumulator.prepareStep()` and a `chat.createSession` turn's `prepareStep()`, `onCompacted`, `onValidateMessages`, and the `pendingMessages` `onReceived` and `onInjected` callbacks previously lacked it. The `mockChatAgent` turn methods (`sendMessage`, `sendRegenerate`, `sendAction`) now also wait for `onTurnComplete` and the transcript save to finish, so tests can assert on what those hooks recorded without a sleep. ([`579904220`](https://github.com/triggerdotdev/trigger.dev/commit/579904220ce83f8016179d09f68b6b3423eaba9c))
+- `concurrencyKey` now also takes an object, so one run can be limited by two limits keyed by different things, like a cap per session and a cap per organization. `default` is the run's own key and every other entry gives a named limit its own key: `concurrencyKey: { default: sessionId, [orgLimit.name]: orgId }`. A string key works as before. ([`4961fc474`](https://github.com/triggerdotdev/trigger.dev/commit/4961fc474c2fe155e557573f48c5eb95868d3015))
+- `webhooks.notion()` endpoints accept Notion's verification request. While the endpoint has no signing secret, the `verification_token` Notion sends is stored as its signing secret, so you can paste it back into Notion and later deliveries verify with it. Redeploy with this version for existing Notion endpoints to pick it up. ([`4288ea912`](https://github.com/triggerdotdev/trigger.dev/commit/4288ea9126432bfede2c6162e1bdc81a2348a127))
+- Support scoped run tokens without an environment key, including offloaded task inputs and stream waits. Explain why a run has no usable credential for an operation. ([`ed0147895`](https://github.com/triggerdotdev/trigger.dev/commit/ed0147895c9b65069c3a6d6e404c3074d47c4018))
+- Public-token helpers and chat token creation now prefer server minting for root API keys too, avoiding the legacy claims endpoint on compatible servers. Trigger, batch, and waitpoint responses missing a token also try server minting first. ([`90d677b12`](https://github.com/triggerdotdev/trigger.dev/commit/90d677b12a5a37d00a96da922d60a54fc7dd7709))
+
+  Root-key callers retain local-signing compatibility only when the mint endpoint is missing or an older server specifically rejects an empty scope list. Named API keys and run tokens never self-sign. Authorization failures, expiration validation errors, rate limits, and server or connection failures do not activate the fallback.
+
+  Server minting with a root key signs with that same authenticated key, including during its rotation grace period, rather than with its replacement. Tokens stop authenticating when that key's grace period ends or it is immediately revoked. Deploy this server update before upgrading the SDK if you rely on minting during root-key rotation; older servers can still reject grace-window keys.
+
+  Server-minted tokens use the API rate-limit budget and follow the server's expiration rules, including its 30-day maximum. Minting tokens without scopes requires self-hosted v4.8.4 or later unless the root-key compatibility fallback is available. The default expiration remains 15 minutes.
+
+- Fix webhook verification for `webhooks.brex()`, which now reads the `webhook-id`, `webhook-timestamp` and `webhook-signature` headers Brex sends instead of `svix-*` headers, and for `webhooks.composio()`, which now keys the signature with the secret's raw text as Composio does instead of base64-decoding it. PagerDuty, Sentry, Vercel, Zendesk, Attio, DocuSign and Intercom endpoints now default to pasting the provider-issued signing secret, and Linear and Calendly offer both generating and pasting one. Redeploy with this version for existing endpoints to pick up the change. ([`b5b311407`](https://github.com/triggerdotdev/trigger.dev/commit/b5b311407aa185457f42361d85eef0cd15f20f4a))
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.6`
+
+## 4.8.5
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.5`
+
+## 4.8.4
+
+### Patch Changes
+
+- `chat.agent` now accepts only two kinds of message from a chat client: user messages, and answers to tool calls the agent made. A tool approval or tool output is merged onto the stored call it answers and runs with the input from the agent's own history, so a client can't add tool calls or change a call's input. `chat.headStart` drops tool calls from the history the client sends, and `upsertIncomingMessage` only adds user messages. ([`44feaaff6`](https://github.com/triggerdotdev/trigger.dev/commit/44feaaff6ea10019af1a24b009609ff25c813c15))
+- Add `infisicalAccessToken` at `@trigger.dev/sdk/oidc/infisical` to authenticate tasks with Infisical using OIDC instead of stored credentials. Supports US, EU, and self-hosted instances, custom audiences, and Infisical organization scoping. ([`63b58f329`](https://github.com/triggerdotdev/trigger.dev/commit/63b58f329012475941cef93b3440cca09514fee0))
+- Add opt-in AWS session tags with `awsCredentialProvider({ sessionTags: true })` for task-level IAM restrictions and attribute-based permissions. Tags come from the verified run identity. Update the role trust policy to allow `sts:TagSession` before enabling them; existing integrations remain untagged. ([`c8ae1ffb5`](https://github.com/triggerdotdev/trigger.dev/commit/c8ae1ffb588895a0ffb8c0dbdcaa1d6e19671edc))
+- Use run credentials for run results, rescheduling, schedules, and environment-variable operations inside tasks. Run credentials remain limited to the current environment: shared schedules cannot be changed, and parent environment variables cannot be written. ([`cd58c750b`](https://github.com/triggerdotdev/trigger.dev/commit/cd58c750b878d39e16acde163b751de2e7491ac0))
+- Create public tokens without scopes from inside tasks using run credentials, without requiring an environment secret key. ([`306d960ca`](https://github.com/triggerdotdev/trigger.dev/commit/306d960caadf4cbe123a205cb4934d071611b360))
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.4`
+
+## 4.8.3
+
+### Patch Changes
+
+- Fix reloading a chat mid-turn after its access token was refreshed. A token refresh during a streaming turn persisted a resume cursor from the middle of the turn, so a reload resumed past chunks the page needed and failed to rebuild the assistant message ("No tool invocation found for tool call ID"). The persisted cursor now stays at the start of the turn until it completes, so a reload replays the whole turn. ([`9fd1de656`](https://github.com/triggerdotdev/trigger.dev/commit/9fd1de656eb9f96968f43525966a4cc8f5f71348))
+- Add private-beta OIDC authentication for deployed Cloud tasks, with an AWS credential provider and environment-specific setup instructions. Install `@aws-sdk/client-sts` to use `@trigger.dev/sdk/oidc/aws`, upgrade your deployment CLI, and redeploy. Contact us to enable access for your organization. ([`65352bc90`](https://github.com/triggerdotdev/trigger.dev/commit/65352bc90aff3788f466569997f2f6a24229ff5a))
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.3`
+
+## 4.8.2
+
+### Patch Changes
+
+- Fix `chat.inject` messages added from a tool mid-turn being saved before the assistant's response. They now stay after the tool result, where the model saw them, so the next turn keeps the same prompt prefix. If you roll `@trigger.dev/sdk` back to an earlier version, chats saved by this version lose these mid-turn `chat.inject` messages from the model's context, though the chat history shown in the UI keeps them. ([`fc33769a5`](https://github.com/triggerdotdev/trigger.dev/commit/fc33769a559a69cae687354413b2316bf9fd0bf3))
+- The bundled `trigger-cost-savings` skill now notes that a webhook delivery starts no run when no subscriber's filter matches, so it costs no compute. ([#5051](https://github.com/triggerdotdev/trigger.dev/pull/5051))
+- Stream a sub-agent's reply through a parent tool call with `chat.forwardSubAgent`. Each chunk is written to the parent chat once and the tool resolves with the sub-agent's final message, so streaming a sub-agent costs bytes in proportion to its reply. Yielding `stream.messages()` snapshots resends the whole message on every chunk, which grows with the square of the reply. ([`bdc994c4d`](https://github.com/triggerdotdev/trigger.dev/commit/bdc994c4d3f80d047b4d0a830cca81330912f8c2))
+
+  ```ts
+  execute: async ({ topic }, { toolCallId, abortSignal }) => {
+    const stream = await researcher.sendMessage(topic, { abortSignal });
+    return await chat.forwardSubAgent(stream, { toolCallId });
+  },
+  ```
+
+  Render it while it runs with `useSubAgentMessages()` from `@trigger.dev/sdk/chat/react` (or `createSubAgentMessages()` outside React).
+
+- Fix a `chat.agent` turn failing after a head start that ended with two or more parallel tool calls. When those tools finished out of call order, the agent sent their results to the model twice on the next step, and the provider rejected the request (Anthropic: "each tool_use must have a single result"). Each handed-over tool result is now sent once. ([`d06ee5825`](https://github.com/triggerdotdev/trigger.dev/commit/d06ee5825baf1d92202604f4ebc1107a01a1aad6))
+- Use short-lived run tokens for supported SDK operations inside deployed tasks when available, retaining environment-key compatibility for unsupported operations and missing or expired tokens. Explicit credentials still take precedence. Public-token helpers use server-side minting with run tokens rather than signing locally. ([`5a1c14239`](https://github.com/triggerdotdev/trigger.dev/commit/5a1c14239bcedf85570c8392835bda07482e222e))
+
+  Project and organization queries, and branch overrides targeting another PREVIEW or DEVELOPMENT environment, keep using compatibility credentials. Branch headers do not change credential selection in STAGING or PRODUCTION. Chat subscriptions reread implicit credentials for each connection.
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.2`
+
+## 4.8.1
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.1`
+
+## 4.8.0
+
+### Minor Changes
+
+- Route verified webhooks into agent sessions with `chat.event({ endpoint, key })`, and connect external chat surfaces with `chat.channels.custom({ endpoint })`. Both subscribe to a shared webhook endpoint, so an agent and your other webhook tasks can use the same provider URL. Channels support reply delivery, session binding, conversation seeding, and lifecycle reactions, and a failed turn posts a short line instead of the error (`errorMessage` sets it, as a string or a function of the failure). Use `chat.createWatchToken()` to watch a session from another surface. ([`d6955ee9f`](https://github.com/triggerdotdev/trigger.dev/commit/d6955ee9f31b0b1a3af55bb8fbbc77ba68bcb3f7))
+
+  A connector can also stream replies natively (`stream()`), mirror the session's state into the surface (`lifecycle()`), show tool calls as they run (`progress()`), stop a running turn from the surface (`onControl()`), post approvals and tool controls and resume the run from a verified click, download files only the surface can read (`download()`), and acknowledge or fold in messages that arrive mid-turn (`received()`, `pendingMessages`).
+
+- Add hosted webhooks: declare an endpoint once with `webhooks.endpoint.define({ id, source })` and Trigger.dev hosts its URL, verifies every request, and routes each event to the endpoint's subscribers. Subscribe tasks with `webhook({ endpoint, filter, onEvent })`, each with its own type-safe filter, and pause a run until a matching webhook arrives with `webhooks.waiter.create()` and `webhooks.waiter.wait()`. ([`d6955ee9f`](https://github.com/triggerdotdev/trigger.dev/commit/d6955ee9f31b0b1a3af55bb8fbbc77ba68bcb3f7))
+
+  ```ts
+  export const stripe = webhooks.endpoint.define({
+    id: "stripe",
+    source: webhooks.stripe(),
+  });
+
+  export const fulfill = webhook({
+    id: "fulfill",
+    endpoint: stripe,
+    filter: "event.type == 'checkout.session.completed'",
+    onEvent: async ({ event }) => {},
+  });
+
+  const waiter = await webhooks.waiter.create(stripe, {
+    match: { "event.data.object.metadata.orderId": order.id },
+  });
+  const { event } = await webhooks.waiter.wait(waiter).unwrap();
+  ```
+
+  Sources cover presets (`webhooks.stripe()`, `webhooks.github()`, `webhooks.svix()`, `webhooks.discord()`, and others), named providers (`webhooks.clerk()`, `webhooks.shopify()`, and more) and `webhooks.custom<T>(config)`, and most carry a setup prompt an AI coding agent can follow to register the endpoint. Retries are deduplicated on the provider's own event or delivery id where it sends one. Filters, keys and waiter `match` paths share the `event.`, `header.` and `webhook.` namespaces, and filters accept `== null` / `!= null` presence checks and `event any (...)` over a payload that is an array of events. `webhook()` takes `task()` options such as `queue`, `machine` and `retry`. The HTTP API lists endpoints and deliveries, replays deliveries, and creates and cancels waiters, and both it and the MCP server can read an endpoint's setup prompt and generate or store its signing secret.
+
+- Add `@trigger.dev/slack`: turn a `chat.agent` into a native Slack agent. Each DM or channel thread is a durable session, the reply streams into the thread with the turn's tool calls shown as a plan, approvals are Approve and Deny buttons, and Slack's stop button stops the turn. ([`6e715da77`](https://github.com/triggerdotdev/trigger.dev/commit/6e715da7709c48eedd134d52645d825b3569e0ff))
+
+  ```ts
+  import { appMentions, slack, webhookSource } from "@trigger.dev/slack";
+
+  const slackEvents = webhooks.endpoint.define({
+    id: "slack",
+    source: webhookSource(),
+  });
+
+  export const support = chat.agent({
+    id: "support",
+    channels: [
+      slack({
+        id: "slack",
+        endpoint: slackEvents,
+        token: process.env.SLACK_BOT_TOKEN!,
+        startOn: appMentions(),
+      }),
+    ],
+    run: async ({ messages, signal, streamText }) =>
+      streamText({ model, messages, abortSignal: signal }),
+  });
+  ```
+
+  `startOn` decides which channel messages start a session (`appMentions()` answers when the agent is @mentioned). Images and PDFs people share reach the model, messages sent while the agent is answering can be folded into the reply, tools can post their own buttons, and `ownWorkspaceOnly` ignores Slack Connect guests.
+
+- Add `@trigger.dev/linear`: turn a `chat.agent` into a Linear agent. Assign it an issue or @mention it, and Linear's agent session becomes a durable Trigger.dev session: the reply posts back to Linear, tool calls show as activities, `linearPlanTool()` keeps the plan Linear shows as a checklist, and approvals are Approve and Deny options that resume the run. ([`1586c4a3f`](https://github.com/triggerdotdev/trigger.dev/commit/1586c4a3f7638837a0615453f6e5b5d9b92491a4))
+
+  ```ts
+  import { linear, webhookSource } from "@trigger.dev/linear";
+
+  const linearEvents = webhooks.endpoint.define({
+    id: "linear",
+    source: webhookSource(),
+  });
+
+  export const triage = chat.agent({
+    id: "triage",
+    channels: [
+      linear({
+        id: "linear",
+        endpoint: linearEvents,
+        token: process.env.LINEAR_ACCESS_TOKEN!,
+      }),
+    ],
+    run: async ({ messages, signal, streamText }) =>
+      streamText({ model, messages, abortSignal: signal }),
+  });
+  ```
+
+  The first turn gets the issue's context and earlier comments, images and PDFs in the issue reach the model, a Stop in Linear winds the turn down, and `errorMessage` sets the text a failed turn shows.
+
+### Patch Changes
+
+- The `streamText` passed to a `chat.agent`'s `run()` now turns AI SDK telemetry on by default, so each model step and tool call shows up as a span in the run trace even when the agent doesn't store a prompt with `chat.prompt.set()`. An agent with `telemetry: { recordUserMessage: false }` gets these spans without prompt and response content, including when it stores a prompt (whose variables are left out of the span metadata). Pass `experimental_telemetry: { isEnabled: false }` at the call site to turn them off, or `recordInputs: false` / `recordOutputs: false` to keep them without content. ([`bd7cc3525`](https://github.com/triggerdotdev/trigger.dev/commit/bd7cc35252d25223859a3e8f696de05cc6527bc7))
+- Add `webhooks.hookdeck()`, a source for deliveries relayed through a Hookdeck connection. It verifies the `x-hookdeck-signature` header with the project's signing secret, keeps verifying while the secret is being rolled (Hookdeck sends the previous secret's signature in `x-hookdeck-signature-2`), and deduplicates retries on `x-hookdeck-eventid`. The event is the original provider's payload, so pass its type: `webhooks.hookdeck<Stripe.Event>()`. If the Hookdeck project's header prefix was changed, pass it as `webhooks.hookdeck({ headerPrefix })` so retries keep deduplicating. ([`51b39fbc6`](https://github.com/triggerdotdev/trigger.dev/commit/51b39fbc6ff0eeeda78fd292d974e7aaa747a086))
+- Updated dependencies:
+  - `@trigger.dev/core@4.8.0`
+
+## 4.7.6
+
+### Patch Changes
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.7.6`
+
+## 4.7.5
+
+### Patch Changes
+
+- Manage custom metric dashboards from code. `query.dashboards` lists, creates, updates and deletes custom dashboards and their widgets, and every widget query is checked when it is saved. The MCP server adds `create_dashboard` and `set_dashboard_widgets`, so your AI assistant can build a dashboard for you. ([`252624c92`](https://github.com/triggerdotdev/trigger.dev/commit/252624c92077a8326e9b68f7b6713beca173d8b1))
+
+  ```ts
+  import { query } from "@trigger.dev/sdk";
+
+  await query.dashboards.create({
+    title: "Email tasks",
+    widgets: [
+      {
+        title: "Total runs",
+        query: "SELECT count() AS total FROM runs",
+        display: { type: "bignumber", column: "total", aggregation: "sum" },
+      },
+    ],
+  });
+  ```
+
+- Redact span content before it leaves the worker. `telemetry.spanProcessors` in `trigger.config.ts` runs your own span processors ahead of every export, to Trigger.dev and to your own exporters, so you can redact or drop span content before it reaches the run trace. `chat.agent` also takes a `telemetry` option to stop recording the user's message and `clientData` on its spans. ([`32b36b143`](https://github.com/triggerdotdev/trigger.dev/commit/32b36b1433dddb4f9d2cbd4c0320b146c7d6c858))
+
+  ```ts
+  export default defineConfig({
+    telemetry: { spanProcessors: [new MyRedactingSpanProcessor()] },
+  });
+
+  chat.agent({
+    id: "my-chat",
+    telemetry: { recordUserMessage: false, recordClientData: false },
+    run: async ({ messages, signal, streamText }) =>
+      streamText({ model, messages, abortSignal: signal }),
+  });
+  ```
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.7.5`
+
+## 4.7.4
+
+### Patch Changes
+
+- Override a concurrency limit's `perKey` for a single `concurrencyKey`: `concurrencyLimits.override(name, { concurrencyKey, perKey, ttl })` caps that one key under that one limit for a while (7 days by default, 30 at most), `reset(name, { concurrencyKey })` clears it, and `retrieve(name, { concurrencyKey })` shows the key's bound and when the override expires. ([`c49fd05f4`](https://github.com/triggerdotdev/trigger.dev/commit/c49fd05f44119ec2a036afaabaad8f9e148a3db6))
+- `runs.replay()` now takes options, so you can replay a run with a different payload, metadata, tags, queue, machine, version, delay and other trigger options. Anything you leave out comes from the original run, as before, and the payload is serialized like `trigger()`, so values like `Date` and `BigInt` keep their types. ([`ff2aa236e`](https://github.com/triggerdotdev/trigger.dev/commit/ff2aa236eb986b938e8e04cec3898b24aed4ec3f))
+
+  ```ts
+  import { runs } from "@trigger.dev/sdk";
+
+  await runs.replay("run_1234", {
+    payload: { userId: "user_456" },
+    tags: ["replayed"],
+    delay: "10m",
+  });
+  ```
+
+- Updated dependencies:
+  - `@trigger.dev/core@4.7.4`
+
 ## 4.7.3
 
 ### Patch Changes

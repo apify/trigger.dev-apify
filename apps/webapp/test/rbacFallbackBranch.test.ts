@@ -1,9 +1,10 @@
 import { postgresTest } from "@internal/testcontainers";
-import plugin, { signUserActorToken } from "@trigger.dev/rbac";
+import plugin, { createPublicTokenSubjectCodec, signUserActorToken } from "@trigger.dev/rbac";
 import { createHash } from "node:crypto";
 import { generateJWT } from "@trigger.dev/core/v3/jwt";
 import { type PrismaClient } from "@trigger.dev/database";
 import { describe, expect, it, vi } from "vitest";
+import { bearerPublicJwtActor, signPublicJwtActor } from "~/services/publicJwtActor.server";
 import { generateAdditionalApiKey } from "~/utils/apiKeys";
 import { createTestOrgProjectWithMember, uniqueId } from "./fixtures/environmentVariablesFixtures";
 
@@ -373,6 +374,61 @@ describe("RBAC fallback — additional keys", () => {
   });
 });
 
+describe("RBAC fallback — sealed public token subjects", () => {
+  const codec = createPublicTokenSubjectCodec("0123456789abcdef0123456789abcdef");
+
+  function makeSealingController(prisma: PrismaClient) {
+    return plugin.create(
+      { primary: prisma, replica: prisma },
+      { forceFallback: true, publicTokenSubjects: codec }
+    );
+  }
+
+  // Catches: the resolver looking up the environment by the sealed claim, so every new token 401s.
+  postgresTest("authenticates a token whose subject is sealed", async ({ prisma }) => {
+    const { organization, project, orgMember } = await createTestOrgProjectWithMember(prisma);
+    const environment = await createEnv(prisma, project.id, organization.id, {
+      type: "PRODUCTION",
+      orgMemberId: orgMember.id,
+    });
+    const sub = codec.encode(environment.id);
+    expect(sub).not.toContain(environment.id);
+
+    const token = await generateJWT({
+      secretKey: environment.apiKey,
+      payload: { pub: true, sub, scopes: ["read:runs"] },
+      expirationTime: "1h",
+    });
+
+    const result = await makeSealingController(prisma).authenticateBearer(bearerRequest(token), {
+      allowJWT: true,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.environment.id).toBe(environment.id);
+  });
+
+  // Catches: accepting a subject this server didn't seal.
+  postgresTest("rejects a subject sealed under another key", async ({ prisma }) => {
+    const { organization, project, orgMember } = await createTestOrgProjectWithMember(prisma);
+    const environment = await createEnv(prisma, project.id, organization.id, {
+      type: "PRODUCTION",
+      orgMemberId: orgMember.id,
+    });
+    const otherCodec = createPublicTokenSubjectCodec("fedcba9876543210fedcba9876543210");
+    const token = await generateJWT({
+      secretKey: environment.apiKey,
+      payload: { pub: true, sub: otherCodec.encode(environment.id), scopes: ["read:runs"] },
+      expirationTime: "1h",
+    });
+
+    const result = await makeSealingController(prisma).authenticateBearer(bearerRequest(token), {
+      allowJWT: true,
+    });
+    expect(result.ok).toBe(false);
+  });
+});
+
 describe("RBAC fallback — public JWTs", () => {
   postgresTest(
     "keeps tokens signed with a rotated root key valid for the grace window",
@@ -478,6 +534,57 @@ describe("RBAC fallback — public JWTs", () => {
     if (!result.ok) return;
     expect(result.jwt?.act).toEqual({ sub: user.id });
   });
+
+  // Catches: a signed claim (client, scopes, expiry) not reaching the host, so it can't verify the token it minted.
+  postgresTest(
+    "passes a public JWT actor's signature and signed claims to the host",
+    async ({ prisma }) => {
+      const { organization, project, orgMember, user } =
+        await createTestOrgProjectWithMember(prisma);
+      const rbac = makeController(prisma);
+      const environment = await createEnv(prisma, project.id, organization.id, {
+        type: "PRODUCTION",
+        orgMemberId: orgMember.id,
+      });
+      const secret = "test-public-token-secret";
+      const expiresAt = Math.floor(Date.now() / 1000) + 60 * 60;
+      const act = { sub: user.id, client: "cli" };
+      const sig = signPublicJwtActor(secret, act, {
+        environmentId: environment.id,
+        expiresAt,
+        scopes: ["read:runs"],
+      });
+      const mint = (scopes: string[]) =>
+        generateJWT({
+          secretKey: environment.apiKey,
+          payload: { pub: true, sub: environment.id, scopes, act: { ...act, sig } },
+          expirationTime: expiresAt,
+        });
+
+      const result = await rbac.authenticateBearer(bearerRequest(await mint(["read:runs"])), {
+        allowJWT: true,
+      });
+      // The same signature on a token the root key's holder gave wider scopes.
+      const widened = await rbac.authenticateBearer(
+        bearerRequest(await mint(["read:runs", "write:all"])),
+        { allowJWT: true }
+      );
+
+      expect(result.ok && widened.ok).toBe(true);
+      if (!result.ok || !widened.ok) return;
+      expect(result.jwt?.act).toEqual({ ...act, sig });
+      expect(result.jwt?.expiresAt).toBe(expiresAt);
+      expect(result.jwt?.scopes).toEqual(["read:runs"]);
+      expect(bearerPublicJwtActor(secret, result.environment.id, result.jwt)).toEqual({
+        ...act,
+        verified: true,
+      });
+      expect(bearerPublicJwtActor(secret, widened.environment.id, widened.jwt)).toMatchObject({
+        sub: user.id,
+        verified: false,
+      });
+    }
+  );
 
   postgresTest("rejects public JWTs for soft-deleted projects", async ({ prisma }) => {
     const { organization, project, orgMember } = await createTestOrgProjectWithMember(prisma);

@@ -27,7 +27,7 @@ await preview.runs.list({ status: ["COMPLETED"] });
 | Field           | Description                                                                                              | Env-var fallback                                  |
 | --------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
 | `accessToken`   | Environment API key (`tr_dev_sk_*`, `tr_prod_sk_*`, `tr_preview_sk_*`) or personal access token (`tr_pat_*`). | `TRIGGER_SECRET_KEY`, then `TRIGGER_ACCESS_TOKEN` |
-| `previewBranch` | Preview branch name when using a `tr_preview_sk_*` key.                                                     | `TRIGGER_PREVIEW_BRANCH`, then `VERCEL_GIT_COMMIT_REF` |
+| `previewBranch` | Preview branch name when using a `tr_preview_sk_*` key, or dev branch name for a dev environment.            | `TRIGGER_PREVIEW_BRANCH`, then `VERCEL_GIT_COMMIT_REF`, then `TRIGGER_DEV_BRANCH` |
 | `baseURL`       | Override the Trigger.dev API URL. Defaults to `https://api.trigger.dev`.                                  | `TRIGGER_API_URL`                                 |
 | `requestOptions`| Request-level options (retry policy, additional headers, etc.) — see the `ApiRequestOptions` type.        | —                                                 |
 
@@ -71,7 +71,7 @@ That isolation also means a call from inside a task does not automatically inher
 
 ```ts
 const sameProject = new TriggerClient({
-  accessToken: process.env.TRIGGER_SECRET_KEY,
+  accessToken: process.env.TRIGGER_PROJECT_API_KEY, // a named API key you add to the task's environment variables
   inheritContext: true,
 });
 ```

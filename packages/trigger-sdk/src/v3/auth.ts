@@ -3,26 +3,25 @@ import {
   type ApiClient,
   type ApiClientConfiguration,
   type CreatePublicTokenRequestBody,
+  type GetOIDCTokenOptions,
   apiClientManager,
-  generateJWT as internal_generateJWT,
-  isAdditionalApiKey,
 } from "@trigger.dev/core/v3";
 import "@trigger.dev/core/v3/sdk-scope-storage";
 
 /**
- * Register the global API client configuration. Alternatively, you can set the `TRIGGER_SECRET_KEY` and `TRIGGER_API_URL` environment variables.
+ * Register the global API client configuration with an explicit `accessToken`.
  * @param options The API client configuration.
  * @param options.baseURL The base URL of the Trigger API. (default: `https://api.trigger.dev`)
- * @param options.accessToken The accessToken to authenticate with the Trigger API. (default: `process.env.TRIGGER_SECRET_KEY`) This can be found in your Trigger.dev project "API Keys" settings.
+ * @param options.accessToken A named environment API key or personal access token to authenticate with the Trigger API. Create environment keys in your project's "API Keys" settings.
  *
  * @example
  *
  * ```typescript
- * import { configure } from "@trigger.dev/sdk/v3";
+ * import { configure } from "@trigger.dev/sdk";
  *
  * configure({
  *  baseURL: "https://api.trigger.dev",
- *  accessToken: "tr_dev_1234567890"
+ *  accessToken: process.env.TRIGGER_API_KEY
  * });
  * ```
  */
@@ -33,6 +32,7 @@ export function configure(options: ApiClientConfiguration) {
 export const auth = {
   configure,
   createPublicToken,
+  getOIDCToken,
   createTriggerPublicToken,
   createBatchTriggerPublicToken,
   withAuth,
@@ -40,6 +40,16 @@ export const auth = {
   withTriggerPublicToken,
   withBatchTriggerPublicToken,
 };
+
+/**
+ * Mint a short-lived OIDC token for an external service from a deployed task run.
+ * Uses the current run identity, ignoring credentials from configure() or withAuth().
+ */
+async function getOIDCToken(
+  options: GetOIDCTokenOptions
+): Promise<{ token: string; expiresAt: Date }> {
+  return apiClientManager.getOIDCToken(options);
+}
 
 type PublicTokenPermissionProperties = {
   /**
@@ -112,8 +122,7 @@ type PublicTokenPermissions = {
 type CreatePublicTokenOptions = {
   /**
    * A collection of permission scopes to be granted to the token. This remains
-   * optional for root API key compatibility; additional API keys require at
-   * least one scope.
+   * optional. Tokens without scopes grant no permissions.
    *
    * @example
    *
@@ -158,9 +167,7 @@ type CreatePublicTokenOptions = {
   };
 };
 
-// A `Date` becomes Unix seconds; duration strings and numbers pass through. A
-// bare number is already Unix seconds, matching how the local signing path
-// reads it, so both key types treat the option the same.
+// Numbers are already Unix seconds; only Dates need conversion.
 function serverExpirationTime(
   expirationTime: number | Date | string | undefined
 ): number | string | undefined {
@@ -173,18 +180,8 @@ async function createServerPublicToken(
   apiClient: ApiClient,
   body: CreatePublicTokenRequestBody
 ): Promise<string> {
-  try {
-    const result = await apiClient.createPublicToken(body);
-    return result.token;
-  } catch (error) {
-    if (error !== null && typeof error === "object" && "status" in error && error.status === 404) {
-      throw new Error(
-        "This additional API key cannot self-sign public tokens, and the server does not support public-token minting. Upgrade the server or use the root API key."
-      );
-    }
-
-    throw error;
-  }
+  const result = await apiClient.createPublicToken(body);
+  return result.token;
 }
 
 /**
@@ -214,34 +211,10 @@ async function createPublicToken(options?: CreatePublicTokenOptions): Promise<st
   const scopes = options?.scopes ? flattenScopes(options.scopes) : [];
   const apiClient = apiClientManager.clientOrThrow();
 
-  if (isAdditionalApiKey(apiClient.accessToken)) {
-    // Additional keys cannot self-sign, and the server rejects empty scope
-    // lists because they cannot authorize anything. Keep the legacy root-key
-    // behaviour unchanged while failing clearly for this new credential type.
-    if (scopes.length === 0) {
-      throw new Error(
-        "auth.createPublicToken() requires at least one scope when using an additional API key. " +
-          'For example: auth.createPublicToken({ scopes: { read: { runs: ["run_1234"] } } })'
-      );
-    }
-
-    return createServerPublicToken(apiClient, {
-      scopes,
-      expirationTime: serverExpirationTime(options?.expirationTime),
-      realtime: options?.realtime,
-    });
-  }
-
-  const claims = await apiClient.generateJWTClaims();
-
-  return await internal_generateJWT({
-    secretKey: apiClient.accessToken,
-    payload: {
-      ...claims,
-      scopes: options?.scopes ? scopes : undefined,
-      realtime: options?.realtime,
-    },
-    expirationTime: options?.expirationTime,
+  return createServerPublicToken(apiClient, {
+    scopes,
+    expirationTime: serverExpirationTime(options?.expirationTime),
+    realtime: options?.realtime,
   });
 }
 
@@ -339,26 +312,11 @@ async function createTriggerPublicToken(
   });
   const oneTimeUse = typeof options?.multipleUse === "boolean" ? !options.multipleUse : true;
 
-  if (isAdditionalApiKey(apiClient.accessToken)) {
-    return createServerPublicToken(apiClient, {
-      scopes,
-      expirationTime: serverExpirationTime(options?.expirationTime),
-      oneTimeUse,
-      realtime: options?.realtime,
-    });
-  }
-
-  const claims = await apiClient.generateJWTClaims();
-
-  return await internal_generateJWT({
-    secretKey: apiClient.accessToken,
-    payload: {
-      ...claims,
-      otu: oneTimeUse,
-      realtime: options?.realtime,
-      scopes,
-    },
-    expirationTime: options?.expirationTime,
+  return createServerPublicToken(apiClient, {
+    scopes,
+    expirationTime: serverExpirationTime(options?.expirationTime),
+    oneTimeUse,
+    realtime: options?.realtime,
   });
 }
 
@@ -422,26 +380,11 @@ async function createBatchTriggerPublicToken(
   });
   const oneTimeUse = typeof options?.multipleUse === "boolean" ? !options.multipleUse : true;
 
-  if (isAdditionalApiKey(apiClient.accessToken)) {
-    return createServerPublicToken(apiClient, {
-      scopes,
-      expirationTime: serverExpirationTime(options?.expirationTime),
-      oneTimeUse,
-      realtime: options?.realtime,
-    });
-  }
-
-  const claims = await apiClient.generateJWTClaims();
-
-  return await internal_generateJWT({
-    secretKey: apiClient.accessToken,
-    payload: {
-      ...claims,
-      otu: oneTimeUse,
-      realtime: options?.realtime,
-      scopes,
-    },
-    expirationTime: options?.expirationTime,
+  return createServerPublicToken(apiClient, {
+    scopes,
+    expirationTime: serverExpirationTime(options?.expirationTime),
+    oneTimeUse,
+    realtime: options?.realtime,
   });
 }
 

@@ -244,6 +244,21 @@ describe("TraceChunkAssembler.tailBase", () => {
     expect(a.tailBase()).toBe(9000);
   });
 
+  it("has no base with no rows and nothing pinned", () => {
+    expect(new TraceChunkAssembler().tailBase()).toBeNull();
+  });
+
+  it("tails an empty first chunk from its pinned read time, then from each tail's", () => {
+    const a = new TraceChunkAssembler();
+    a.pinTailFloor(4000);
+    expect(a.tailBase()).toBe(4000);
+    a.completeTailRead(4000, 7000); // the tail found nothing yet
+    expect(a.tailBase()).toBe(7000);
+    a.mergeChunk([ev("r", "", 0, { insertedAt: "8000" })], { source: "tail" });
+    a.completeTailRead(7000, 9000);
+    expect(a.tailBase()).toBe(9000);
+  });
+
   it("uses the pinned floor until a tail from it completes", () => {
     const a = new TraceChunkAssembler();
     a.mergeChunk([ev("r", "", 0, { insertedAt: "9000" })]);
@@ -589,5 +604,57 @@ describe("TraceChunkAssembler merge order", () => {
       }),
     ]);
     expect(a.spans.find((n) => n.id === "c")?.data.style.icon).toBe("cache");
+  });
+});
+
+describe("TraceChunkAssembler live spans", () => {
+  // Catches: a stored span re-read by a tail's overlap, or a stored read of any kind, counting as
+  // live (the session Trace tab's "new spans" pill counts only live spans).
+  it("marks only spans first seen in a tail read as live", () => {
+    const assembler = new TraceChunkAssembler();
+    assembler.mergeChunk([ev("root", "", 0), ev("stored", "root", 1)]);
+    assembler.mergeChunk([ev("errors", "root", 2)], { source: "errors" });
+    assembler.mergeChunk([ev("deeplink", "root", 3)], { source: "deeplink" });
+    assembler.mergeChunk([ev("revalidate", "root", 4)], { source: "revalidate" });
+    assembler.mergeChunk([ev("stored", "root", 1), ev("live", "root", 5)], { source: "tail" });
+    assembler.mergeChunk([ev("later", "root", 6)]);
+    expect([...assembler.liveSpanIds]).toEqual(["live"]);
+  });
+});
+
+describe("TraceChunkAssembler message changes", () => {
+  // Catches: search not refiltering a shown span whose message changed in place (same tree shape).
+  it("counts new messages on spans it already holds, not new spans or repeats", () => {
+    const assembler = new TraceChunkAssembler();
+    assembler.mergeChunk([ev("root", "", 0), ev("a", "root", 1, { status: "PARTIAL" })]);
+    expect(assembler.messageChanges).toBe(0);
+
+    assembler.mergeChunk([ev("a", "root", 1, { message: "a done" })], { source: "tail" });
+    assembler.mergeChunk([ev("a", "root", 1, { message: "a done" })], { source: "tail" });
+
+    expect(assembler.messageChanges).toBe(1);
+  });
+
+  // Catches: a span shown under an event row's message, then given its real name by its SPAN
+  // row, never being re-checked by search.
+  it("counts a span's first SPAN row replacing an event row's message", () => {
+    const assembler = new TraceChunkAssembler();
+    assembler.mergeChunk([
+      ev("root", "", 0),
+      ev("a", "root", 1, { kind: "SPAN_EVENT", message: "exception" }),
+    ]);
+    expect(assembler.messageChanges).toBe(0);
+
+    assembler.mergeChunk([ev("a", "root", 1, { message: "real name" })], { source: "tail" });
+
+    expect(assembler.messageChanges).toBe(1);
+  });
+
+  it("ignores an older partial row arriving after the final one", () => {
+    const assembler = new TraceChunkAssembler();
+    assembler.mergeChunk([ev("root", "", 0), ev("a", "root", 1, { message: "final" })]);
+    assembler.mergeChunk([ev("a", "root", 1, { status: "PARTIAL", message: "partial" })]);
+
+    expect(assembler.messageChanges).toBe(0);
   });
 });

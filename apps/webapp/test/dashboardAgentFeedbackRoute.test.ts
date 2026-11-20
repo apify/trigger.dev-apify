@@ -9,8 +9,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("~/services/uatRoutePreamble.server", () => ({
   authenticateUatOrApiRequest: mocks.authenticate,
 }));
-vi.mock("~/services/dashboardAgentWatches.server", () => ({
-  authorizeWatchEnvironmentById: mocks.authorizeEnvironment,
+vi.mock("~/services/dashboardAgentChatContext.server", () => ({
+  authorizeAgentEnvironmentById: mocks.authorizeEnvironment,
 }));
 vi.mock("~/services/telemetry.server", () => ({
   telemetry: { dashboardAgent: { feedback: mocks.feedback } },
@@ -92,6 +92,12 @@ describe("POST /api/v1/dashboard-agent/feedback", () => {
   it("rejects an empty or oversized message", async () => {
     expect((await post({ chatId: "chat_1", message: "   " })).status).toBe(400);
     expect((await post({ chatId: "chat_1", message: "x".repeat(4001) })).status).toBe(400);
+    expect(mocks.feedback).not.toHaveBeenCalled();
+  });
+
+  // Catches: an unbounded or non-chat chatId reaching the telemetry event.
+  it.each(["not_a_chat", `chat_${"x".repeat(60)}`])("rejects chatId %s", async (chatId) => {
+    expect((await post({ chatId, message: "hi" })).status).toBe(400);
     expect(mocks.feedback).not.toHaveBeenCalled();
   });
 

@@ -3,6 +3,7 @@ export type { ClickHouseSettings };
 import { ClickhouseClient } from "./client/client.js";
 import type { ClickhouseReader, ClickhouseWriter } from "./client/types.js";
 import { NoopClient } from "./client/noop.js";
+import { MirroredClickhouseWriter } from "./client/mirroredWriter.js";
 import {
   insertTaskRunsCompactArrays,
   insertRawTaskRunPayloadsCompactArrays,
@@ -28,15 +29,12 @@ import {
   getTraceSummaryQueryBuilderV2,
   getTraceChunkQueryBuilder,
   getTraceChunkQueryBuilderV2,
-  getTraceSpanCountQueryBuilder,
-  getTraceSpanCountQueryBuilderV2,
   insertTaskEvents,
   insertTaskEventsV2,
   getLogDetailQueryBuilderV2,
   getLogsSearchListQueryBuilder,
 } from "./taskEvents.js";
 import { insertTaskEventsSearchV2 } from "./taskEventsSearch.js";
-import { projectTaskEventsSearchV2Window } from "./taskEventsSearchProjector.js";
 import { insertMetrics } from "./metrics.js";
 import { insertLlmMetrics } from "./llmMetrics.js";
 import {
@@ -81,6 +79,11 @@ import {
   getOccurrenceCountsSinceQueryBuilder,
 } from "./errors.js";
 export { msToClickHouseInterval } from "./intervals.js";
+export {
+  setQueryObserver,
+  type QueryObservation,
+  type QueryObserver,
+} from "./client/queryObserver.js";
 import { Logger, type LogLevel } from "@trigger.dev/core/logger";
 import type { Meter } from "@internal/tracing";
 import type { Agent as HttpAgent } from "http";
@@ -91,11 +94,11 @@ export type * from "./taskEvents.js";
 export {
   buildTraceChunkCursorPredicate,
   buildTraceChunkKeyPredicate,
+  buildTraceStartTimeSortKeyPredicate,
   sliceTraceChunk,
   TRACE_CHUNK_ORDER_BY,
 } from "./taskEvents.js";
 export * from "./taskEventsSearch.js";
-export * from "./taskEventsSearchProjector.js";
 export type * from "./metrics.js";
 export type * from "./llmMetrics.js";
 export type * from "./queueMetrics.js";
@@ -139,7 +142,12 @@ export {
 export type { ColumnFormatType, OutputColumnMetadata } from "@internal/tsql";
 
 // Errors
-export { QueryError, isClickhouseResourceLimitError } from "./client/errors.js";
+export {
+  QueryError,
+  isClickhouseResourceLimitError,
+  insertErrorServerText,
+  insertErrorType,
+} from "./client/errors.js";
 
 export type ClickhouseCommonConfig = {
   keepAlive?: {
@@ -157,6 +165,8 @@ export type ClickhouseCommonConfig = {
   };
   maxOpenConnections?: number;
   requestTimeoutMs?: number;
+  /** Every write that the primary accepts is also sent to this ClickHouse service, detached from the caller. Reads are unaffected. */
+  mirrorUrl?: string;
 };
 
 export type ClickHouseConfig =
@@ -165,6 +175,8 @@ export type ClickHouseConfig =
       url?: string;
       writerUrl?: never;
       readerUrl?: never;
+      readerClickhouseSettings?: never;
+      readerRequestTimeoutMs?: never;
     } & ClickhouseCommonConfig)
   | ({
       name?: never;
@@ -173,6 +185,10 @@ export type ClickHouseConfig =
       writerUrl: string;
       readerName?: string;
       readerUrl: string;
+      /** Applied to the reader only, on top of `clickhouseSettings`. */
+      readerClickhouseSettings?: ClickHouseSettings;
+      /** Reader-only override of `requestTimeoutMs`. */
+      readerRequestTimeoutMs?: number;
     } & ClickhouseCommonConfig);
 
 export class ClickHouse {
@@ -180,6 +196,7 @@ export class ClickHouse {
   public readonly writer: ClickhouseWriter;
   private readonly logger: Logger;
   private _splitClients: boolean;
+  private _mirror?: ClickhouseClient;
 
   constructor(config: ClickHouseConfig) {
     this.logger = config.logger ?? new Logger("ClickHouse", config.logLevel ?? "debug");
@@ -204,24 +221,24 @@ export class ClickHouse {
         compression: config.compression,
       });
       this.reader = client;
-      this.writer = client;
+      this.writer = this.withMirror(client, config.name ?? "clickhouse", config);
 
       this._splitClients = false;
     } else if (config.writerUrl && config.readerUrl) {
       this.reader = new ClickhouseClient({
         name: config.readerName ?? "clickhouse-reader",
         url: config.readerUrl,
-        clickhouseSettings: config.clickhouseSettings,
+        clickhouseSettings: { ...config.clickhouseSettings, ...config.readerClickhouseSettings },
         logger: this.logger,
         meter: config.meter,
         logLevel: config.logLevel,
         keepAlive: config.keepAlive,
         httpAgent: config.httpAgent,
         maxOpenConnections: config.maxOpenConnections,
-        requestTimeoutMs: config.requestTimeoutMs,
+        requestTimeoutMs: config.readerRequestTimeoutMs ?? config.requestTimeoutMs,
         compression: config.compression,
       });
-      this.writer = new ClickhouseClient({
+      const writer = new ClickhouseClient({
         name: config.writerName ?? "clickhouse-writer",
         url: config.writerUrl,
         clickhouseSettings: config.clickhouseSettings,
@@ -234,6 +251,7 @@ export class ClickHouse {
         requestTimeoutMs: config.requestTimeoutMs,
         compression: config.compression,
       });
+      this.writer = this.withMirror(writer, config.writerName ?? "clickhouse-writer", config);
 
       this._splitClients = true;
     } else {
@@ -263,12 +281,43 @@ export class ClickHouse {
     });
   }
 
+  private withMirror(
+    writer: ClickhouseClient,
+    name: string,
+    config: ClickHouseConfig
+  ): ClickhouseWriter {
+    if (!config.mirrorUrl) return writer;
+
+    this.logger.info("🪞 Mirroring ClickHouse writes to host", {
+      host: new URL(config.mirrorUrl).host,
+    });
+
+    this._mirror = new ClickhouseClient({
+      name: `${name}-mirror`,
+      url: config.mirrorUrl,
+      clickhouseSettings: config.clickhouseSettings,
+      logger: this.logger,
+      meter: config.meter,
+      logLevel: config.logLevel,
+      keepAlive: config.keepAlive,
+      httpAgent: config.httpAgent,
+      maxOpenConnections: config.maxOpenConnections,
+      requestTimeoutMs: config.requestTimeoutMs,
+      compression: config.compression,
+    });
+    return new MirroredClickhouseWriter(writer, this._mirror, this.logger);
+  }
+
+  /** True when reads and writes go to separate services. */
+  get hasSeparateReader(): boolean {
+    return this._splitClients;
+  }
+
   async close() {
-    if (this._splitClients) {
-      await Promise.all([this.reader.close(), this.writer.close()]);
-    } else {
-      await this.reader.close();
-    }
+    const closing = [this.reader.close()];
+    if (this._splitClients) closing.push(this.writer.close());
+    else if (this._mirror) closing.push(this._mirror.close());
+    await Promise.all(closing);
   }
 
   get taskRuns() {
@@ -293,7 +342,6 @@ export class ClickHouse {
       insert: insertTaskEvents(this.writer),
       traceSummaryQueryBuilder: getTraceSummaryQueryBuilder(this.reader),
       traceChunkQueryBuilder: getTraceChunkQueryBuilder(this.reader),
-      traceSpanCountQueryBuilder: getTraceSpanCountQueryBuilder(this.reader),
       traceDetailedSummaryQueryBuilder: getTraceDetailedSummaryQueryBuilder(this.reader),
       traceEventsForExportQueryBuilder: getTraceEventsForExportQueryBuilder(this.reader),
       spanDetailsQueryBuilder: getSpanDetailsQueryBuilder(this.reader),
@@ -361,7 +409,6 @@ export class ClickHouse {
       insert: insertTaskEventsV2(this.writer),
       traceSummaryQueryBuilder: getTraceSummaryQueryBuilderV2(this.reader),
       traceChunkQueryBuilder: getTraceChunkQueryBuilderV2(this.reader),
-      traceSpanCountQueryBuilder: getTraceSpanCountQueryBuilderV2(this.reader),
       traceDetailedSummaryQueryBuilder: getTraceDetailedSummaryQueryBuilderV2(this.reader),
       traceEventsForExportQueryBuilder: getTraceEventsForExportQueryBuilderV2(this.reader),
       spanDetailsQueryBuilder: getSpanDetailsQueryBuilderV2(this.reader),
@@ -373,7 +420,6 @@ export class ClickHouse {
     return {
       insert: insertTaskEventsSearchV2(this.writer),
       logsListQueryBuilder: getLogsSearchListQueryBuilder(this.reader),
-      projectV2Window: projectTaskEventsSearchV2Window(this.writer),
     };
   }
 

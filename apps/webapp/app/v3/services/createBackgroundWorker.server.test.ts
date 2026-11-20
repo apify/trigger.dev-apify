@@ -5,6 +5,8 @@ import type { PrismaClient } from "@trigger.dev/database";
 import { describe, expect, vi } from "vitest";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { FEATURE_FLAG } from "~/v3/featureFlags";
+import { ServiceValidationError } from "~/v3/services/common.server";
+import { deflateSync } from "node:zlib";
 import {
   CreateBackgroundWorkerService,
   createWorkerResources,
@@ -23,7 +25,6 @@ function createTestScheduleEngine(
     worker: { concurrency: 1, disabled: true },
     distributionWindow: { seconds: 0 },
     schedulePhaseSecret: "sync-declarative-schedules-test",
-    cronSpreadFraction: 1,
     onTriggerScheduledTask: async () => ({ success: true }),
     isDevEnvironmentConnectedHandler: async () => true,
   });
@@ -105,20 +106,13 @@ function countingPrisma(prisma: PrismaClient) {
   return { client: client as unknown as PrismaClient, counts };
 }
 
-// syncDeclarativeSchedules reads environment.organizationId AND
-// environment.organization.featureFlags (the free-plan policy resolves the rollout flag from
-// the pre-loaded org). Attach a minimal organization so the fake env matches the real shape,
-// and explicitly disable the unrelated policy unless a test opts into it. A valid org override
-// also keeps these testcontainer calls from falling through to the app singleton's database.
 const asEnv = (
   env: { id: string; projectId: string; type: string; organizationId?: string },
-  organizationFeatureFlags: unknown = {
-    [FEATURE_FLAG.freeScheduleMinimumWindowEnabled]: false,
-  }
+  featureFlags: unknown = {}
 ) =>
   ({
     ...env,
-    organization: { id: env.organizationId, featureFlags: organizationFeatureFlags },
+    organization: { id: env.organizationId, featureFlags },
   }) as unknown as AuthenticatedEnvironment;
 
 function declarativeTasks(schedule: { cron: string; timezone: string; window?: string }): TasksArg {
@@ -212,6 +206,7 @@ describe("worker task creation", () => {
             slug: "duplicate-task",
             ttl: null,
             triggerSource: "STANDARD",
+            executionPolicy: null,
             queueId: queue.id,
             queueName: queue.name,
             gates: null,
@@ -222,6 +217,7 @@ describe("worker task creation", () => {
             slug: "duplicate-task",
             ttl: null,
             triggerSource: "STANDARD",
+            executionPolicy: null,
             queueId: queue.id,
             queueName: queue.name,
             gates: null,
@@ -362,6 +358,93 @@ describe("archived queues on deploy", () => {
         where: { id: undeclared.id },
       });
       expect(undeclaredAfter.archivedAt).toEqual(archivedAt);
+    }
+  );
+});
+
+describe("sandbox task registration", () => {
+  // Catches: a sandbox registering as a standard task (full access) when its config is lost or not
+  // allowed, and a rejected registration leaving a worker that a same-content retry would accept.
+  containerTest(
+    "rejects sandboxes before persisting a worker and registers them once allowed",
+    async ({ prisma }) => {
+      const { project, devEnv } = await seedProjectWithEnvs(prisma);
+      const body = (task: Record<string, unknown>) =>
+        ({
+          engine: "V2",
+          metadata: {
+            contentHash: "sandbox-hash",
+            tasks: [
+              { id: "coder", filePath: "src/trigger/coder.ts", exportName: "coder", ...task },
+            ],
+          },
+        }) as Parameters<CreateBackgroundWorkerService["call"]>[2];
+      const register = (task: Record<string, unknown>, flags: unknown) =>
+        new CreateBackgroundWorkerService(prisma, prisma).call(
+          project.externalRef,
+          { ...asEnv(devEnv, flags), project } as AuthenticatedEnvironment,
+          body(task)
+        );
+      const sandbox = { triggerSource: "sandbox", sandbox: { envVars: ["API_KEY"] } };
+      const enabled = { [FEATURE_FLAG.sandboxTasks]: true };
+
+      await expect(register({ triggerSource: "sandbox" }, enabled)).rejects.toThrow(
+        /dropped its sandbox configuration/
+      );
+      await expect(register(sandbox, {})).rejects.toThrow(/not enabled for this organization/);
+      expect(await prisma.backgroundWorker.count({ where: { projectId: project.id } })).toBe(0);
+
+      const worker = await register(sandbox, enabled);
+      const task = await prisma.backgroundWorkerTask.findUniqueOrThrow({
+        where: { workerId_slug: { workerId: worker.id, slug: "coder" } },
+      });
+      expect(task.executionMode).toBe("SANDBOX");
+      expect(task.executionPolicy).toMatchObject({ rootKey: false, envVars: ["API_KEY"] });
+    }
+  );
+});
+
+describe("source file size limits", () => {
+  // Catches: an upload whose source inflates without bound, and a refused upload leaving rows behind.
+  containerTest(
+    "refuses oversized source before persisting anything and registers normal source",
+    async ({ prisma }) => {
+      const { project, devEnv } = await seedProjectWithEnvs(prisma);
+      const environment = { ...asEnv(devEnv), project } as AuthenticatedEnvironment;
+      const body = (contentHash: string, source: string | Buffer) =>
+        ({
+          engine: "V2",
+          metadata: {
+            contentHash,
+            tasks: [{ id: "task-a", filePath: "src/trigger/a.ts", exportName: "a" }],
+            sourceFiles: [
+              {
+                filePath: "src/trigger/a.ts",
+                contentHash: `${contentHash}-file`,
+                contents: deflateSync(source).toString("base64"),
+                taskIds: ["task-a"],
+              },
+            ],
+          },
+        }) as Parameters<CreateBackgroundWorkerService["call"]>[2];
+      const service = new CreateBackgroundWorkerService(prisma, prisma);
+
+      const error = await service
+        .call(
+          project.externalRef,
+          environment,
+          body("oversized-hash", Buffer.alloc(64 * 1024 * 1024))
+        )
+        .catch((e) => e);
+
+      expect(error).toBeInstanceOf(ServiceValidationError);
+      expect(error.status).toBe(413);
+      expect(error.message).toContain('"src/trigger/a.ts"');
+      expect(await prisma.backgroundWorker.count({ where: { projectId: project.id } })).toBe(0);
+      expect(await prisma.backgroundWorkerFile.count({ where: { projectId: project.id } })).toBe(0);
+
+      await service.call(project.externalRef, environment, body("ok-hash", "export const a = 1;"));
+      expect(await prisma.backgroundWorkerFile.count({ where: { projectId: project.id } })).toBe(1);
     }
   );
 });

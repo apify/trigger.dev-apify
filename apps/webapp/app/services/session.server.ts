@@ -1,4 +1,5 @@
 import { redirect } from "@remix-run/node";
+import { prisma, type PrismaClientOrTransaction } from "~/db.server";
 import { getUserById } from "~/models/user.server";
 import { sanitizeRedirectPath } from "~/utils";
 import { extractClientIp } from "~/utils/extractClientIp.server";
@@ -10,7 +11,12 @@ import {
 } from "./impersonation.server";
 import { redirectWithErrorMessage } from "~/models/message.server";
 import { type SupportAccessDecision } from "~/utils/impersonationState";
+import { checkSession } from "./accessPolicy.server";
+import { noteSessionAuthentication } from "./auditLogs/auditContext.server";
 import { logger } from "./logger.server";
+import { enforceMfaSetup } from "./mfa/mfaPolicy.server";
+import { SESSION_ISSUED_AT_KEY } from "./sessionDuration.server";
+import { getUserSession } from "./sessionStorage.server";
 import { revalidateSsoSession } from "./ssoSessionRevalidation.server";
 
 /**
@@ -19,13 +25,13 @@ import { revalidateSsoSession } from "./ssoSessionRevalidation.server";
  * The deadline is written at login (and any time the effective duration is
  * recomputed — see `commitAuthenticatedSession`) and shortened in bulk when
  * an admin lowers an org cap (see the admin `session-duration` route).
- * Non-impersonation `requireUserId`/`getUserId` paths do NOT enforce —
- * enforcement happens at the next page navigation (root.tsx calls `getUser`),
- * which matches HIPAA auto-logoff semantics: terminate at the navigation
- * boundary, not on every polling fetch. Impersonation paths DO enforce in
- * `getUserId` (against the admin's deadline) so a `requireUserId`-only route
- * can't keep operating as the impersonation target after the admin's session
- * has expired or their admin role was revoked.
+ * `getUserId` enforces it on every authenticated request, including
+ * `requireUserId`-only routes and single-route data requests, so a session past
+ * its deadline can't keep calling actions (such as minting a personal access
+ * token) without a page navigation. Impersonation paths enforce against the
+ * admin's deadline, so a `requireUserId`-only route can't keep operating as the
+ * impersonation target after the admin's session has expired or their admin
+ * role was revoked.
  *
  * `nextSessionEnd === null` means "no enforced deadline" — applies to legacy
  * sessions from before this feature shipped. The default `User.sessionDuration`
@@ -36,11 +42,11 @@ import { revalidateSsoSession } from "./ssoSessionRevalidation.server";
  * `nextSessionEnd`, so there is no realistic state where an unenforced null
  * masks a tighter cap.
  */
-function maybeAutoLogout(
+export async function maybeAutoLogout(
   request: Request,
   user: { id: string; nextSessionEnd: Date | null },
   impersonatedUserId: string | null = null
-): void {
+): Promise<void> {
   if (user.nextSessionEnd === null) return;
   if (Date.now() <= user.nextSessionEnd.getTime()) return;
   // Don't redirect to /logout when we're already on /logout — root.tsx's
@@ -61,7 +67,7 @@ function maybeAutoLogout(
     requestPath: new URL(request.url).pathname,
     sourceIp: extractClientIp(request.headers.get("x-forwarded-for")),
   });
-  throw redirect("/logout");
+  return endSession(request);
 }
 
 // Pages outside a Support Access session go back to its org; data requests get a 403.
@@ -117,26 +123,74 @@ export async function getUserId(request: Request): Promise<string | undefined> {
     // letting them act as the impersonation target after losing the role.
     const authUser = await authenticator.isAuthenticated(request);
     if (!authUser?.userId) return undefined;
+    // The real user's session is checked whether or not they are still an admin.
+    await enforceSessionPolicy(request, authUser.userId);
     const realUser = await getUserById(authUser.userId);
-    if (!realUser) return authUser.userId;
-    if (realUser.admin) {
-      maybeAutoLogout(request, realUser, impersonatedUserId);
-      return impersonatedUserId;
+    if (realUser?.admin) {
+      await maybeAutoLogout(request, realUser, impersonatedUserId);
+      return sessionUserId(request, impersonatedUserId, authUser.userId);
     }
-    maybeAutoLogout(request, realUser);
-    return authUser.userId;
+    if (realUser) await maybeAutoLogout(request, realUser);
+    // No longer an admin: they act as themselves, so their orgs' MFA requirement applies.
+    await enforceMfaSetup(request, authUser.userId);
+    return sessionUserId(request, authUser.userId);
   }
 
-  // Non-impersonation fast path: zero DB queries. Auto-logout enforcement
-  // for this path happens in `getUser`, where we already pay for the User
-  // row fetch. `requireUserId` callers stay cookie-only.
   const authUser = await authenticator.isAuthenticated(request);
   // SSO session re-validation runs here so it covers both navigation
   // (getUser) and API fetches (requireUserId). It's single-flight and
   // throttled, so most requests do nothing; only SSO-marked sessions
   // touch Redis. Throws redirect("/logout") if the IdP says invalid.
   await revalidateSsoSession(request, authUser);
+  if (authUser?.userId) {
+    const decision = await enforceSessionPolicy(request, authUser.userId);
+    // The plugin can return the deadline from its own read, saving one query per request.
+    const user =
+      decision.nextSessionEnd !== undefined
+        ? { nextSessionEnd: decision.nextSessionEnd }
+        : await getSessionAuthState(prisma, authUser.userId);
+    if (user) await maybeAutoLogout(request, { id: authUser.userId, ...user });
+    await enforceMfaSetup(request, authUser.userId);
+    return sessionUserId(request, authUser.userId);
+  }
   return authUser?.userId;
+}
+
+/** Notes the session's user for audit logs, and the staff member behind an impersonation. */
+function sessionUserId(request: Request, userId: string, impersonatorUserId?: string): string {
+  noteSessionAuthentication(request, { userId, impersonatorUserId });
+  return userId;
+}
+
+export type SessionAuthState = { nextSessionEnd: Date | null };
+
+/** Reads a user's session deadline. Runs on every authenticated request. */
+export async function getSessionAuthState(
+  client: PrismaClientOrTransaction,
+  userId: string
+): Promise<SessionAuthState | null> {
+  return client.user.findFirst({ where: { id: userId }, select: { nextSessionEnd: true } });
+}
+
+/** Ends the session when the access policy plugin no longer accepts it. */
+async function enforceSessionPolicy(
+  request: Request,
+  userId: string
+): Promise<{ nextSessionEnd?: Date | null }> {
+  if (new URL(request.url).pathname === "/logout") return {};
+  const session = await getUserSession(request);
+  const issuedAt = session.get(SESSION_ISSUED_AT_KEY);
+  const decision = await checkSession({
+    userId,
+    issuedAt: typeof issuedAt === "number" ? issuedAt : undefined,
+  });
+  if (decision.valid) return decision;
+  logger.warn("Session ended by access policy", {
+    event: "auth.session_refused",
+    userId,
+    requestPath: new URL(request.url).pathname,
+  });
+  return endSession(request);
 }
 
 export async function getUser(request: Request) {
@@ -148,13 +202,13 @@ export async function getUser(request: Request) {
     // matched, let it destroy the cookie itself rather than redirecting in
     // circles via root.tsx.
     if (new URL(request.url).pathname === "/logout") return null;
-    throw await logout(request);
+    return endSession(request);
   }
   // Auto-logout for the non-impersonation path. The impersonation path was
   // already enforced inside `getUserId` against the admin's deadline, so
   // skip re-checking against the (impersonation target's) row here.
   const impersonationId = await getImpersonationId(request);
-  if (!impersonationId) maybeAutoLogout(request, user);
+  if (!impersonationId) await maybeAutoLogout(request, user);
   return user;
 }
 
@@ -231,6 +285,11 @@ export function hasAdminDisplayAccess(user: {
   return (user.admin || user.isImpersonating) && !user.isViewingAsUser;
 }
 
-async function logout(request: Request) {
-  return redirect("/logout");
+/**
+ * Ends the session in this response: clears the cookie and redirects home. Server-side logouts
+ * must not go through GET /logout, which refuses navigations that are not same-origin (a typed
+ * URL or bookmark) without clearing the cookie, so the browser would loop.
+ */
+async function endSession(request: Request): Promise<never> {
+  return authenticator.logout(request, { redirectTo: "/" });
 }

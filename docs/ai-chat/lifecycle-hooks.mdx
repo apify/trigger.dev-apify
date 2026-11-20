@@ -62,7 +62,7 @@ export const myChat = chat.agent({
     }
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -101,7 +101,7 @@ export const myChat = chat.agent({
     // (splice partial + first user into chain, dispatch the rest).
   },
   run: async ({ messages, signal }) =>
-    streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal }),
+    streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal }),
 });
 ```
 
@@ -157,7 +157,7 @@ export const myChat = chat.agent({
     // ... non-preloaded chat-row initialization
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -206,7 +206,7 @@ export const myChat = chat.agent({
     });
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -245,7 +245,7 @@ export const myChat = chat.agent({
     return messages;
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, tools: chatTools, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, tools: chatTools, abortSignal: signal });
   },
 });
 ```
@@ -253,6 +253,10 @@ export const myChat = chat.agent({
 <Warning>
   On HITL continuations (`addToolOutput` / `addToolApproveResponse`) the assistant entry in `messages` is **slim** — `state` + `output` / `errorText` / `approval` only, no `input` or other parts. `validateUIMessages` against the AI SDK schema rejects that shape (the schema requires `input` on resolved tool parts), so filter to user messages first (or skip validation entirely on those turns). The example above does the filter.
 </Warning>
+
+<Note>
+  The agent only takes two kinds of message from a client: user messages, and resolutions of tool calls the agent itself made (an approval response for a call awaiting approval, or the output of a client-side tool). Tool parts on a user message, any client-supplied tool `input`, other roles, and resolutions that don't answer a pending call are dropped before your hooks run. Tool `input` always comes from the agent's own history.
+</Note>
 
 <Note>
   `onValidateMessages` fires **before** `onTurnStart` and message accumulation. If you need to validate messages loaded from a database, do the loading in `onChatStart` or `onPreload` and let `onValidateMessages` validate the full incoming set each turn.
@@ -301,7 +305,7 @@ export const myChat = chat.agent({
     return stored;
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -359,7 +363,7 @@ export const myChat = chat.agent({
     });
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -394,7 +398,7 @@ export const myChat = chat.agent({
     }
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -442,7 +446,7 @@ export const myChat = chat.agent({
     ]);
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -485,7 +489,7 @@ export const myChat = chat.agent({
     logger.info("Resumed", { phase: event.phase });
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```
@@ -519,7 +523,7 @@ export const myChat = chat.agent({
     await initializeChat(chatId, clientData);
   },
   run: async ({ messages, signal }) => {
-    return streamText({ model: anthropic("claude-sonnet-4-5"), messages, abortSignal: signal });
+    return streamText({ model: anthropic("claude-sonnet-5-5"), messages, abortSignal: signal });
   },
 });
 ```

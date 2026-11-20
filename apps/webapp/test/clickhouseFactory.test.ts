@@ -6,6 +6,7 @@ import { postgresTest } from "@internal/testcontainers";
 import { OrganizationDataStoresRegistry } from "~/services/dataStores/organizationDataStoresRegistry.server";
 import { ClickhouseConnectionSchema } from "~/services/clickhouse/clickhouseSecretSchemas.server";
 import { ClickhouseFactory } from "~/services/clickhouse/clickhouseFactory.server";
+import type { ClickhouseEventRepository } from "~/v3/eventRepository/clickhouseEventRepository.server";
 
 vi.setConfig({ testTimeout: 60_000 });
 
@@ -124,4 +125,104 @@ describe("ClickHouse Factory", () => {
       expect(after).toBe(defaultClient);
     }
   );
+  /**
+   * Catches: a factory cache key that ignores the mirror URL, so setting or clearing a mirror keeps
+   * serving the previously built client and event repository.
+   */
+  postgresTest(
+    "setting a mirror URL yields a fresh client whose writer is mirrored",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry);
+      const before = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(before.writer).toBe(before.reader);
+
+      await registry.updateDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL, mirrorUrl: TEST_URL_2 }),
+      });
+      await registry.reload();
+
+      const mirrored = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(mirrored).not.toBe(before);
+      expect(mirrored.writer).not.toBe(mirrored.reader);
+
+      const repoBefore = factory.getEventRepositoryForOrganizationSync(
+        "clickhouse_v2",
+        "org-mirror"
+      );
+
+      await registry.updateDataStore({
+        key: "mirror-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-mirror"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+      await registry.reload();
+
+      const cleared = await factory.getClickhouseForOrganization("org-mirror", "standard");
+      expect(cleared).toBe(before);
+      const repoAfter = factory.getEventRepositoryForOrganizationSync(
+        "clickhouse_v2",
+        "org-mirror"
+      );
+      expect(repoAfter.key).not.toBe(repoBefore.key);
+    }
+  );
+
+  postgresTest(
+    "routes the v1 store to the shared v2 repository when the reroute is on",
+    async ({ prisma }) => {
+      const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+      await registry.addDataStore({
+        key: "reroute-store",
+        kind: "CLICKHOUSE",
+        organizationIds: ["org-reroute"],
+        config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+      });
+
+      await registry.loadFromDatabase();
+
+      const factory = new ClickhouseFactory(registry, true);
+      const v1 = factory.getEventRepositoryForOrganizationSync("clickhouse", "org-reroute");
+      const v2 = factory.getEventRepositoryForOrganizationSync("clickhouse_v2", "org-reroute");
+
+      expect(v1.key).toBe(v2.key);
+      expect(v1.repository).toBe(v2.repository);
+      expect((v1.repository as ClickhouseEventRepository).version).toBe("v2");
+    }
+  );
+
+  postgresTest("keeps the v1 repository when the reroute is off", async ({ prisma }) => {
+    const registry = new OrganizationDataStoresRegistry(prisma, prisma);
+
+    await registry.addDataStore({
+      key: "no-reroute-store",
+      kind: "CLICKHOUSE",
+      organizationIds: ["org-no-reroute"],
+      config: ClickhouseConnectionSchema.parse({ url: TEST_URL }),
+    });
+
+    await registry.loadFromDatabase();
+
+    const factory = new ClickhouseFactory(registry, false);
+    const v1 = factory.getEventRepositoryForOrganizationSync("clickhouse", "org-no-reroute");
+    const v2 = factory.getEventRepositoryForOrganizationSync("clickhouse_v2", "org-no-reroute");
+
+    expect(v1.key).not.toBe(v2.key);
+    expect((v1.repository as ClickhouseEventRepository).version).toBe("v1");
+    expect((v2.repository as ClickhouseEventRepository).version).toBe("v2");
+  });
 });

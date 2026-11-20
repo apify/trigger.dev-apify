@@ -33,8 +33,14 @@ const IMPERSONATED_USER_ID_KEY = "impersonatedUserId";
 // The org the session may open, and (request-mode only) when it ends.
 const SUPPORT_ACCESS_ORG_SLUGS_KEY = "supportAccessOrgSlugs";
 const SUPPORT_ACCESS_EXPIRES_AT_KEY = "supportAccessExpiresAt";
+const SUPPORT_ACCESS_REQUEST_ID_KEY = "supportAccessRequestId";
 
-export type SupportAccessScope = { organizationSlugs: string[]; expiresAt?: Date };
+export type SupportAccessScope = {
+  organizationSlugs: string[];
+  expiresAt?: Date;
+  /** The approved request the session runs under, so its end can say why, as its start does. */
+  requestId?: string;
+};
 
 /**
  * Display-only "view as user" flag. It lives on the impersonation cookie so it
@@ -67,6 +73,13 @@ export async function getSupportAccessDenial(
   return decision.type === "deny" ? decision : undefined;
 }
 
+/** The approved request the current session runs under, if it runs under one. */
+export async function getSupportAccessRequestId(request: Request): Promise<string | undefined> {
+  const session = await getImpersonationSession(request);
+  const requestId: unknown = session.get(SUPPORT_ACCESS_REQUEST_ID_KEY);
+  return typeof requestId === "string" ? requestId : undefined;
+}
+
 export async function getSupportAccessOrgSlugs(request: Request): Promise<string[] | undefined> {
   const session = await getImpersonationSession(request);
   const slugs: unknown = session.get(SUPPORT_ACCESS_ORG_SLUGS_KEY);
@@ -84,6 +97,16 @@ export function commitImpersonationSession(session: Session) {
   return impersonationSessionStorage.commitSession(session, {
     maxAge: Math.max(0, Math.min(IMPERSONATION_MAX_AGE_SECONDS, secondsLeft)),
   });
+}
+
+/**
+ * When a request-mode session ends: the approved end, capped at 24 hours from the start. Every
+ * commit keeps to it, so it can't move. Other sessions have no fixed end, because each commit
+ * (e.g. the view-as-user toggle) restarts the cookie's `maxAge`.
+ */
+export function getSupportAccessExpiresAt(session: Session): Date | undefined {
+  const expiresAt = session.get(SUPPORT_ACCESS_EXPIRES_AT_KEY);
+  return typeof expiresAt === "number" ? new Date(expiresAt) : undefined;
 }
 
 export async function getImpersonationId(request: Request) {
@@ -118,6 +141,11 @@ export async function setImpersonationId(
   session.set(IMPERSONATED_USER_ID_KEY, userId);
 
   session.set(SUPPORT_ACCESS_ORG_SLUGS_KEY, supportAccess.organizationSlugs);
+  if (supportAccess.requestId) {
+    session.set(SUPPORT_ACCESS_REQUEST_ID_KEY, supportAccess.requestId);
+  } else {
+    session.unset(SUPPORT_ACCESS_REQUEST_ID_KEY);
+  }
   session.unset(SUPPORT_ACCESS_EXPIRES_AT_KEY);
   if (supportAccess.expiresAt) {
     const cap = Date.now() + IMPERSONATION_MAX_AGE_SECONDS * 1000;
@@ -136,6 +164,7 @@ export async function clearImpersonationId(request: Request) {
   session.unset(VIEWING_AS_USER_KEY);
   session.unset(SUPPORT_ACCESS_ORG_SLUGS_KEY);
   session.unset(SUPPORT_ACCESS_EXPIRES_AT_KEY);
+  session.unset(SUPPORT_ACCESS_REQUEST_ID_KEY);
 
   return session;
 }

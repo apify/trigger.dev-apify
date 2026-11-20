@@ -12,7 +12,6 @@ export function DashboardAgentHero({
   dismissedIds,
   composer,
   promptsDisabledReason,
-  watchEnabled = false,
 }: {
   /** Receives the prompt text to send, not the button label. */
   onSelect: (prompt: string) => void;
@@ -22,15 +21,13 @@ export function DashboardAgentHero({
   composer?: React.ReactNode;
   /** Set to disable the suggestion chips and say why. */
   promptsDisabledReason?: string;
-  /** Withholds the `watch` chip while watch functionality is behind its flag. */
-  watchEnabled?: boolean;
 }) {
   // Centred by the child's `m-auto`, not by `justify-center`: auto margins give up their space
   // once the content outgrows the panel, so the heading stays scrollable to.
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-4 py-6 scrollbar-thin scrollbar-track-transparent scrollbar-thumb-surface-control">
       <div className="m-auto flex w-full max-w-2xl flex-col items-center gap-5">
-        <div className="flex flex-col items-center gap-1.5 text-center">
+        <div className="flex flex-col items-center gap-2.5 text-center">
           <Header1 className="flex items-center gap-2">
             <AISparkleIcon className="size-[22px]" />
             Ask Trigger
@@ -47,7 +44,6 @@ export function DashboardAgentHero({
           promoted={promoted}
           dismissedIds={dismissedIds}
           disabledReason={promptsDisabledReason}
-          watchEnabled={watchEnabled}
         />
       </div>
     </div>

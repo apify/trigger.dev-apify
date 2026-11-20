@@ -14,6 +14,7 @@ import {
   VercelProjectIntegrationDataSchema,
   buildVercelDeploymentUrl,
 } from "~/v3/vercel/vercelProjectIntegrationSchema";
+import { resolveRedeploySource } from "~/v3/redeploy";
 
 const pageSize = 20;
 
@@ -154,7 +155,12 @@ export class DeploymentListPresenter {
         userAvatarUrl: string | null;
         type: WorkerInstanceGroupType;
         externalId: string | null;
+        triggeredVia: string | null;
         git: Prisma.JsonValue | null;
+        buildServerMetadata: Prisma.JsonValue | null;
+        hasBuildEnvVars: boolean;
+        createdAt: Date;
+        isSuperseded: boolean;
         integrationDeploymentId: string | null;
       }[]
     >`
@@ -175,7 +181,12 @@ export class DeploymentListPresenter {
   wd."deployedAt",
   wd."type",
   wd."externalId",
-  wd."git"
+  wd."triggeredVia",
+  wd."git",
+  wd."buildServerMetadata",
+  wd."buildEnvVars" IS NOT NULL AS "hasBuildEnvVars",
+  wd."createdAt",
+  wd."supersededById" IS NOT NULL AS "isSuperseded"
   ${vercelSelect}
 FROM
   ${sqlDatabaseSchema}."WorkerDeployment" as wd
@@ -222,6 +233,7 @@ LIMIT ${pageSize} OFFSET ${pageSize * (page - 1)};`;
         const label = labeledDeployments.find(
           (labeledDeployment) => labeledDeployment.deploymentId === deployment.id
         );
+        const redeploySource = resolveRedeploySource(deployment);
 
         let vercelDeploymentUrl: string | null = null;
         if (
@@ -267,7 +279,14 @@ LIMIT ${pageSize} OFFSET ${pageSize * (page - 1)};`;
               }
             : undefined,
           externalId: deployment.externalId,
+          triggeredVia: deployment.triggeredVia,
           git: processGitMetadata(deployment.git),
+          createdAt: deployment.createdAt,
+          isSuperseded: deployment.status === "CANCELED" && deployment.isSuperseded,
+          redeploySource:
+            redeploySource?.kind === "artifact" && redeploySource.fromBundle
+              ? ("bundle" as const)
+              : (redeploySource?.kind ?? null),
           vercelDeploymentUrl,
         };
       }),

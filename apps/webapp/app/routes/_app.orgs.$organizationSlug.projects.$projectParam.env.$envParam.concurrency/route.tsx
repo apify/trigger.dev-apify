@@ -1,5 +1,6 @@
 import {
   ArrowUpCircleIcon,
+  BellAlertIcon,
   BookOpenIcon,
   ExclamationTriangleIcon,
   PauseIcon,
@@ -68,8 +69,7 @@ import { TimeFilter, timeFilterFromTo } from "~/components/runs/v3/SharedFilters
 import { useSearchParams } from "~/hooks/useSearchParam";
 import { parseFiniteInt } from "~/utils/searchParams";
 import { MiniLineChart } from "~/components/metrics/MiniLineChart";
-import { buildActivityTimeAxis } from "~/components/primitives/charts/activityTimeAxis";
-import { Chart, type ChartConfig } from "~/components/primitives/charts/ChartCompound";
+import { MetricTileChart } from "~/components/queues/MetricTileChart";
 import { ChartCard } from "~/components/primitives/charts/ChartCard";
 import { ChartSyncProvider } from "~/components/primitives/charts/ChartSyncContext";
 import { useZoomToTimeFilter } from "~/hooks/useZoomToTimeFilter";
@@ -84,12 +84,14 @@ import { resolveProjectAuthScope } from "~/services/projectAuthScope.server";
 import { dashboardAction } from "~/services/routeBuilders/dashboardBuilder";
 import { requireUserId } from "~/services/session.server";
 import { cn } from "~/utils/cn";
+import { ChartTileTitle } from "~/components/queues/ChartTileTitle";
 import { ENVIRONMENT_PAUSE_SOURCE_BILLING_LIMIT } from "~/utils/environmentPauseSource";
 import {
   concurrencyLimitsPath,
   docsPath,
   EnvironmentParamSchema,
   v3BillingPath,
+  v3AlertCreatePath,
   concurrencyQueuePath,
   v3RunsPath,
 } from "~/utils/pathBuilder";
@@ -98,7 +100,6 @@ import { queuesAgentPageContext } from "~/components/dashboard-agent/suggested-p
 import { WhenAgentUnavailable } from "~/components/dashboard-agent/WhenAgentUnavailable";
 import { PauseEnvironmentService } from "~/v3/services/pauseEnvironment.server";
 import { handleQueueMutationAction } from "~/models/queueMutation.server";
-import { queueArchivingEnabled } from "~/v3/services/queueArchivingEnabled.server";
 import {
   QueueArchiveButton,
   QueueOverrideConcurrencyButton,
@@ -109,6 +110,7 @@ import { Callout } from "~/components/primitives/Callout";
 import { useCurrentPlan } from "../_app.orgs.$organizationSlug/route";
 import { BigNumber } from "~/components/metrics/BigNumber";
 import { canAccessQueueMetricsUi } from "~/v3/canAccessQueueMetricsUi.server";
+import { canUseAlertsList } from "~/v3/canUseAlertsList.server";
 import { QueueAllocationPresenter } from "~/presenters/v3/QueueAllocationPresenter.server";
 import {
   QUEUE_METRICS_DEFAULT_PERIOD,
@@ -177,15 +179,17 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     });
   }
 
+  const alertsEnabled = await canUseAlertsList({
+    orgFeatureFlags: (project.organization.featureFlags as Record<string, unknown>) ?? {},
+    userId,
+  });
+
   const auth = await rbac.authenticateSession(request, {
     userId,
     organizationId: project.organizationId,
     projectId: project.id,
   });
   const canWriteTasks = auth.ok && auth.ability.can("write", { type: "tasks" });
-  const archivingEnabled = await queueArchivingEnabled(environment.organizationId, {
-    orgFeatureFlags: project.organization.featureFlags,
-  });
 
   // Per-org gate for the metrics UI. When off, this org gets the classic Queues page and
   // no metrics query fires.
@@ -210,8 +214,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       query,
       page,
       includeLimits: true,
-      archived: archivingEnabled && showArchived !== "true" ? "exclude" : "include",
-      detectArchivedActivity: archivingEnabled,
+      archived: showArchived === "true" ? "include" : "exclude",
+      detectArchivedActivity: true,
       // Relevance ordering rides the metrics pipeline, so it is part of the gated UI.
       sort: queueMetricsUiEnabled ? (sort ?? "busiest") : "name",
     });
@@ -282,10 +286,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     let allocation: Awaited<ReturnType<QueueAllocationPresenter["call"]>> | null = null;
     if (queueMetricsUiEnabled) {
       try {
-        allocation = await new QueueAllocationPresenter().call({
-          environment,
-          excludeArchived: archivingEnabled,
-        });
+        allocation = await new QueueAllocationPresenter().call({ environment });
       } catch (error) {
         logger.warn("Queue allocation summary unavailable, rendering without it", {
           error,
@@ -304,7 +305,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       defaultPeriod,
       maxPeriodDays,
       canWriteTasks,
-      archivingEnabled,
+      alertsEnabled,
     });
   } catch (error) {
     console.error(error);
@@ -455,7 +456,7 @@ function QueuesWithMetricsView() {
     defaultPeriod,
     maxPeriodDays,
     canWriteTasks,
-    archivingEnabled,
+    alertsEnabled,
   } = useTypedLoaderData<typeof loader>();
 
   const metricsByQueue = metrics?.byQueue ?? {};
@@ -651,11 +652,7 @@ function QueuesWithMetricsView() {
                 Allocated
                 {allocation ? (
                   <InfoIconTooltip
-                    content={`The sum of every queue's concurrency limit. It can go over 100% of the environment limit, which is normal: it lets one queue burst while others are quiet. The environment limit still caps total running work, so queues share it when the environment is busy.${
-                      archivingEnabled
-                        ? " Archived queues aren't counted, even if they still have runs."
-                        : ""
-                    }`}
+                    content={`The sum of every queue's concurrency limit. It can go over 100% of the environment limit, which is normal: it lets one queue burst while others are quiet. The environment limit still caps total running work, so queues share it when the environment is busy. Archived queues aren't counted, even if they still have runs.`}
                     contentClassName="max-w-xs"
                   />
                 ) : null}
@@ -757,7 +754,7 @@ function QueuesWithMetricsView() {
              above. Same left/right split as the classic view's bar. */
           toolbar={
             <>
-              <QueueFilters showArchivedToggle={archivingEnabled} />
+              <QueueFilters />
               <PaginationControls
                 currentPage={pagination.currentPage}
                 totalPages={pagination.mode === "unfiltered" ? pagination.totalPages : 1}
@@ -922,14 +919,24 @@ function QueuesWithMetricsView() {
                         environmentConcurrencyLimit={environment.concurrencyLimit}
                         disabled={!canWriteTasks}
                       />
-                      {archivingEnabled || queue.archivedAt ? (
-                        <QueueArchiveButton
-                          queue={queue}
-                          disabled={!canWriteTasks}
-                          lastOnPage={queues.length === 1 && pagination.currentPage > 1}
-                          onDone={close}
+                      {alertsEnabled ? (
+                        <PopoverMenuItem
+                          icon={BellAlertIcon}
+                          leadingIconClassName="text-alerts size-[1.125rem]"
+                          title="Watch…"
+                          to={v3AlertCreatePath(organization, project, env, {
+                            capability: "queue.depth",
+                            scope: "queue",
+                            scopeValue: queueFilterableName,
+                          })}
                         />
                       ) : null}
+                      <QueueArchiveButton
+                        queue={queue}
+                        disabled={!canWriteTasks}
+                        lastOnPage={queues.length === 1 && pagination.currentPage > 1}
+                        onDone={close}
+                      />
                     </div>
                   );
 
@@ -1003,12 +1010,10 @@ function QueuesWithMetricsView() {
                               Paused
                             </Badge>
                           ) : null}
-                          {archivingEnabled ? (
-                            <QueueArchivedBadge
-                              queue={queue}
-                              hasActiveRuns={activeArchivedIds.has(queue.id)}
-                            />
-                          ) : null}
+                          <QueueArchivedBadge
+                            queue={queue}
+                            hasActiveRuns={activeArchivedIds.has(queue.id)}
+                          />
                           {isAtQueueLimit ? (
                             <Badge variant="extra-small" className="text-error">
                               At queue limit
@@ -1400,22 +1405,20 @@ export function isEnvironmentPauseResumeFormSubmission(
   );
 }
 
-export function QueueFilters({ showArchivedToggle = false }: { showArchivedToggle?: boolean }) {
+export function QueueFilters() {
   const { value, replace } = useSearchParams();
 
   return (
     <div className="flex items-center gap-2">
       <SearchInput placeholder="Search queues…" paramName="query" resetParams={["page"]} />
-      {showArchivedToggle ? (
-        <Switch
-          checked={value("showArchived") === "true"}
-          onCheckedChange={(checked) =>
-            replace({ showArchived: checked ? "true" : undefined, page: undefined })
-          }
-          label="Show archived"
-          variant="secondary/small"
-        />
-      ) : null}
+      <Switch
+        checked={value("showArchived") === "true"}
+        onCheckedChange={(checked) =>
+          replace({ showArchived: checked ? "true" : undefined, page: undefined })
+        }
+        label="Show archived"
+        variant="secondary/small"
+      />
     </div>
   );
 }
@@ -1761,12 +1764,10 @@ function QueueEnvMetricChart({
   const wholeLineWarning = solidWarning && total > 0;
   const lineColor = wholeLineWarning ? "var(--color-warning)" : tile.color;
 
-  const chartConfig = useMemo<ChartConfig>(
-    () => ({ [tile.id]: { label: tile.label, color: lineColor } }),
+  const chartSeries = useMemo(
+    () => [{ key: tile.id, label: tile.label, color: lineColor }],
     [tile.id, tile.label, lineColor]
   );
-
-  const { tickFormatter, tooltipLabelFormatter } = buildActivityTimeAxis(data);
   const hasData = data.length > 0 && data.some((p) => Number(p[tile.id] ?? 0) > 0);
 
   // Peak readout lives in the card title (ChartCard has no dedicated value slot). A zero/empty
@@ -1785,62 +1786,14 @@ function QueueEnvMetricChart({
   return (
     <ChartCard
       title={
-        <span className="flex flex-col gap-1">
-          <span className="flex items-baseline gap-2">
-            <span className="flex items-center gap-1">
-              {tile.label}
-              <InfoIconTooltip
-                content={tile.description}
-                contentClassName="max-w-[230px]"
-                disableHoverableContent
-              />
-            </span>
-            {peak != null ? (
-              tile.totalTooltip && !readoutLoading ? (
-                <SimpleTooltip
-                  button={
-                    <span
-                      className={cn(
-                        "text-xs font-normal tabular-nums text-text-dimmed",
-                        totalClassName
-                      )}
-                    >
-                      {peak}
-                    </span>
-                  }
-                  content={tile.totalTooltip}
-                  className="max-w-[230px]"
-                  disableHoverableContent
-                />
-              ) : (
-                <span
-                  className={cn(
-                    "text-xs font-normal tabular-nums text-text-dimmed",
-                    totalClassName
-                  )}
-                >
-                  {peak}
-                </span>
-              )
-            ) : null}
-          </span>
-          {tile.legend && (showLoading || hasData) ? (
-            <span className="flex items-center gap-2">
-              {tile.legend.map((item) => (
-                <span
-                  key={item.label}
-                  className="flex items-center gap-1 text-xs font-normal text-text-dimmed"
-                >
-                  <span
-                    className="size-2.5 rounded-[2px]"
-                    style={{ backgroundColor: item.color }}
-                  />
-                  {item.label}
-                </span>
-              ))}
-            </span>
-          ) : null}
-        </span>
+        <ChartTileTitle
+          label={tile.label}
+          description={tile.description}
+          peak={peak}
+          peakClassName={totalClassName}
+          peakTooltip={readoutLoading ? undefined : tile.totalTooltip}
+          legend={showLoading || hasData ? tile.legend : undefined}
+        />
       }
     >
       {showLoading ? (
@@ -1850,24 +1803,15 @@ function QueueEnvMetricChart({
           Unable to load metrics
         </div>
       ) : hasData ? (
-        <Chart.Root
-          config={chartConfig}
+        <MetricTileChart
           data={data}
-          dataKey="bucket"
-          series={[tile.id]}
-          fillContainer
-        >
-          <Chart.Line
-            showDots={false}
-            referenceLines={referenceLines}
-            thresholdStroke={thresholdStroke}
-            warningOverlay={warningOverlay}
-            xAxisProps={{ tickFormatter }}
-            yAxisProps={tile.formatAxis ? { tickFormatter: tile.formatAxis } : undefined}
-            tooltipLabelFormatter={tooltipLabelFormatter}
-            tooltipValueFormatter={tile.formatValue}
-          />
-        </Chart.Root>
+          series={chartSeries}
+          referenceLines={referenceLines}
+          thresholdStroke={thresholdStroke}
+          warningOverlay={warningOverlay}
+          formatAxis={tile.formatAxis}
+          formatValue={tile.formatValue}
+        />
       ) : (
         <div className="flex h-full items-center justify-center text-xs text-text-dimmed">
           No activity
@@ -1958,7 +1902,7 @@ function ClassicQueuesView() {
     hasFilters,
     autoReloadPollIntervalMs,
     canWriteTasks,
-    archivingEnabled,
+    alertsEnabled,
   } = useTypedLoaderData<typeof loader>();
   const activeArchivedIds = new Set(activeArchivedQueues?.map((q) => q.id));
 
@@ -2101,7 +2045,7 @@ function ClassicQueuesView() {
 
           <div className="grid max-h-full min-h-full grid-rows-[auto_1fr] overflow-x-auto">
             <div className="flex items-center justify-between gap-2 border-t border-grid-dimmed px-1.5 py-1.5">
-              <QueueFilters showArchivedToggle={archivingEnabled} />
+              <QueueFilters />
               <PaginationControls
                 currentPage={pagination.currentPage}
                 totalPages={pagination.mode === "unfiltered" ? pagination.totalPages : 1}
@@ -2257,14 +2201,24 @@ function ClassicQueuesView() {
                             environmentConcurrencyLimit={environment.concurrencyLimit}
                             disabled={!canWriteTasks}
                           />
-                          {archivingEnabled || queue.archivedAt ? (
-                            <QueueArchiveButton
-                              queue={queue}
-                              disabled={!canWriteTasks}
-                              lastOnPage={queues.length === 1 && pagination.currentPage > 1}
-                              onDone={close}
+                          {alertsEnabled ? (
+                            <PopoverMenuItem
+                              icon={BellAlertIcon}
+                              leadingIconClassName="text-alerts size-[1.125rem]"
+                              title="Watch…"
+                              to={v3AlertCreatePath(organization, project, env, {
+                                capability: "queue.depth",
+                                scope: "queue",
+                                scopeValue: queueFilterableName,
+                              })}
                             />
                           ) : null}
+                          <QueueArchiveButton
+                            queue={queue}
+                            disabled={!canWriteTasks}
+                            lastOnPage={queues.length === 1 && pagination.currentPage > 1}
+                            onDone={close}
+                          />
                         </div>
                       );
 
@@ -2291,12 +2245,10 @@ function ClassicQueuesView() {
                                   Paused
                                 </Badge>
                               ) : null}
-                              {archivingEnabled ? (
-                                <QueueArchivedBadge
-                                  queue={queue}
-                                  hasActiveRuns={activeArchivedIds.has(queue.id)}
-                                />
-                              ) : null}
+                              <QueueArchivedBadge
+                                queue={queue}
+                                hasActiveRuns={activeArchivedIds.has(queue.id)}
+                              />
                               {isAtQueueLimit ? (
                                 <Badge variant="extra-small" className="text-error">
                                   At queue limit

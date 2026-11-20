@@ -3,6 +3,8 @@ import type {
   Prisma,
   PrismaClient,
   RuntimeEnvironmentType,
+  TaskExecutionMode,
+  WorkerDeploymentStatus,
 } from "@trigger.dev/database";
 import { CURRENT_DEPLOYMENT_LABEL } from "@trigger.dev/core/v3/isomorphic";
 import type { AuthenticatedEnvironment } from "@trigger.dev/core/v3/auth/environment";
@@ -51,6 +53,13 @@ export type ResolvedEngineEnv = {
  * Just the soft-delete tombstones, read from the authoritative source rather than from
  * whatever `resolveEnv` has cached.
  */
+/** A deployment's status and when it started deploying, read from the authoritative source. */
+export type ResolvedDeploymentStatus = {
+  status: WorkerDeploymentStatus;
+  /** When the deployment entered DEPLOYING (`builtAt`), else when it was created. */
+  deployingSince: Date;
+};
+
 export type EnvDeletionState = Pick<
   ResolvedEngineEnv,
   "projectDeletedAt" | "organizationDeletedAt"
@@ -103,6 +112,7 @@ export type ResolvedWorkerTask = {
   machineConfig: Prisma.JsonValue | null;
   retryConfig: Prisma.JsonValue | null;
   maxDurationInSeconds: number | null;
+  executionMode: TaskExecutionMode;
 };
 
 /** The `select` that yields a `ResolvedWorkerTask`. */
@@ -112,6 +122,7 @@ const resolvedWorkerTaskSelect = {
   machineConfig: true,
   retryConfig: true,
   maxDurationInSeconds: true,
+  executionMode: true,
 } satisfies Prisma.BackgroundWorkerTaskSelect;
 
 /**
@@ -130,23 +141,27 @@ const resolvedTaskQueueSelect = {
 } satisfies Prisma.TaskQueueSelect;
 
 /**
- * The WorkerDeployment columns the dequeue resolve path reads: `id`, `friendlyId`,
- * `imageReference`, `imagePlatform`. Drops the unread heavy JSON columns (`externalBuildData`,
+ * The WorkerDeployment columns the dequeue resolve path reads: `id`, `friendlyId`, `status`,
+ * `imageReference`, `imagePlatform`, `templateKey`. Drops the unread heavy JSON columns (`externalBuildData`,
  * `buildServerMetadata`, `errorData`, `git`) that this single-row read otherwise ships.
  */
 export type ResolvedWorkerDeployment = {
   id: string;
   friendlyId: string;
+  status: WorkerDeploymentStatus;
   imageReference: string | null;
   imagePlatform: string;
+  templateKey: string | null;
 };
 
 /** The `select` that yields a `ResolvedWorkerDeployment`. */
 const resolvedWorkerDeploymentSelect = {
   id: true,
   friendlyId: true,
+  status: true,
   imageReference: true,
   imagePlatform: true,
+  templateKey: true,
 } satisfies Prisma.WorkerDeploymentSelect;
 
 /** Identical to dequeue's `WorkerDeploymentWithWorkerTasks`. */
@@ -178,8 +193,27 @@ export interface ControlPlaneResolver {
    * environment does not exist.
    */
   resolveEnvDeletionState(environmentId: string): Promise<EnvDeletionState | null>;
+  /**
+   * A deployment's status read straight from the authoritative control-plane source, never from
+   * a cache or replica. `resolveWorkerVersion` may serve a status that lags a just-finished
+   * deploy, so a decision that holds or fails a run on that status confirms it here. Returns
+   * `null` when the deployment does not exist.
+   */
+  resolveDeploymentStatus(deploymentId: string): Promise<ResolvedDeploymentStatus | null>;
   resolveAuthenticatedEnv(environmentId: string): Promise<ResolvedAuthenticatedEnv | null>;
   resolveWorkerVersion(
+    args: {
+      environmentId: string;
+      type: RuntimeEnvironmentType;
+      workerId?: string;
+    } & WorkerVersionDispatchFilter
+  ): Promise<ResolvedWorkerVersion | null>;
+  /**
+   * `resolveWorkerVersion` read straight from the authoritative control-plane source, never from
+   * a cache or replica. A replica can lag a just-promoted deployment, so a decision that parks a
+   * run because no worker covers it confirms the miss here.
+   */
+  resolveWorkerVersionFromPrimary(
     args: {
       environmentId: string;
       type: RuntimeEnvironmentType;
@@ -254,6 +288,16 @@ export class PassthroughControlPlaneResolver implements ControlPlaneResolver {
    * satisfy the seam. It reads the org tombstone through `project.organization` (the same path
    * the webapp resolver uses) rather than the environment's own organization relation.
    */
+  async resolveDeploymentStatus(deploymentId: string): Promise<ResolvedDeploymentStatus | null> {
+    const deployment = await this.#prisma.workerDeployment.findFirst({
+      where: { id: deploymentId },
+      select: { status: true, builtAt: true, createdAt: true },
+    });
+    return deployment
+      ? { status: deployment.status, deployingSince: deployment.builtAt ?? deployment.createdAt }
+      : null;
+  }
+
   async resolveEnvDeletionState(environmentId: string): Promise<EnvDeletionState | null> {
     const env = await this.#prisma.runtimeEnvironment.findFirst({
       where: { id: environmentId },
@@ -346,6 +390,17 @@ export class PassthroughControlPlaneResolver implements ControlPlaneResolver {
   async assertEnvExists(_environmentId: string): Promise<void> {
     // No-op: passthrough is single-DB, so run and env share one database and there is
     // no cross-seam FK to replace (matches main, which dropped the TaskRun env FK).
+  }
+
+  // Passthrough already reads the primary.
+  async resolveWorkerVersionFromPrimary(
+    args: {
+      environmentId: string;
+      type: RuntimeEnvironmentType;
+      workerId?: string;
+    } & WorkerVersionDispatchFilter
+  ): Promise<ResolvedWorkerVersion | null> {
+    return this.resolveWorkerVersion(args);
   }
 
   async resolveWorkerVersion(
@@ -484,8 +539,10 @@ export class PassthroughControlPlaneResolver implements ControlPlaneResolver {
         deployment: {
           id: promotion.deployment.id,
           friendlyId: promotion.deployment.friendlyId,
+          status: promotion.deployment.status,
           imageReference: promotion.deployment.imageReference,
           imagePlatform: promotion.deployment.imagePlatform,
+          templateKey: promotion.deployment.templateKey,
         },
       };
     }
@@ -519,8 +576,10 @@ export class PassthroughControlPlaneResolver implements ControlPlaneResolver {
       deployment: {
         id: latestV2Deployment.id,
         friendlyId: latestV2Deployment.friendlyId,
+        status: latestV2Deployment.status,
         imageReference: latestV2Deployment.imageReference,
         imagePlatform: latestV2Deployment.imagePlatform,
+        templateKey: latestV2Deployment.templateKey,
       },
     };
   }

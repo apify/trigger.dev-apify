@@ -1,11 +1,18 @@
 import { generateJWT as internal_generateJWT } from "@trigger.dev/core/v3";
 import { extractJwtSigningSecretKey } from "./jwtAuth.server";
+import { publicTokenSubject } from "~/services/publicTokenSubject.server";
+import {
+  inheritedSourcePatClaim,
+  type RequestActor,
+} from "~/services/publicAccessTokenResponse.server";
 
 type Environment = Parameters<typeof extractJwtSigningSecretKey>[0];
 
 export type MintSessionTokenOptions = {
   /** Token expiration. Defaults to "1h". */
   expirationTime?: string;
+  /** The minting request's actor; a source PAT on it is inherited by the token. */
+  actor?: RequestActor;
 };
 
 /**
@@ -31,9 +38,10 @@ export async function mintSessionToken(
   return internal_generateJWT({
     secretKey: extractJwtSigningSecretKey(environment),
     payload: {
-      sub: environment.id,
+      sub: publicTokenSubject(environment.id),
       pub: true,
       scopes,
+      ...inheritedSourcePatClaim(options.actor),
     },
     expirationTime: options.expirationTime ?? "1h",
   });

@@ -7,12 +7,17 @@ import { toWebhookHttpResponse, webhookHttpResponseFor } from "~/v3/webhookIngre
 /**
  * GET: a provider's verification of the endpoint URL (Meta's `hub.challenge` flow). The engine
  * answers it from the endpoint's declared GET handshake, or refuses with 405 when the source
- * declares none. Never records a delivery.
+ * declares none. HEAD (which Remix routes here): a provider checking the URL is reachable before
+ * saving it, answered 200 for any active endpoint. Neither records a delivery.
  */
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  const admitted = await admitWebhookIngress(params);
+  const admitted = await admitWebhookIngress(params, request);
   if (admitted instanceof Response) return admitted;
   const { opaqueId } = admitted;
+
+  if (request.method === "HEAD") {
+    return toWebhookHttpResponse(webhookHttpResponseFor(await webhookEngine.answerHead(opaqueId)));
+  }
 
   const query: Record<string, string> = {};
   new URL(request.url).searchParams.forEach((v, k) => (query[k] = v));
@@ -28,7 +33,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 // signature scheme verifies. The engine resolves the endpoint (and its env id +
 // type) from the globally-unique opaqueId, so this route runs no env query.
 export async function action({ request, params }: ActionFunctionArgs) {
-  const admitted = await admitWebhookIngress(params);
+  const admitted = await admitWebhookIngress(params, request);
   if (admitted instanceof Response) return admitted;
   const { opaqueId } = admitted;
 
@@ -37,7 +42,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return toWebhookHttpResponse(webhookHttpResponseFor(result));
   }
 
-  const body = await readWebhookIngressRequest(request);
+  const body = await readWebhookIngressRequest(request, admitted);
   if (body instanceof Response) return body;
   const { rawBytes, headers } = body;
 
@@ -55,11 +60,21 @@ export async function action({ request, params }: ActionFunctionArgs) {
     case "secret_missing":
       logger.warn("webhook ingress rejected: signing secret unset", { opaqueId });
       break;
+    case "secret_adopted":
+      logger.info("webhook ingress adopted the provider's signing secret", { opaqueId });
+      break;
     case "verification_failed":
       logger.info("webhook ingress verification failed", { opaqueId });
       break;
     case "enqueue_failed":
       logger.error("webhook ingress enqueue failed", { opaqueId, error: result.error });
+      break;
+    case "queue_full":
+    case "over_capacity":
+      logger.warn("webhook ingress refused: queue at capacity", {
+        opaqueId,
+        reason: result.outcome,
+      });
       break;
     default:
       break;

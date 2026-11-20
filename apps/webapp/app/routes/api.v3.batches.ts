@@ -28,6 +28,11 @@ import { ServiceValidationError } from "~/v3/services/baseService.server";
 import { OutOfEntitlementError } from "~/v3/services/triggerTask.server";
 import { engine } from "~/v3/runEngine.server";
 import { HeadersSchema } from "./api.v1.tasks.$taskId.trigger";
+import { publicTokenSubject } from "~/services/publicTokenSubject.server";
+import {
+  inheritedSourcePatClaim,
+  type RequestActor,
+} from "~/services/publicAccessTokenResponse.server";
 
 /**
  * Phase 1 of 2-phase batch API: Create a batch.
@@ -141,7 +146,8 @@ const { action, loader } = createActionApiRoute(
           responseBody,
           authentication.environment,
           ability,
-          triggerClient
+          triggerClient,
+          authentication.actor
         );
       },
     });
@@ -177,7 +183,8 @@ const { action, loader } = createActionApiRoute(
         batch,
         authentication.environment,
         ability,
-        triggerClient
+        triggerClient,
+        authentication.actor
       );
 
       return json(batch, {
@@ -251,7 +258,8 @@ async function responseHeaders(
   batch: CreateBatchResponse,
   environment: AuthenticatedEnvironment,
   ability: RbacAbility,
-  triggerClient?: string | null
+  triggerClient: string | null | undefined,
+  actor: RequestActor | undefined
 ): Promise<Record<string, string>> {
   // Browser clients need a delegated token for phase two because they must not
   // retain a private API key. Selected-task credentials only receive read access
@@ -261,15 +269,16 @@ async function responseHeaders(
   const jwt = await generateJWT({
     secretKey: extractJwtSigningSecretKey(environment),
     payload: {
-      sub: environment.id,
+      sub: publicTokenSubject(environment.id),
       pub: true,
       scopes,
+      ...inheritedSourcePatClaim(actor),
     },
     expirationTime: "1h",
   });
 
   return {
-    "x-trigger-jwt-claims": JSON.stringify({ sub: environment.id, pub: true }),
+    "x-trigger-jwt-claims": JSON.stringify({ sub: publicTokenSubject(environment.id), pub: true }),
     "x-trigger-jwt": jwt,
   };
 }

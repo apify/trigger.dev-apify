@@ -19,6 +19,7 @@ import { flushSync } from "react-dom";
 import { useTypedFetcher } from "remix-typedjson";
 import simplur from "simplur";
 import { AISparkleIcon } from "~/assets/icons/AISparkleIcon";
+import { WatchQueryButton, type WatchQueryAnalysis } from "~/components/alerts/WatchQueryButton";
 import { ChartConfigPanel, defaultChartConfig } from "~/components/code/ChartConfigPanel";
 import { autoFormatSQL, TSQLEditor } from "~/components/code/TSQLEditor";
 import { PageBody, PageContainer } from "~/components/layout/AppLayout";
@@ -97,6 +98,7 @@ type QueryActionResponse = {
   queryId?: string | null;
   periodClipped: number | null;
   maxQueryPeriod?: number;
+  alertAnalysis?: WatchQueryAnalysis | null;
 };
 
 type QueryEditorMode =
@@ -143,6 +145,8 @@ export type QueryEditorProps = {
   // Max period days (from plan)
   maxPeriodDays?: number;
 
+  watchAlertsPath?: string;
+
   // Render prop for save functionality - receives current data, returns ReactNode
   save?: (data: QueryEditorSaveData) => ReactNode;
   onClose?: () => void;
@@ -153,6 +157,7 @@ interface QueryEditorFormHandle {
   setQuery: (query: string) => void;
   setScope: (scope: QueryScope) => void;
   getQuery: () => string;
+  getPeriod: () => string;
   setTimeFilter: (filter: { period?: string; from?: string; to?: string }) => void;
 }
 
@@ -169,6 +174,7 @@ const QueryEditorForm = forwardRef<
     isAdmin: boolean;
     queryActionUrl: string;
     maxPeriodDays?: number;
+    watchAlertsPath?: string;
     onQuerySubmit?: () => void;
     onHistorySelected?: (item: QueryHistoryItem) => void;
   }
@@ -183,6 +189,7 @@ const QueryEditorForm = forwardRef<
     isAdmin,
     queryActionUrl,
     maxPeriodDays,
+    watchAlertsPath,
     onQuerySubmit,
     onHistorySelected,
   },
@@ -223,13 +230,14 @@ const QueryEditorForm = forwardRef<
       setQuery,
       setScope,
       getQuery: () => query,
+      getPeriod: () => period ?? defaultPeriod,
       setTimeFilter: (filter: { period?: string; from?: string; to?: string }) => {
         setPeriod(filter.period);
         setFrom(filter.from);
         setTo(filter.to);
       },
     }),
-    [query]
+    [query, period, defaultPeriod]
   );
 
   const handleHistorySelected = useCallback(
@@ -327,6 +335,13 @@ const QueryEditorForm = forwardRef<
               maxPeriodDays={maxPeriodDays}
             />
           )}
+          {watchAlertsPath ? (
+            <WatchQueryButton
+              alertsPath={watchAlertsPath}
+              period={period ?? defaultPeriod}
+              watch={fetcher.data?.alertAnalysis}
+            />
+          ) : null}
           <Button
             type="submit"
             variant="primary/small"
@@ -370,6 +385,7 @@ export function QueryEditor({
   queryActionUrl,
   mode,
   maxPeriodDays,
+  watchAlertsPath,
   save,
   onClose,
 }: QueryEditorProps) {
@@ -650,6 +666,7 @@ export function QueryEditor({
                   isAdmin={isAdmin}
                   queryActionUrl={queryActionUrl}
                   maxPeriodDays={maxPeriodDays}
+                  watchAlertsPath={watchAlertsPath}
                   onQuerySubmit={handleQuerySubmit}
                   onHistorySelected={handleHistorySelected}
                 />
@@ -794,6 +811,8 @@ export function QueryEditor({
                             }
                             // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
                             query={editorRef.current?.getQuery() ?? defaultQuery}
+                            // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
+                            period={editorRef.current?.getPeriod() ?? defaultPeriod}
                             data={{
                               rows: results.rows,
                               columns: results.columns,
@@ -849,6 +868,8 @@ export function QueryEditor({
                           columns={results.columns}
                           // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
                           query={editorRef.current?.getQuery() ?? defaultQuery}
+                          // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
+                          period={editorRef.current?.getPeriod() ?? defaultPeriod}
                           chartConfig={chartConfig}
                           onChartConfigChange={handleChartConfigChange}
                           queryTitle={queryTitle}
@@ -899,6 +920,8 @@ export function QueryEditor({
                           columns={results.columns}
                           // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
                           query={editorRef.current?.getQuery() ?? defaultQuery}
+                          // oxlint-disable-next-line react/refs -- This ref intentionally coordinates an imperative integration outside React state.
+                          period={editorRef.current?.getPeriod() ?? defaultPeriod}
                           bigNumberConfig={bigNumberConfig}
                           onBigNumberConfigChange={setBigNumberConfig}
                           queryTitle={queryTitle}
@@ -1179,6 +1202,7 @@ function ResultsChart({
   rows,
   columns,
   query,
+  period,
   chartConfig,
   onChartConfigChange,
   queryTitle,
@@ -1189,6 +1213,7 @@ function ResultsChart({
   rows: Record<string, unknown>[];
   columns: OutputColumnMetadata[];
   query?: string;
+  period?: string;
   chartConfig: ChartConfiguration;
   onChartConfigChange: (config: ChartConfiguration) => void;
   queryTitle: string | null;
@@ -1210,6 +1235,7 @@ function ResultsChart({
               />
             }
             query={query}
+            period={period}
             data={{
               rows,
               columns,
@@ -1247,6 +1273,7 @@ function ResultsBigNumber({
   rows,
   columns,
   query,
+  period,
   bigNumberConfig,
   onBigNumberConfigChange,
   queryTitle,
@@ -1257,6 +1284,7 @@ function ResultsBigNumber({
   rows: Record<string, unknown>[];
   columns: OutputColumnMetadata[];
   query?: string;
+  period?: string;
   bigNumberConfig: BigNumberConfiguration;
   onBigNumberConfigChange: (config: BigNumberConfiguration) => void;
   queryTitle: string | null;
@@ -1287,6 +1315,7 @@ function ResultsBigNumber({
               />
             }
             query={query}
+            period={period}
             data={{
               rows,
               columns,

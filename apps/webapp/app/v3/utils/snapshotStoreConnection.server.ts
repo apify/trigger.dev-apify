@@ -1,10 +1,10 @@
 import { createRedisClusterClient, type Cluster } from "@internal/redis";
 import { RedisSnapshotStore, type SnapshotStoreMetrics } from "@internal/run-store";
 
-const COMMAND_TIMEOUT_MS = 500;
+const DEFAULT_COMPLETED_TTL_MS = 4 * 24 * 60 * 60 * 1_000;
+const COMMAND_TIMEOUT_MS = 1_000;
 const CONNECT_TIMEOUT_MS = 500;
 const POLICY_CHECK_INTERVAL_MS = 30_000;
-const COMPLETED_TTL_MS = 14 * 24 * 60 * 60 * 1_000;
 
 /** Infrastructure only. Rollout modes belong to the existing polled flags, not this URL. */
 export function snapshotClusterOptions(endpoint: string) {
@@ -18,11 +18,20 @@ export function snapshotClusterOptions(endpoint: string) {
   return {
     nodes: [{ host: url.hostname, port: Number(url.port || 6379) }],
     failFast: true,
-    clusterOptions: { lazyConnect: true, scaleReads: "master" as const },
+    clusterOptions: {
+      lazyConnect: true,
+      scaleReads: "master" as const,
+      ...(url.protocol === "rediss:" && {
+        // Preserve the seed hostname; AWS TLS certificates do not identify private IPs.
+        dnsLookup: (address: string, callback: (err: Error | null, address: string) => void) =>
+          callback(null, address),
+      }),
+    },
     redisOptions: {
       username: url.username ? decodeURIComponent(url.username) : undefined,
       password: url.password ? decodeURIComponent(url.password) : undefined,
-      tls: url.protocol === "rediss:" ? {} : undefined,
+      // Discovered nodes can be IPs too; verify them against the configured cluster hostname.
+      tls: url.protocol === "rediss:" ? { servername: url.hostname } : undefined,
       commandTimeout: COMMAND_TIMEOUT_MS,
       connectTimeout: CONNECT_TIMEOUT_MS,
     },
@@ -36,7 +45,12 @@ export function snapshotClusterOptions(endpoint: string) {
  */
 export function createSnapshotConnection(
   endpoint: string,
-  options: { metrics?: SnapshotStoreMetrics; onError?: (error: Error) => void } = {}
+  options: {
+    metrics?: SnapshotStoreMetrics;
+    onError?: (error: Error) => void;
+    /** How long a finished run's snapshot state stays in the store. */
+    completedTtlMs?: number;
+  } = {}
 ) {
   const clientOptions = snapshotClusterOptions(endpoint);
   let client: Cluster | undefined;
@@ -105,7 +119,7 @@ export function createSnapshotConnection(
     getStore: () =>
       (store ??= new RedisSnapshotStore({
         client: getClient(),
-        completedTtlMs: COMPLETED_TTL_MS,
+        completedTtlMs: options.completedTtlMs ?? DEFAULT_COMPLETED_TTL_MS,
         beforeCommand,
         metrics: options.metrics,
       })),

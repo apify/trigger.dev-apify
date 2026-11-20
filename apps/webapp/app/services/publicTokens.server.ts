@@ -3,15 +3,17 @@ import type { RoleBaseAccessController } from "@trigger.dev/rbac";
 import { resolveJwtSigningKey, scopesWithinAbility } from "@trigger.dev/rbac";
 import { json } from "@remix-run/server-runtime";
 import { z } from "zod";
-import { isApiKeyInGraceWindow, presentedBearerToken } from "~/services/apiKeyGraceWindow.server";
+import { presentedBearerToken } from "~/services/apiKeyGraceWindow.server";
 import { apiKeyTelemetry, type ApiKeyTelemetry } from "~/services/apiKeyTelemetry.server";
 import { rbac } from "~/services/rbac.server";
+import { authenticateBearerWithTelemetry } from "~/services/authTelemetry.server";
+import { publicTokenSubject } from "~/services/publicTokenSubject.server";
 
 // Public access tokens may be valid for at most 30 days.
 const MAX_PUBLIC_TOKEN_LIFETIME_SECONDS = 30 * 24 * 60 * 60;
 
 const RequestBodySchema = z.object({
-  scopes: z.array(z.string()).min(1),
+  scopes: z.array(z.string()),
   expirationTime: z.union([z.string(), z.number()]).optional(),
   oneTimeUse: z.boolean().optional(),
   realtime: z
@@ -56,23 +58,28 @@ function expirationTimestamp(expirationTime: string | number, now: number): numb
 export async function handlePublicTokenRequest(
   request: Request,
   controller: Pick<RoleBaseAccessController, "authenticateBearer"> = rbac,
-  telemetryRecorder: ApiKeyTelemetry = apiKeyTelemetry,
-  graceWindowLookup: (apiKey: string) => Promise<boolean> = isApiKeyInGraceWindow
+  telemetryRecorder: ApiKeyTelemetry = apiKeyTelemetry
 ) {
-  // Public JWTs are intentionally not enabled here. Only API keys may mint tokens.
-  const authResult = await controller.authenticateBearer(request);
+  const presentedApiKey = presentedBearerToken(request);
+  // Public JWTs cannot mint more tokens. Run tokens use the shared host verifier.
+  const authResult = await authenticateBearerWithTelemetry(
+    request,
+    { allowJWT: false },
+    controller
+  );
   if (!authResult.ok) {
     return json({ error: authResult.error }, { status: authResult.status });
   }
 
-  // Additional keys revoke immediately and are not stored in RevokedApiKey. Root keys use a
-  // rotation grace window, but must not use it to mint a token signed by the replacement key.
-  if (authResult.subject.type === "user") {
-    const presentedApiKey = presentedBearerToken(request);
-    if (presentedApiKey && (await graceWindowLookup(presentedApiKey))) {
-      telemetryRecorder.recordPublicTokenMint("rejected", "revoked_key");
-      return json({ error: "Invalid API key" }, { status: 401 });
-    }
+  // Root callers sign with the authenticated key, never its replacement, so tokens minted
+  // during rotation stop authenticating when that key's grace period ends.
+  const signingKey =
+    authResult.subject.type === "user"
+      ? presentedApiKey
+      : resolveJwtSigningKey(authResult.environment);
+  if (!signingKey) {
+    telemetryRecorder.recordPublicTokenMint("rejected");
+    return json({ error: "Invalid API key" }, { status: 401 });
   }
 
   let body: unknown;
@@ -126,9 +133,9 @@ export async function handlePublicTokenRequest(
   let token: string;
   try {
     token = await generateJWT({
-      secretKey: resolveJwtSigningKey(authResult.environment),
+      secretKey: signingKey,
       payload: {
-        sub: authResult.environment.id,
+        sub: publicTokenSubject(authResult.environment.id),
         pub: true,
         scopes: parsedBody.data.scopes,
         ...(parsedBody.data.oneTimeUse ? { otu: true } : {}),

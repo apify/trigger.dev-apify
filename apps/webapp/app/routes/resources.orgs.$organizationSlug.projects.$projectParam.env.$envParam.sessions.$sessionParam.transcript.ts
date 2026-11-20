@@ -19,10 +19,10 @@ const SearchParamsSchema = z.object({
   before: z.string().optional(),
 });
 
-// GET: one earlier page of a Session's saved transcript, for the Agent view's
-// "load earlier messages" control. Dashboard-auth counterpart to the public
-// API's `/api/v1/sessions/:sessionId/transcript`; the presenter seeds the most
-// recent page on first render and this serves the pages before it.
+// GET: a page of a Session's saved transcript. Without `before` it's the most
+// recent page, which the Conversation tab fetches when the session page opened
+// on the Trace tab; with `before`, an earlier page for "load earlier messages".
+// Dashboard-auth counterpart to the public API's `/api/v1/sessions/:sessionId/transcript`.
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const userId = await requireUserId(request);
   const { organizationSlug, projectParam, envParam } = EnvironmentParamSchema.parse(params);
@@ -46,7 +46,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     return json({ error: "Session not found" }, { status: 404 });
   }
 
-  const seed = await readSessionTranscriptSeed({
+  const read = await readSessionTranscriptSeed({
     session,
     projectRef: project.externalRef,
     envSlug: environment.slug,
@@ -54,8 +54,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     before,
   });
 
+  if (read.kind === "failed") {
+    return json({ error: "Couldn't read the transcript" }, { status: 502 });
+  }
+
+  const seed = read.kind === "seed" ? read.seed : undefined;
+  // `lastOutEventId` lets a first page seed the conversation and resume its stream after it.
   return json({
     messages: seed?.messages ?? [],
     nextCursor: seed?.nextCursor,
+    lastOutEventId: seed?.lastOutEventId,
   });
 }

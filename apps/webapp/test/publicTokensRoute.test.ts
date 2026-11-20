@@ -6,6 +6,7 @@ import rbacPlugin, { type RbacAbility, type RoleBaseAccessController } from "@tr
 import { describe, expect, it, vi } from "vitest";
 import type { ApiKeyTelemetry } from "~/services/apiKeyTelemetry.server";
 import { handlePublicTokenRequest } from "~/services/publicTokens.server";
+import { RUN_TOKEN_TTL_SECONDS, runTokenScopes } from "~/services/oidc/runTokenClaims";
 import { generateAdditionalApiKey, generateRootApiKey, hashApiKey } from "~/utils/apiKeys";
 import { createTestOrgProjectWithMember, uniqueId } from "./fixtures/environmentVariablesFixtures";
 
@@ -35,7 +36,7 @@ const permissiveAbility: RbacAbility = {
 
 function controllerWithAbility(
   ability: RbacAbility,
-  subject: "root" | "additional" = "additional"
+  subject: "root" | "additional" | "run" = "additional"
 ) {
   return {
     async authenticateBearer() {
@@ -49,12 +50,19 @@ function controllerWithAbility(
                 userId: "user_test",
                 organizationId: "org_test",
               }
-            : {
-                type: "apiKey" as const,
-                apiKeyId: "key_test",
-                restricted: ability !== permissiveAbility,
-                organizationId: "org_test",
-              },
+            : subject === "run"
+              ? {
+                  type: "runToken" as const,
+                  runId: "run_test",
+                  environmentId: environment.id,
+                  organizationId: "org_test",
+                }
+              : {
+                  type: "apiKey" as const,
+                  apiKeyId: "key_test",
+                  restricted: ability !== permissiveAbility,
+                  organizationId: "org_test",
+                },
         ability,
       };
     },
@@ -74,17 +82,14 @@ function telemetryRecorder(): ApiKeyTelemetry {
 
 describe("POST /api/v1/auth/public-tokens", () => {
   it("lets root and unrestricted additional keys mint arbitrary scopes", async () => {
-    const graceWindowLookup = vi.fn().mockResolvedValue(false);
-
     for (const controller of [
       controllerWithAbility(permissiveAbility, "root"),
       controllerWithAbility(permissiveAbility, "additional"),
     ]) {
       const response = await handlePublicTokenRequest(
-        request({ scopes: ["read:runs", "custom:resources:value"] }),
+        request({ scopes: ["read:runs", "custom:resources:value"] }, environment.apiKey),
         controller,
-        telemetryRecorder(),
-        graceWindowLookup
+        telemetryRecorder()
       );
       expect(response.status).toBe(200);
 
@@ -98,40 +103,34 @@ describe("POST /api/v1/auth/public-tokens", () => {
         scopes: ["read:runs", "custom:resources:value"],
       });
     }
-
-    expect(graceWindowLookup).toHaveBeenCalledTimes(1);
-    expect(graceWindowLookup).toHaveBeenCalledWith("tr_prod_test");
   });
 
-  it("rejects root keys in their rotation grace window", async () => {
-    const telemetry = telemetryRecorder();
-    const graceWindowLookup = vi.fn().mockResolvedValue(true);
+  it("delegates run-token abilities with the existing public-token lifetime", async () => {
     const response = await handlePublicTokenRequest(
-      request({ scopes: ["read:runs"] }),
-      controllerWithAbility(permissiveAbility, "root"),
-      telemetry,
-      graceWindowLookup
-    );
-
-    expect(response.status).toBe(401);
-    await expect(responseJson(response)).resolves.toEqual({ error: "Invalid API key" });
-    expect(graceWindowLookup).toHaveBeenCalledTimes(1);
-    expect(graceWindowLookup).toHaveBeenCalledWith("tr_prod_test");
-    expect(telemetry.recordPublicTokenMint).toHaveBeenCalledTimes(1);
-    expect(telemetry.recordPublicTokenMint).toHaveBeenCalledWith("rejected", "revoked_key");
-  });
-
-  it("does not apply the root rotation check to additional keys", async () => {
-    const graceWindowLookup = vi.fn().mockResolvedValue(true);
-    const response = await handlePublicTokenRequest(
-      request({ scopes: ["read:runs"] }),
-      controllerWithAbility(permissiveAbility, "additional"),
-      telemetryRecorder(),
-      graceWindowLookup
+      request({ scopes: ["read:runs:run_other"], oneTimeUse: true }, undefined, "25d"),
+      controllerWithAbility(buildJwtAbility(runTokenScopes()), "run")
     );
 
     expect(response.status).toBe(200);
-    expect(graceWindowLookup).not.toHaveBeenCalled();
+    const { token } = await responseJson(response);
+    const validation = await validateJWT(token, environment.apiKey);
+    expect(validation.ok).toBe(true);
+    if (!validation.ok) return;
+    expect(validation.payload).toMatchObject({
+      sub: environment.id,
+      pub: true,
+      otu: true,
+      scopes: ["read:runs:run_other"],
+    });
+    expect(validation.payload.exp! - Math.floor(Date.now() / 1000)).toBeGreaterThan(
+      RUN_TOKEN_TTL_SECONDS
+    );
+
+    const denied = await handlePublicTokenRequest(
+      request({ scopes: ["write:runs:run_other"] }),
+      controllerWithAbility(buildJwtAbility(["write:runs:run_test"]), "run")
+    );
+    expect(denied.status).toBe(403);
   });
 
   it("records successful and rejected mint outcomes", async () => {
@@ -193,13 +192,22 @@ describe("POST /api/v1/auth/public-tokens", () => {
     });
   });
 
-  it("rejects empty scopes", async () => {
+  // Catches: empty scopes becoming an admin grant during server minting.
+  it("mints empty scopes without granting permissions", async () => {
     const response = await handlePublicTokenRequest(
       request({ scopes: [] }),
-      controllerWithAbility(permissiveAbility)
+      controllerWithAbility(buildJwtAbility(runTokenScopes()), "run")
     );
 
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(200);
+    const { token } = await responseJson(response);
+    const validation = await validateJWT(token, environment.apiKey);
+    expect(validation.ok).toBe(true);
+    if (!validation.ok) return;
+    expect(validation.payload.scopes).toEqual([]);
+    const ability = buildJwtAbility(validation.payload.scopes as string[]);
+    expect(ability.can("read", { type: "runs", id: "run_test" })).toBe(false);
+    expect(ability.can("trigger", { type: "tasks", id: "task_test" })).toBe(false);
   });
 
   it("rejects expirations longer than 30 days", async () => {

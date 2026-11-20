@@ -4,8 +4,18 @@ import { CliApiClient } from "../apiClient.js";
 import { CLOUD_API_URL } from "../consts.js";
 import { readAuthConfigProfile, writeAuthConfigProfile } from "../utilities/configFiles.js";
 import { NotAccessTokenError, validateAccessToken } from "../utilities/accessTokens.js";
-import type { LoginResult } from "../utilities/session.js";
-import { getPersonalAccessToken } from "../commands/login.js";
+import { CLI_LOGIN_EXPIRED_CODE, type LoginResult } from "../utilities/session.js";
+import type { CreateAuthorizationCodeRequest } from "@trigger.dev/core/v3";
+import {
+  AUTHORIZATION_CODE_TTL_MS,
+  exchangeApprovalCode,
+  getPersonalAccessToken,
+} from "../commands/login.js";
+import {
+  createPkcePair,
+  listenForApprovalCallback,
+  waitForApprovalCode,
+} from "../utilities/loginApproval.js";
 import open from "open";
 import pRetry from "p-retry";
 import type { McpContext } from "./context.js";
@@ -71,71 +81,86 @@ export async function mcpAuth(options: McpAuthOptions): Promise<LoginResult> {
     );
     const userData = await apiClient.whoAmI();
 
-    if (!userData.success) {
+    if (userData.success) {
+      return {
+        ok: true as const,
+        profile: options?.profile ?? "default",
+        userId: userData.data.userId,
+        email: userData.data.email,
+        dashboardUrl: userData.data.dashboardUrl,
+        auth: {
+          accessToken: authConfig.accessToken,
+          apiUrl: authConfig.apiUrl ?? opts.defaultApiUrl,
+          tokenType: "personal" as const,
+        },
+      };
+    }
+
+    // A login that went unused for too long is replaced by the login flow below.
+    if (userData.errorCode !== CLI_LOGIN_EXPIRED_CODE) {
       throw new Error(userData.error);
     }
-
-    return {
-      ok: true as const,
-      profile: options?.profile ?? "default",
-      userId: userData.data.userId,
-      email: userData.data.email,
-      dashboardUrl: userData.data.dashboardUrl,
-      auth: {
-        accessToken: authConfig.accessToken,
-        apiUrl: authConfig.apiUrl ?? opts.defaultApiUrl,
-        tokenType: "personal" as const,
-      },
-    };
   }
 
-  const apiClient = new CliApiClient(authConfig?.apiUrl ?? opts.defaultApiUrl);
+  // Log in again against the profile's own server, not the default one.
+  const loginApiUrl = authConfig?.apiUrl ?? opts.defaultApiUrl;
+  const apiClient = new CliApiClient(loginApiUrl);
 
-  //generate authorization code
-  const authorizationCodeResult = await createAuthorizationCode(apiClient);
+  const callback = await listenForApprovalCallback("Return to your MCP client to continue.");
 
-  const url = new URL(authorizationCodeResult.url);
+  let indexResult: { token: string; obfuscatedToken: string };
 
-  url.searchParams.set("source", "mcp");
+  try {
+    const { codeVerifier, codeChallenge } = createPkcePair();
+    const authorizationCodeResult = await createAuthorizationCode(apiClient, {
+      codeChallenge,
+      codeChallengeMethod: "S256",
+      callbackPort: callback.port,
+    });
 
-  const clientName = options.server.server.getClientVersion()?.name;
+    const url = new URL(authorizationCodeResult.url);
 
-  if (clientName) {
-    url.searchParams.set("clientName", clientName);
-  }
-  // Only elicitInput if the client has the elicitation capability
+    url.searchParams.set("source", "mcp");
 
-  // Elicit the user to visit the authorization code URL
-  const allowLogin = await askForLoginPermission(opts.server, url.toString());
+    const clientName = options.server.server.getClientVersion()?.name;
 
-  if (!allowLogin) {
-    return {
-      ok: false as const,
-      error: "User did not allow login",
-    };
-  }
-
-  // Open the authorization code URL in the browser
-  await open(url.toString());
-
-  // Poll for the personal access token
-  const indexResult = await pRetry(
-    () => getPersonalAccessToken(apiClient, authorizationCodeResult.authorizationCode),
-    {
-      //poll at a fixed 1s interval. ~5 min window so the user has time to
-      //approve the consent screen; stays within the code's 10-min validity.
-      factor: 1,
-      retries: 300,
-      minTimeout: 1000,
+    if (clientName) {
+      url.searchParams.set("clientName", clientName);
     }
-  );
 
-  writeAuthConfigProfile(
-    { accessToken: indexResult.token, apiUrl: opts.defaultApiUrl },
-    options?.profile
-  );
+    const allowLogin = await askForLoginPermission(opts.server, url.toString());
 
-  const client = new CliApiClient(opts.defaultApiUrl, indexResult.token);
+    if (!allowLogin) {
+      return {
+        ok: false as const,
+        error: "User did not allow login",
+      };
+    }
+
+    await open(url.toString());
+
+    indexResult =
+      authorizationCodeResult.approval === "callback"
+        ? await exchangeApprovalCode(
+            apiClient,
+            { authorizationCode: authorizationCodeResult.authorizationCode, codeVerifier },
+            await waitForApprovalCode(
+              callback,
+              AUTHORIZATION_CODE_TTL_MS,
+              "Login timed out waiting for the browser to approve it. Try again, or log in from a terminal with `trigger.dev login --no-browser`."
+            )
+          )
+        : await pRetry(
+            () => getPersonalAccessToken(apiClient, authorizationCodeResult.authorizationCode),
+            { factor: 1, retries: 300, minTimeout: 1000 }
+          );
+  } finally {
+    callback.close();
+  }
+
+  writeAuthConfigProfile({ accessToken: indexResult.token, apiUrl: loginApiUrl }, options?.profile);
+
+  const client = new CliApiClient(loginApiUrl, indexResult.token);
   const userData = await client.whoAmI();
 
   if (!userData.success) {
@@ -150,14 +175,17 @@ export async function mcpAuth(options: McpAuthOptions): Promise<LoginResult> {
     dashboardUrl: userData.data.dashboardUrl,
     auth: {
       accessToken: indexResult.token,
-      apiUrl: opts.defaultApiUrl,
+      apiUrl: loginApiUrl,
       tokenType: "personal" as const,
     },
   };
 }
 
-async function createAuthorizationCode(apiClient: CliApiClient) {
-  const authorizationCodeResult = await apiClient.createAuthorizationCode();
+async function createAuthorizationCode(
+  apiClient: CliApiClient,
+  body: CreateAuthorizationCodeRequest
+) {
+  const authorizationCodeResult = await apiClient.createAuthorizationCode(body);
 
   if (!authorizationCodeResult.success) {
     throw new Error(`Failed to create authorization code\n${authorizationCodeResult.error}`);

@@ -1,4 +1,10 @@
-import type { Organization, OrgMember, Project } from "@trigger.dev/database";
+import type {
+  Organization,
+  OrgMember,
+  PrismaClientOrTransaction,
+  Project,
+} from "@trigger.dev/database";
+import { tryCatch } from "@trigger.dev/core/utils";
 import { z } from "zod";
 import { Prisma as PrismaNamespace, type Prisma, prisma } from "~/db.server";
 import {
@@ -6,10 +12,20 @@ import {
   memberDevelopmentEnvironmentWhere,
 } from "./organization.server";
 import { customAlphabet } from "nanoid";
+import { isOrganizationJoinAllowed } from "~/services/accessPolicy.server";
+import { auditLogs } from "~/services/auditLogs/auditLogs.server";
+import { userActor } from "~/services/credentialFingerprints.server";
+import { enqueueAttioMemberSync } from "~/services/attio.server";
 import { logger } from "~/services/logger.server";
 import { getDefaultEnvironmentConcurrencyLimit } from "~/services/platform.v3.server";
 import { rbac } from "~/services/rbac.server";
 import { ssoController } from "~/services/sso.server";
+import {
+  auditRoleName,
+  inviteAuditTarget,
+  memberAuditTarget,
+  recordMemberAuditEventInBackground,
+} from "./memberAudit.server";
 
 import { boundedIn } from "@trigger.dev/database";
 export const INVITE_NOT_FOUND = "Invite not found";
@@ -22,6 +38,9 @@ export const ENV_SETUP_INCOMPLETE =
 export const MembershipSourceSchema = z.enum(["invite", "sso_jit", "directory_sync", "manual"]);
 
 export type MembershipSource = z.infer<typeof MembershipSourceSchema>;
+
+// Stored on OrgMember.joinMethod. "created" = the member who created the organization.
+export type OrgMemberJoinMethod = "created" | MembershipSource;
 
 /** Thrown when provisioning fails partway through; the membership is still valid. */
 export class DevEnvironmentProvisioningError extends Error {
@@ -170,6 +189,8 @@ export async function inviteMembers({
   // (unique org+email) — skip it so one duplicate can't fail the batch, and
   // don't return it: callers email exactly what they created, and re-sending an
   // already-pending invite is the dedicated resend flow's job (its own cooldown).
+  // Looked up once, by the first event that needs it, after the invites are returned.
+  let invitedRoleName: Promise<string | null> | undefined;
   const created: Prisma.OrgMemberInviteGetPayload<{
     include: { organization: true; inviter: true };
   }>[] = [];
@@ -209,6 +230,29 @@ export async function inviteMembers({
         },
       });
       created.push(invite);
+      const invitedRoleId = invite.rbacRoleId;
+      if (invitedRoleId) {
+        recordMemberAuditEventInBackground(
+          async () => ({
+            category: "members",
+            action: "member.invited",
+            organizationId: org.id,
+            target: inviteAuditTarget(invite),
+            changes: {
+              role: await (invitedRoleName ??= auditRoleName(org.id, invitedRoleId)),
+            },
+          }),
+          { action: "member.invited", organizationId: org.id }
+        );
+      } else {
+        auditLogs.record({
+          category: "members",
+          action: "member.invited",
+          organizationId: org.id,
+          target: inviteAuditTarget(invite),
+          changes: null,
+        });
+      }
     } catch (error) {
       if (
         error instanceof PrismaNamespace.PrismaClientKnownRequestError &&
@@ -236,10 +280,27 @@ export async function getInviteFromToken({ token }: { token: string }) {
   });
 }
 
+// Invites match the address they were sent to, ignoring case. Don't use
+// Prisma's `equals` with `mode: "insensitive"` for this: it compiles to ILIKE,
+// so "_" and "%" in an address act as wildcards and `j_smith@` would match an
+// invite for `j.smith@`.
+function inviteEmailMatches(inviteEmail: string, userEmail: string) {
+  return inviteEmail.toLowerCase() === userEmail.toLowerCase();
+}
+
+async function findInviteIdsForEmail(client: PrismaClientOrTransaction, email: string) {
+  const rows = await client.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "OrgMemberInvite" WHERE lower("email") = ${email.toLowerCase()}
+  `;
+  return rows.map((row) => row.id);
+}
+
 export async function getUsersInvites({ email }: { email: string }) {
+  const inviteIds = await findInviteIdsForEmail(prisma, email);
+
   return await prisma.orgMemberInvite.findMany({
     where: {
-      email: { equals: email, mode: "insensitive" },
+      id: { in: boundedIn(inviteIds) },
       organization: {
         deletedAt: null,
       },
@@ -314,6 +375,7 @@ export async function provisionMemberDevelopmentEnvironments({
         project,
         member,
         maximumConcurrencyLimit,
+        createdBy: userActor(member.userId),
       });
 
       if (created) {
@@ -380,23 +442,46 @@ async function provisionInviteDevelopmentEnvironments(args: {
   }
 }
 
+/**
+ * Whether this call assigned the invite's role. The role is recorded by the request that assigned
+ * it: in `invite.accepted` when that request consumed the invite, otherwise here as
+ * `member.role_changed` (`recordRoleChange`). Concurrent accepts of one invite can consume it in one
+ * request and assign the role in another, in either order.
+ */
 async function assignInviteRbacRole({
   userId,
   organizationId,
   rbacRoleId,
   onlyWhenUnassigned,
+  recordRoleChange,
 }: {
   userId: string;
   organizationId: string;
   rbacRoleId: string;
   onlyWhenUnassigned: boolean;
-}) {
+  /** The member the role change event names, when this request didn't consume the invite. */
+  recordRoleChange?: { memberId: string; email: string };
+}): Promise<boolean> {
   try {
+    let roleBefore: { id: string; name: string } | null = null;
     if (onlyWhenUnassigned) {
       const currentRole = await rbac.getUserRole({ userId, organizationId });
       if (currentRole !== null) {
-        return;
+        return false;
       }
+    } else if (recordRoleChange && auditLogs.isRecordingEnabled()) {
+      // Best-effort, like setOrgMemberRole: a failed read records an unknown "before".
+      const [roleBeforeError, currentRole] = await tryCatch(
+        rbac.getUserRole({ userId, organizationId })
+      );
+      if (roleBeforeError) {
+        logger.warn("acceptInvite: failed to read the role before assigning the invite's role", {
+          organizationId,
+          userId,
+          error: roleBeforeError,
+        });
+      }
+      roleBefore = currentRole ?? null;
     }
 
     const roleResult = await rbac.setUserRole({
@@ -404,6 +489,26 @@ async function assignInviteRbacRole({
       organizationId,
       roleId: rbacRoleId,
     });
+    if (roleResult.ok && recordRoleChange && roleBefore?.id !== rbacRoleId) {
+      recordMemberAuditEventInBackground(
+        async () => ({
+          category: "members",
+          action: "member.role_changed",
+          organizationId,
+          target: memberAuditTarget({
+            id: recordRoleChange.memberId,
+            user: { email: recordRoleChange.email },
+          }),
+          changes: {
+            role: {
+              before: roleBefore?.name ?? null,
+              after: await auditRoleName(organizationId, rbacRoleId),
+            },
+          },
+        }),
+        { action: "member.role_changed", organizationId }
+      );
+    }
     if (!roleResult.ok) {
       if (roleResult.code === "last_owner") {
         logger.info("acceptInvite: kept last Owner, skipped RBAC role assignment", {
@@ -420,6 +525,7 @@ async function assignInviteRbacRole({
         });
       }
     }
+    return roleResult.ok;
   } catch (error) {
     logger.error("acceptInvite: RBAC role assignment threw", {
       organizationId,
@@ -430,6 +536,7 @@ async function assignInviteRbacRole({
           ? { name: error.name, message: error.message, stack: error.stack }
           : String(error),
     });
+    return false;
   }
 }
 
@@ -483,6 +590,7 @@ async function tryRecoverIncompleteInviteAccept({
     projects: missingProjects,
     maximumConcurrencyLimit,
   });
+  await enqueueAttioMemberSync({ organizationId, userId: user.id });
 
   return {
     remainingInvites: await getUsersInvites({ email: user.email }),
@@ -499,10 +607,9 @@ export async function acceptInvite({
   inviteId: string;
   organizationId?: string;
 }) {
-  const invite = await prisma.orgMemberInvite.findFirst({
+  const found = await prisma.orgMemberInvite.findFirst({
     where: {
       id: inviteId,
-      email: { equals: user.email, mode: "insensitive" },
       organization: {
         deletedAt: null,
       },
@@ -515,6 +622,7 @@ export async function acceptInvite({
       },
     },
   });
+  const invite = found && inviteEmailMatches(found.email, user.email) ? found : null;
 
   if (!invite) {
     if (organizationId) {
@@ -536,6 +644,9 @@ export async function acceptInvite({
   const membershipPolicy = await ssoController.getMembershipPolicy(invite.organizationId);
   if (membershipPolicy.isOk() && !membershipPolicy.value.manualMembershipAllowed) {
     throw new Error(INVITE_BLOCKED_DIRECTORY_MANAGED);
+  }
+  if (!(await isOrganizationJoinAllowed({ organizationId: invite.organizationId }))) {
+    throw new Error(INVITE_NOT_FOUND);
   }
 
   const maximumConcurrencyLimit = await getDefaultEnvironmentConcurrencyLimit(
@@ -560,6 +671,8 @@ export async function acceptInvite({
           organizationId: invite.organizationId,
           userId: user.id,
           role: invite.role,
+          invitedById: invite.inviterId,
+          joinMethod: "invite" satisfies OrgMemberJoinMethod,
         },
       });
       membershipCreated = true;
@@ -594,13 +707,15 @@ export async function acceptInvite({
 
   // Consume the invite only after development environments are provisioned so
   // a failed setup can be retried from /invites.
+  let inviteConsumed = false;
   try {
     await prisma.orgMemberInvite.delete({
       where: {
         id: inviteId,
-        email: { equals: user.email, mode: "insensitive" },
+        email: invite.email,
       },
     });
+    inviteConsumed = true;
   } catch (error) {
     if (
       !(error instanceof PrismaNamespace.PrismaClientKnownRequestError && error.code === "P2025")
@@ -609,16 +724,44 @@ export async function acceptInvite({
     }
   }
 
-  const remainingInvites = await getUsersInvites({ email: user.email });
-
-  if (invite.rbacRoleId) {
-    await assignInviteRbacRole({
+  const assignedRoleId =
+    invite.rbacRoleId &&
+    (await assignInviteRbacRole({
       userId: user.id,
       organizationId: invite.organization.id,
       rbacRoleId: invite.rbacRoleId,
       onlyWhenUnassigned: !membershipCreated,
-    });
+      recordRoleChange: inviteConsumed ? undefined : { memberId: member.id, email: user.email },
+    }))
+      ? invite.rbacRoleId
+      : null;
+
+  // Only the request that consumed the invite records it, with the invite's role when this request
+  // assigned it. A concurrent accept that assigns it instead records member.role_changed.
+  if (inviteConsumed) {
+    const accepted = {
+      category: "members",
+      action: "invite.accepted",
+      organizationId: invite.organizationId,
+      target: inviteAuditTarget(invite),
+    } as const;
+    if (assignedRoleId) {
+      recordMemberAuditEventInBackground(
+        async () => ({
+          ...accepted,
+          changes: { role: await auditRoleName(invite.organizationId, assignedRoleId) },
+        }),
+        { action: "invite.accepted", organizationId: invite.organizationId }
+      );
+    } else {
+      auditLogs.record(accepted);
+    }
   }
+
+  // After the role is applied, also when an earlier attempt already created the membership.
+  await enqueueAttioMemberSync({ organizationId: invite.organizationId, userId: user.id });
+
+  const remainingInvites = await getUsersInvites({ email: user.email });
 
   // Deliberate re-admission clears any sticky-removal tombstone so this
   // membership isn't shadowed by a prior removal (best-effort; no-op in OSS).
@@ -638,10 +781,15 @@ export async function declineInvite({
 }) {
   return await prisma.$transaction(async (tx) => {
     //1. delete invite
+    const invite = await tx.orgMemberInvite.findFirst({ where: { id: inviteId } });
+    if (!invite || !inviteEmailMatches(invite.email, user.email)) {
+      throw new Error(INVITE_NOT_FOUND);
+    }
+
     const declinedInvite = await tx.orgMemberInvite.delete({
       where: {
         id: inviteId,
-        email: { equals: user.email, mode: "insensitive" },
+        email: invite.email,
       },
       include: {
         organization: true,
@@ -651,7 +799,7 @@ export async function declineInvite({
     //2. check for other invites
     const remainingInvites = await tx.orgMemberInvite.findMany({
       where: {
-        email: { equals: user.email, mode: "insensitive" },
+        id: { in: boundedIn(await findInviteIdsForEmail(tx, user.email)) },
       },
     });
 
@@ -711,6 +859,13 @@ export async function revokeInvite({
     where: {
       id: invite.id,
     },
+  });
+
+  auditLogs.record({
+    category: "members",
+    action: "invite.revoked",
+    organizationId: invite.organization.id,
+    target: inviteAuditTarget(invite),
   });
 
   return { email: invite.email, organization: invite.organization };

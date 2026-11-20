@@ -11,7 +11,12 @@ import type {
   WebhookRoutingTarget,
   WebhookSubscriberResource,
 } from "@trigger.dev/core/v3";
-import { FILTER_AST_VERSION, tryCatch } from "@trigger.dev/core/v3";
+import {
+  FILTER_AST_VERSION,
+  SANDBOX_TRIGGER_SOURCE,
+  sandboxExecutionPolicy,
+  tryCatch,
+} from "@trigger.dev/core/v3";
 import { FilterParseError, parseFilter } from "@internal/webhook-engine";
 import {
   BackgroundWorkerId,
@@ -34,6 +39,7 @@ import { sanitizeQueueName } from "~/models/taskQueue.server";
 import type { AuthenticatedEnvironment } from "~/services/apiAuth.server";
 import { logger } from "~/services/logger.server";
 import { organizationHasWebhooksAccess } from "~/v3/webhooksAccess.server";
+import { sandboxTasksEnabled } from "~/v3/sandboxTasksFlag.server";
 import { safeEnvironmentLogFields } from "~/services/safeEnvironmentLog";
 import { syncTaskIdentifiers } from "~/services/taskIdentifierRegistry.server";
 import {
@@ -60,8 +66,7 @@ import { normalizeScheduleWindow } from "../scheduleWindow.server";
 import { resolveNewScheduleDefaultWindowSeconds } from "../scheduleDefaultWindow.server";
 import {
   assertCronMeetsFreeMinimum,
-  minimumWindowForNewSchedule,
-  resolveFreeSchedulePolicyContext,
+  resolvePlanState,
   resolveMinimumWindowOnUpdate,
 } from "../freeSchedulePolicy.server";
 import { calculateNextBuildVersion } from "../utils/calculateNextBuildVersion";
@@ -69,10 +74,10 @@ import { clampMaxDuration } from "../utils/maxDuration";
 import { BaseService, ServiceValidationError } from "./baseService.server";
 import { CheckScheduleService } from "./checkSchedule.server";
 import { CronPattern } from "../schedules";
-import { explicitWindowBelowMinimum } from "../explicitWindowBelowMinimum";
 import { projectPubSub } from "./projectPubSub.server";
 
 import { assertNoDuplicateTaskIds } from "./duplicateTaskIds.server";
+import { assertSourceFilesWithinLimits } from "../workerSourceFiles.server";
 import { stripBackgroundWorkerMetadataForStorage } from "./stripBackgroundWorkerMetadataForStorage.server";
 
 export type BackgroundWorkerWithWarnings = BackgroundWorker & {
@@ -94,7 +99,8 @@ export class CreateBackgroundWorkerService extends BaseService {
   public async call(
     projectRef: string,
     environment: AuthenticatedEnvironment,
-    body: CreateBackgroundWorkerRequestBody
+    body: CreateBackgroundWorkerRequestBody,
+    { restricted = false }: { restricted?: boolean } = {}
   ): Promise<BackgroundWorkerWithWarnings> {
     return this.traceWithEnv("call", environment, async (span) => {
       span.setAttribute("projectRef", projectRef);
@@ -122,15 +128,17 @@ export class CreateBackgroundWorkerService extends BaseService {
       });
 
       validateWorkerConcurrencyDeclarations(body.metadata);
+      // Before the worker row and the content-hash shortcut, so a rejected registration leaves
+      // nothing a same-content retry would accept.
+      body.metadata.tasks.forEach((task) => validateSandboxTask(task, environment));
+      await assertSourceFilesWithinLimits(body.metadata.sourceFiles);
 
       const latestBackgroundWorker = project.backgroundWorkers[0];
 
       // Validate before persisting a worker or accepting a matching hash from an earlier attempt.
-      const preparedSchedules = await prepareDeclarativeSchedules(
-        body.metadata.tasks,
-        environment,
-        this._prisma
-      );
+      const preparedSchedules = restricted
+        ? undefined
+        : await prepareDeclarativeSchedules(body.metadata.tasks, environment, this._prisma);
 
       if (latestBackgroundWorker?.contentHash === body.metadata.contentHash) {
         return { ...latestBackgroundWorker, warnings: [] };
@@ -220,14 +228,16 @@ export class CreateBackgroundWorkerService extends BaseService {
       }
 
       const [schedulesError, scheduleWarnings] = await tryCatch(
-        syncDeclarativeSchedules(
-          body.metadata.tasks,
-          backgroundWorker,
-          environment,
-          this._prisma,
-          scheduleEngine,
-          preparedSchedules
-        )
+        restricted
+          ? Promise.resolve([])
+          : syncDeclarativeSchedules(
+              body.metadata.tasks,
+              backgroundWorker,
+              environment,
+              this._prisma,
+              scheduleEngine,
+              preparedSchedules
+            )
       );
 
       if (schedulesError) {
@@ -256,16 +266,18 @@ export class CreateBackgroundWorkerService extends BaseService {
       }
 
       const [webhooksError] = await tryCatch(
-        syncDeclarativeWebhooks(
-          {
-            endpoints: body.metadata.webhookEndpoints,
-            subscribers: body.metadata.webhookSubscribers,
-          },
-          backgroundWorker,
-          environment,
-          this._prisma,
-          webhookPrisma
-        )
+        restricted
+          ? Promise.resolve()
+          : syncDeclarativeWebhooks(
+              {
+                endpoints: body.metadata.webhookEndpoints,
+                subscribers: body.metadata.webhookSubscribers,
+              },
+              backgroundWorker,
+              environment,
+              this._prisma,
+              webhookPrisma
+            )
       );
       if (webhooksError) {
         if (webhooksError instanceof ServiceValidationError) {
@@ -661,6 +673,9 @@ async function createWorkerTask(
     resolvedTtl =
       typeof task.ttl === "number" ? (stringifyDuration(task.ttl) ?? null) : (task.ttl ?? null);
 
+    validateSandboxTask(task, environment);
+    const executionPolicy = task.sandbox ? sandboxExecutionPolicy(task.sandbox) : undefined;
+
     let taskPersisted = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       const result = await prisma.backgroundWorkerTask.createMany({
@@ -679,6 +694,7 @@ async function createWorkerTask(
           machineConfig: task.machine,
           triggerSource: resolvedTriggerSource,
           config: task.agentConfig ? (task.agentConfig as any) : undefined,
+          ...(executionPolicy ? { executionMode: "SANDBOX" as const, executionPolicy } : {}),
           fileId: tasksToBackgroundFiles?.get(task.id) ?? null,
           maxDurationInSeconds: task.maxDuration ? clampMaxDuration(task.maxDuration) : null,
           ttl: resolvedTtl,
@@ -712,6 +728,7 @@ async function createWorkerTask(
       slug: task.id,
       ttl: resolvedTtl,
       triggerSource: resolvedTriggerSource,
+      executionPolicy: executionPolicy ?? null,
       queueId: queue.id,
       queueName: queue.name,
       gates: compiledGates.length > 0 ? compiledGates : (task.gates ?? null),
@@ -773,6 +790,23 @@ async function createWorkerQueues(
   }
 
   return allQueues;
+}
+
+/** Rejects a sandbox whose config an older CLI dropped, or whose organization lacks the flag. */
+export function validateSandboxTask(
+  task: Pick<TaskResource, "id" | "triggerSource" | "sandbox">,
+  environment: AuthenticatedEnvironment
+): void {
+  if (task.triggerSource === SANDBOX_TRIGGER_SOURCE && !task.sandbox) {
+    throw new ServiceValidationError(
+      `Task "${task.id}" is a sandbox, but this CLI version dropped its sandbox configuration. Update the trigger.dev CLI and deploy again.`
+    );
+  }
+  if (task.sandbox && !sandboxTasksEnabled(environment.organization.featureFlags)) {
+    throw new ServiceValidationError(
+      `Task "${task.id}" is a sandbox, but sandbox tasks are not enabled for this organization.`
+    );
+  }
 }
 
 /**
@@ -1377,63 +1411,21 @@ function scheduleWindowsEqual(
 function newDeclarativeSchedulePolicyWarning({
   taskId,
   explicitWindow,
-  cron,
-  timezone,
   defaultWindowDurationSeconds,
-  minimumWindowDurationSeconds,
 }: {
   taskId: string;
   explicitWindow: string | undefined;
-  cron: string;
-  timezone?: string | null;
   defaultWindowDurationSeconds: number | null;
-  minimumWindowDurationSeconds: number | null;
 }): BackgroundWorkerWarning | undefined {
   const defaultMinutes =
     defaultWindowDurationSeconds !== null
       ? Math.round(defaultWindowDurationSeconds / 60)
       : undefined;
-  const minimumMinutes =
-    minimumWindowDurationSeconds !== null
-      ? Math.round(minimumWindowDurationSeconds / 60)
-      : undefined;
-  const prefix = `Task \`${taskId}\``;
 
-  if (!explicitWindow) {
-    if (defaultMinutes && minimumMinutes) {
-      return {
-        code: "schedule_default_window",
-        message: `${prefix} got the ${defaultMinutes}-minute default cron window.`,
-      };
-    }
-    if (defaultMinutes) {
-      return {
-        code: "schedule_default_window",
-        message: `${prefix} got the ${defaultMinutes}-minute default cron window.`,
-      };
-    }
-    if (minimumMinutes) {
-      return {
-        code: "schedule_minimum_window",
-        message: `${prefix} got the minimum Free plan cron window of ${minimumMinutes} minutes.`,
-      };
-    }
-    return undefined;
-  }
-
-  if (
-    minimumMinutes &&
-    minimumWindowDurationSeconds !== null &&
-    explicitWindowBelowMinimum({
-      explicitWindow,
-      cron,
-      timezone,
-      minimumWindowDurationSeconds,
-    })
-  ) {
+  if (!explicitWindow && defaultMinutes) {
     return {
-      code: "schedule_minimum_window",
-      message: `${prefix} uses the Free plan ${minimumMinutes}-minute minimum window.`,
+      code: "schedule_default_window",
+      message: `Task \`${taskId}\` got the ${defaultMinutes}-minute default cron window.`,
     };
   }
 
@@ -1495,17 +1487,12 @@ async function prepareDeclarativeSchedules(
     return existing && existing.minimumWindowDurationSeconds !== null;
   });
 
-  // Restricted rows still check paid status with rollout off.
   const defaultWindowDurationSeconds = hasNewSchedules
     ? await resolveNewScheduleDefaultWindowSeconds(prisma, environment.organizationId)
     : null;
-  const policy =
-    hasNewSchedules || hasRestrictedSchedules
-      ? await resolveFreeSchedulePolicyContext(prisma, {
-          id: environment.organizationId,
-          featureFlags: environment.organization.featureFlags,
-        })
-      : undefined;
+  const planState = hasRestrictedSchedules
+    ? await resolvePlanState(environment.organizationId)
+    : "unknown";
 
   const preparedTasks = [];
   const warnings: BackgroundWorkerWarning[] = [];
@@ -1515,9 +1502,9 @@ async function prepareDeclarativeSchedules(
     const minimumWindowDurationSeconds = existingSchedule
       ? existingSchedule.minimumWindowDurationSeconds === null
         ? null
-        : resolveMinimumWindowOnUpdate(policy!, existingSchedule.minimumWindowDurationSeconds)
+        : resolveMinimumWindowOnUpdate(planState, existingSchedule.minimumWindowDurationSeconds)
             .minimumWindowDurationSeconds
-      : minimumWindowForNewSchedule(policy!, "DECLARATIVE");
+      : null;
 
     if (minimumWindowDurationSeconds !== null) {
       const cron = CronPattern.safeParse(task.schedule.cron);
@@ -1539,10 +1526,7 @@ async function prepareDeclarativeSchedules(
       const warning = newDeclarativeSchedulePolicyWarning({
         taskId: task.id,
         explicitWindow: task.schedule.window,
-        cron: task.schedule.cron,
-        timezone: task.schedule.timezone,
         defaultWindowDurationSeconds,
-        minimumWindowDurationSeconds,
       });
       if (warning) {
         warnings.push(warning);

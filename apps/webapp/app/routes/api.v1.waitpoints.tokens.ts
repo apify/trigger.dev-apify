@@ -24,6 +24,7 @@ import {
   createActionApiRoute,
   createLoaderApiRoute,
 } from "~/services/routeBuilders/apiBuilder.server";
+import { keyedWaitpointBudgetResponse } from "~/services/routeBuilders/keyedWaitpointBudget.server";
 import { parseDelay } from "~/utils/delays";
 import { resolveIdempotencyKeyTTL } from "~/utils/idempotencyKeys.server";
 import { engine } from "~/v3/runEngine.server";
@@ -33,6 +34,10 @@ export const loader = createLoaderApiRoute(
   {
     searchParams: ApiWaitpointListSearchParams,
     findResource: async () => 1, // This is a dummy function, we don't need to find a resource
+    authorization: {
+      action: "read",
+      resource: () => ({ type: "waitpoints" }),
+    },
   },
   async ({ searchParams, authentication }) => {
     const presenter = new ApiWaitpointListPresenter(undefined, undefined, {
@@ -51,6 +56,10 @@ const { action } = createActionApiRoute(
     body: CreateWaitpointTokenRequestBody,
     maxContentLength: 1024 * 10, // 10KB
     method: "POST",
+    authorization: {
+      action: "write",
+      resource: () => ({ type: "waitpoints" }),
+    },
   },
   async ({ authentication, body }) => {
     try {
@@ -107,6 +116,7 @@ const { action } = createActionApiRoute(
       const result = await engine.createManualWaitpoint({
         environmentId: authentication.environment.id,
         projectId: authentication.environment.projectId,
+        organizationId: authentication.environment.organization.id,
         idempotencyKey: body.idempotencyKey,
         idempotencyKeyExpiresAt,
         timeout,
@@ -126,7 +136,15 @@ const { action } = createActionApiRoute(
         {
           id: waitpointId,
           isCached: result.isCached,
-          url: generateHttpCallbackUrl(result.waitpoint.id, authentication.environment.apiKey),
+          url: generateHttpCallbackUrl(
+            result.waitpoint.id,
+            authentication.environment.apiKey,
+            (await engine.waitpointSystem.isWaitpointStoreEnabled(
+              authentication.environment.organization.id
+            ))
+              ? { environmentId: authentication.environment.id }
+              : undefined
+          ),
         },
         { status: 200, headers: $responseHeaders }
       );
@@ -134,6 +152,11 @@ const { action } = createActionApiRoute(
       if (error instanceof ServiceValidationError) {
         return json({ error: error.message }, { status: 422 });
       }
+      // Expected under load and retryable, so it is not reported as an error.
+      const busy = keyedWaitpointBudgetResponse(error, {
+        environmentId: authentication.environment.id,
+      });
+      if (busy) return busy;
 
       logger.error("Failed to create waitpoint token", {
         error,

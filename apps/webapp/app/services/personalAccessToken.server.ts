@@ -1,12 +1,45 @@
-import { type PersonalAccessToken, type User } from "@trigger.dev/database";
+import { json } from "@remix-run/server-runtime";
+import {
+  type PersonalAccessToken,
+  type PrismaClientOrTransaction,
+  type User,
+} from "@trigger.dev/database";
+import { compareCliLoginNetworks, needsNetworkConfirmation } from "./cliLoginNetwork.server";
+import type { CreateAuthorizationCodeRequest } from "@trigger.dev/core/v3";
+import cuid from "cuid";
 import { customAlphabet, nanoid } from "nanoid";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isIP } from "node:net";
 import { z } from "zod";
-import { prisma } from "~/db.server";
+import { $replica, prisma } from "~/db.server";
+import { noteAdminRequest, recordAdminPatCreated } from "./adminAudit/adminAuditContext.server";
+import {
+  type CredentialRevocation,
+  markCredentialHashRevoked,
+  saveCredentialFingerprint,
+  SYSTEM_ACTOR,
+  userActor,
+} from "./credentialFingerprints.server";
 import { logger } from "./logger.server";
+import { isMfaSetupRequired, mfaSetupRequiredMessage } from "./mfa/mfaRequirement.server";
 import { rbac } from "./rbac.server";
 import { decryptToken, encryptToken, hashToken } from "~/utils/tokens.server";
+import { EncryptedValueSchema as EncryptedSecretValueSchema } from "~/utils/encryptionKeyring.server";
 import { env } from "~/env.server";
-import { isUserActorToken, verifyUserActorToken, type UserActorClaims } from "@trigger.dev/rbac";
+import {
+  isPersonalAccessTokenActive,
+  isUserActorToken,
+  personalAccessTokenExpiry,
+  personalAccessTokenExpiryMessage,
+  personalAccessTokenValidUntil,
+  type PersonalAccessTokenExpiry,
+  verifyUserActorToken,
+  type UserActorClaims,
+} from "@trigger.dev/rbac";
+import { personalAccessTokensPath } from "~/utils/pathBuilder";
+import { PERSONAL_ACCESS_TOKEN_EXPIRING_SOON_DAYS } from "./personalAccessTokenExpiryEmails.server";
+import type { AdminAuditSourceEndpoint, AuditLogActor, AuditLogSource } from "@trigger.dev/plugins";
+import { auditLogs } from "./auditLogs/auditLogs.server";
 
 const tokenValueLength = 40;
 //lowercase only, removed 0 and l to avoid confusion
@@ -22,6 +55,8 @@ export const PAT_LAST_ACCESSED_THROTTLE_MS = 5 * 60 * 1000;
 // the mint and read paths can't drift.
 export const AUTHORIZATION_CODE_TTL_MS = 10 * 60 * 1000;
 
+const SECONDS_PER_DAY = 24 * 60 * 60;
+
 type CreatePersonalAccessTokenOptions = {
   name: string;
   userId: string;
@@ -31,9 +66,103 @@ type CreatePersonalAccessTokenOptions = {
   // the CLI auth-code path doesn't pass one (legacy behaviour
   // preserved — those PATs run with no explicit role).
   roleId?: string;
+  /** Where the mint came from, for the admin audit trail when the user is an admin. */
+  auditSource?: AdminAuditSourceEndpoint;
+  /** When the token stops working. Omitted for tokens that don't expire. */
+  expiresAt?: Date;
+  /** Seconds without use after which the token stops working. Omitted for no idle limit. */
+  idleTimeoutSeconds?: number;
+  /** The OAuth client this token is the grant for. */
+  oauthClientId?: string;
+  /** For callers inside a transaction, which record the audit entry once it commits. */
+  skipAudit?: boolean;
+  /** How the token was asked for, when the request doesn't say: the CLI login has no session. */
+  auditLogSource?: AuditLogSource;
 };
 
-/** Returns obfuscated access tokens that aren't revoked */
+/** The columns `personalAccessTokenExpiry` reads, for every lookup that checks expiry. */
+const expiryColumns = {
+  expiresAt: true,
+  idleTimeoutSeconds: true,
+  lastAccessedAt: true,
+  createdAt: true,
+} as const;
+
+export type PersonalAccessTokenExpiryOption = {
+  /** Lifetime in days. */
+  value: number;
+  label: string;
+};
+
+/**
+ * The lifetimes offered when creating a token on the dashboard, the preselected one, and the
+ * longest, which also bounds a custom date.
+ */
+export function personalAccessTokenExpiryOptions(): {
+  options: PersonalAccessTokenExpiryOption[];
+  defaultDays: number;
+  maxDays: number;
+} {
+  const days = env.PERSONAL_ACCESS_TOKEN_EXPIRY_DAYS;
+  const defaultDays = days.includes(env.PERSONAL_ACCESS_TOKEN_DEFAULT_EXPIRY_DAYS)
+    ? env.PERSONAL_ACCESS_TOKEN_DEFAULT_EXPIRY_DAYS
+    : days[0];
+  return {
+    options: days.map((value) => ({ value, label: expiryLabel(value) })),
+    defaultDays,
+    maxDays: Math.max(...days),
+  };
+}
+
+/**
+ * Whether a dashboard-created token can expire at `expiresAt`: in the future, and no later than
+ * the end of the UTC day the longest offered lifetime from today. The dashboard sends the end of
+ * the chosen UTC day.
+ */
+export function isAllowedPersonalAccessTokenExpiry(
+  expiresAt: Date,
+  now: Date = new Date()
+): boolean {
+  const { maxDays } = personalAccessTokenExpiryOptions();
+  const latest = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + maxDays + 1);
+  const time = expiresAt.getTime();
+  return time > now.getTime() && time <= latest;
+}
+
+function expiryLabel(days: number) {
+  if (days % 365 === 0) {
+    const years = days / 365;
+    return years === 1 ? "1 year" : `${years} years`;
+  }
+  return days === 1 ? "1 day" : `${days} days`;
+}
+
+/** The JSON body for a failed `rbac.authenticatePat`, explaining an expired token. */
+export function personalAccessTokenAuthFailureBody(failure: {
+  error: string;
+  code?: PersonalAccessTokenExpiry["code"];
+  expiredAt?: Date;
+}) {
+  if (failure.code && failure.expiredAt) {
+    return personalAccessTokenExpiryBody({ code: failure.code, expiredAt: failure.expiredAt });
+  }
+  return { error: failure.error };
+}
+
+/** The tokens page. The public origin, when set, is the one users can open from a CLI, CI log or email. */
+export function personalAccessTokensUrl() {
+  return `${env.PUBLIC_APP_ORIGIN ?? env.APP_ORIGIN}${personalAccessTokensPath()}`;
+}
+
+/** The 401 body for an expired token: a CLI login says to log in again, others where to make a new one. */
+export function personalAccessTokenExpiryBody(expiry: PersonalAccessTokenExpiry) {
+  return {
+    error: personalAccessTokenExpiryMessage(expiry, personalAccessTokensUrl()),
+    code: expiry.code,
+  };
+}
+
+/** Returns obfuscated access tokens that aren't revoked, including expired ones */
 export async function getValidPersonalAccessTokens(userId: string) {
   const personalAccessTokens = await prisma.personalAccessToken.findMany({
     select: {
@@ -42,6 +171,8 @@ export async function getValidPersonalAccessTokens(userId: string) {
       obfuscatedToken: true,
       createdAt: true,
       lastAccessedAt: true,
+      expiresAt: true,
+      idleTimeoutSeconds: true,
     },
     where: {
       userId,
@@ -55,6 +186,17 @@ export async function getValidPersonalAccessTokens(userId: string) {
     obfuscatedToken: pat.obfuscatedToken,
     createdAt: pat.createdAt,
     lastAccessedAt: pat.lastAccessedAt,
+    expiresAt: pat.expiresAt,
+    idleTimeoutLabel:
+      pat.idleTimeoutSeconds === null
+        ? null
+        : expiryLabel(Math.round(pat.idleTimeoutSeconds / SECONDS_PER_DAY)),
+    isExpired: personalAccessTokenExpiry(pat) !== undefined,
+    isExpiringSoon:
+      pat.expiresAt !== null &&
+      personalAccessTokenExpiry(pat) === undefined &&
+      pat.expiresAt.getTime() - Date.now() <=
+        PERSONAL_ACCESS_TOKEN_EXPIRING_SOON_DAYS * SECONDS_PER_DAY * 1000,
   }));
 }
 
@@ -62,12 +204,25 @@ export type ObfuscatedPersonalAccessToken = Awaited<
   ReturnType<typeof getValidPersonalAccessTokens>
 >[number];
 
-/** Gets a PersonalAccessToken from an Auth Code, this only works within 10 mins of the auth code being created */
-export async function getPersonalAccessTokenFromAuthorizationCode(authorizationCode: string) {
+/**
+ * Gets a PersonalAccessToken from an Auth Code, this only works within 10 mins of the auth code being created.
+ * Codes are single use: the request that discloses the token also deletes the code.
+ *
+ * A code minted with a PKCE challenge only discloses its token to a caller holding both the
+ * matching verifier and the approval code, which reaches only the browser that approved it.
+ * Codes minted without a challenge are only honoured until `CLI_LOGIN_LEGACY_UNTIL`.
+ */
+export async function getPersonalAccessTokenFromAuthorizationCode(
+  authorizationCode: string,
+  proof: { codeVerifier?: string; approvalCode?: string } = {}
+) {
   // Only allow authorization codes created within the short consent window.
   const validAfter = new Date(Date.now() - AUTHORIZATION_CODE_TTL_MS);
   const code = await prisma.authorizationCode.findFirst({
     select: {
+      id: true,
+      codeChallenge: true,
+      approvalCodeHash: true,
       personalAccessToken: true,
     },
     where: {
@@ -77,8 +232,12 @@ export async function getPersonalAccessTokenFromAuthorizationCode(authorizationC
       },
     },
   });
-  if (!code) {
+  if (!code || code.personalAccessToken?.revokedAt) {
     throw new Error("Invalid authorization code, or code expired");
+  }
+
+  if (!code.codeChallenge && !isLegacyCliLoginAllowed()) {
+    throw new Error(CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE);
   }
 
   //there's no PersonalAccessToken associated with this code
@@ -86,6 +245,24 @@ export async function getPersonalAccessTokenFromAuthorizationCode(authorizationC
     return {
       token: null,
     };
+  }
+
+  if (code.codeChallenge) {
+    const verified =
+      proof.codeVerifier !== undefined &&
+      proof.approvalCode !== undefined &&
+      code.approvalCodeHash !== null &&
+      safeEqual(codeChallengeFor(proof.codeVerifier), code.codeChallenge) &&
+      safeEqual(hashToken(normalizeApprovalCode(proof.approvalCode)), code.approvalCodeHash);
+
+    if (!verified) {
+      throw new Error("Invalid authorization code, or code expired");
+    }
+  }
+
+  const consumed = await prisma.authorizationCode.deleteMany({ where: { id: code.id } });
+  if (consumed.count === 0) {
+    throw new Error("Invalid authorization code, or code expired");
   }
 
   const decryptedToken = decryptPersonalAccessToken(code.personalAccessToken);
@@ -97,8 +274,15 @@ export async function getPersonalAccessTokenFromAuthorizationCode(authorizationC
   };
 }
 
-export async function revokePersonalAccessToken(tokenId: string, userId: string) {
-  const result = await prisma.personalAccessToken.updateMany({
+export async function revokePersonalAccessToken(
+  tokenId: string,
+  userId: string,
+  revocation: Pick<CredentialRevocation, "reason" | "revokedBy"> = {
+    reason: "revoked",
+    revokedBy: userActor(userId),
+  }
+) {
+  const revoked = await prisma.personalAccessToken.updateManyAndReturn({
     where: {
       id: tokenId,
       userId,
@@ -106,20 +290,55 @@ export async function revokePersonalAccessToken(tokenId: string, userId: string)
     data: {
       revokedAt: new Date(),
     },
+    select: { id: true, name: true, obfuscatedToken: true, hashedToken: true, revokedAt: true },
   });
 
-  if (result.count === 0) {
+  if (revoked.length === 0) {
     throw new Error("PAT not found or already revoked");
   }
+
+  markCredentialHashRevoked(revoked[0].hashedToken, {
+    ...revocation,
+    revokedAt: revoked[0].revokedAt ?? undefined,
+  });
+  auditLogs.record({
+    category: "credentials",
+    action: "pat.revoked",
+    ...patAuditFields(revoked[0], revocation.revokedBy ?? userActor(userId)),
+    // Directory sync revokes with no request behind it.
+    ...(revocation.revokedBy?.type === "system" ? { source: "system" as const } : {}),
+    changes: { reason: revocation.reason },
+  });
+}
+
+/**
+ * A PAT belongs to its user, not an organization, so its events have none and no organization's
+ * log shows them. The actor is named because some callers run with no session (CLI login, directory
+ * sync).
+ */
+function patAuditFields(
+  token: { id: string; name: string; obfuscatedToken: string },
+  actor: AuditLogActor
+) {
+  return {
+    organizationId: null,
+    target: { type: "pat", id: token.id, name: token.name },
+    keyLast4s: [token.obfuscatedToken.slice(-4)],
+    actor,
+  };
 }
 
 export type PersonalAccessTokenAuthenticationResult = {
   userId: string;
+  /** The PAT row id. Absent for delegated user-actor tokens. */
+  tokenId?: string;
   /**
    * Verified claims when the caller presented a delegated user-actor token. They ride on the
    * result so no caller can hold the actor without its environment scope.
    */
   userActor?: UserActorClaims;
+  /** When the PAT stops working, if it expires. Anything minted from it shouldn't outlive it. */
+  validUntil?: Date;
 };
 
 /**
@@ -135,32 +354,39 @@ export type PersonalAccessTokenAuthenticationResult = {
  * and the apiBuilder's RBAC-routed PAT flow (which gets `lastAccessedAt`
  * from `rbac.authenticatePat`'s result). Keeps the throttle policy in one
  * place rather than expecting every plugin implementer to re-implement it.
+ *
+ * Returns the last-used time now in effect: the cached value when it was fresh, otherwise now.
  */
 export async function updateLastAccessedAtIfStale(
   tokenId: string,
-  lastAccessedAt: Date | null
-): Promise<void> {
-  if (lastAccessedAt && Date.now() - lastAccessedAt.getTime() <= PAT_LAST_ACCESSED_THROTTLE_MS) {
-    return; // fresh — no roundtrip
+  lastAccessedAt: Date | null | undefined
+): Promise<Date> {
+  if (lastAccessedAt === undefined) {
+    const row = await prisma.personalAccessToken.findFirst({
+      where: { id: tokenId },
+      select: { lastAccessedAt: true },
+    });
+    lastAccessedAt = row?.lastAccessedAt ?? null;
   }
+  if (lastAccessedAt && Date.now() - lastAccessedAt.getTime() <= PAT_LAST_ACCESSED_THROTTLE_MS) {
+    return lastAccessedAt; // fresh — no roundtrip
+  }
+  const now = new Date();
+  // If a concurrent request wins the conditional write, it stored a time within the throttle
+  // window of `now`, so `now` is still the last-used time to within that window.
   await prisma.personalAccessToken.updateMany({
     where: {
       id: tokenId,
       revokedAt: null,
       OR: [
         { lastAccessedAt: null },
-        { lastAccessedAt: { lt: new Date(Date.now() - PAT_LAST_ACCESSED_THROTTLE_MS) } },
+        { lastAccessedAt: { lt: new Date(now.getTime() - PAT_LAST_ACCESSED_THROTTLE_MS) } },
       ],
     },
-    data: { lastAccessedAt: new Date() },
+    data: { lastAccessedAt: now },
   });
+  return now;
 }
-
-const EncryptedSecretValueSchema = z.object({
-  nonce: z.string(),
-  ciphertext: z.string(),
-  tag: z.string(),
-});
 
 const AuthorizationHeaderSchema = z.string().regex(/^Bearer .+$/);
 
@@ -185,7 +411,7 @@ export async function authenticateApiRequestWithPersonalAccessToken(
 
 export type AdminAuthenticationResult =
   | { ok: true; user: User }
-  | { ok: false; status: 401 | 403; message: string };
+  | { ok: false; status: 401 | 403; message: string; code?: string };
 
 /**
  * Authenticates a request via personal access token and checks the user is
@@ -199,6 +425,12 @@ export async function authenticateAdminRequest(
   const authResult = await authenticateApiRequestWithPersonalAccessToken(request);
 
   if (!authResult) {
+    noteAdminRequest(request, { actor: { kind: "unauthenticated" }, captureBody: false });
+    const expiry = await getPersonalAccessTokenExpiry(request);
+    if (expiry) {
+      const { error, code } = personalAccessTokenExpiryBody(expiry);
+      return { ok: false, status: 401, message: error, code };
+    }
     return { ok: false, status: 401, message: "Invalid or Missing API key" };
   }
 
@@ -207,8 +439,20 @@ export async function authenticateAdminRequest(
   });
 
   if (!user) {
+    noteAdminRequest(request, { actor: { kind: "unauthenticated" }, captureBody: false });
     return { ok: false, status: 401, message: "Invalid or Missing API key" };
   }
+
+  noteAdminRequest(request, {
+    actor: {
+      kind: "user_pat",
+      userId: user.id,
+      email: user.email,
+      isAdmin: user.admin,
+      tokenId: authResult.tokenId,
+    },
+    captureBody: user.admin,
+  });
 
   if (!user.admin) {
     return { ok: false, status: 403, message: "You must be an admin to perform this action" };
@@ -227,7 +471,7 @@ export async function requireAdminApiRequest(request: Request): Promise<User> {
   const result = await authenticateAdminRequest(request);
 
   if (!result.ok) {
-    throw new Response(JSON.stringify({ error: result.message }), {
+    throw new Response(JSON.stringify({ error: result.message, code: result.code }), {
       status: result.status,
       headers: { "Content-Type": "application/json" },
     });
@@ -270,7 +514,15 @@ export async function authenticatePersonalAccessToken(
     return;
   }
 
-  await updateLastAccessedAtIfStale(personalAccessToken.id, personalAccessToken.lastAccessedAt);
+  // Checked before the lastAccessedAt write, so a request can't revive an idle-expired token.
+  if (personalAccessTokenExpiry(personalAccessToken)) {
+    return;
+  }
+
+  const lastUsedAt = await updateLastAccessedAtIfStale(
+    personalAccessToken.id,
+    personalAccessToken.lastAccessedAt
+  );
 
   const decryptedToken = decryptPersonalAccessToken(personalAccessToken);
 
@@ -281,13 +533,57 @@ export async function authenticatePersonalAccessToken(
     return;
   }
 
+  if (await isMfaSetupRequired(personalAccessToken.userId)) {
+    throw json({ error: mfaSetupRequiredMessage() }, { status: 403 });
+  }
+
   return {
     userId: personalAccessToken.userId,
+    tokenId: personalAccessToken.id,
+    validUntil: personalAccessTokenValidUntil({
+      ...personalAccessToken,
+      lastAccessedAt: lastUsedAt,
+    }),
   };
 }
 
 export function isPersonalAccessToken(token: string) {
   return token.startsWith(tokenPrefix);
+}
+
+/**
+ * When the request's bearer is an unrevoked personal access token that has expired,
+ * returns why and when. Lets a route that already rejected the request explain why.
+ */
+export async function getPersonalAccessTokenExpiry(
+  request: Request
+): Promise<PersonalAccessTokenExpiry | undefined> {
+  const token = getPersonalAccessTokenFromRequest(request);
+  if (!token || !isPersonalAccessToken(token)) {
+    return;
+  }
+
+  const personalAccessToken = await $replica.personalAccessToken.findFirst({
+    where: { hashedToken: hashToken(token), revokedAt: null },
+    select: expiryColumns,
+  });
+  return personalAccessToken ? personalAccessTokenExpiry(personalAccessToken) : undefined;
+}
+
+/**
+ * The 401 for a request whose personal access token didn't authenticate. If the token expired,
+ * the body says when and where to make a new one; otherwise it carries `error`.
+ */
+export async function personalAccessTokenUnauthorizedResponse(
+  request: Request,
+  error = "Invalid or Missing Access Token"
+): Promise<Response> {
+  const expiry = await getPersonalAccessTokenExpiry(request);
+  const body = expiry ? personalAccessTokenExpiryBody(expiry) : { error };
+  return new Response(JSON.stringify(body), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 /**
@@ -298,12 +594,7 @@ export function isPersonalAccessToken(token: string) {
  */
 export async function assertSourcePatActive(claims: UserActorClaims): Promise<boolean> {
   if (!claims.pat) return true;
-
-  const found = await prisma.personalAccessToken.findFirst({
-    where: { id: claims.pat, revokedAt: null },
-    select: { id: true },
-  });
-  return Boolean(found);
+  return isPersonalAccessTokenActive(prisma, claims.pat);
 }
 
 /**
@@ -317,47 +608,125 @@ export async function assertSourcePatActive(claims: UserActorClaims): Promise<bo
  */
 export async function resolveAndRecheckUserActorClaims(
   claims: UserActorClaims | undefined,
-  bearer: string
+  bearer: string,
+  audience?: string
 ): Promise<UserActorClaims | undefined> {
-  const verified = await verifyUserActorToken(env.SESSION_SECRET, bearer);
-  const resolved = verified ?? claims;
+  const verified = await verifyUserActorToken(env.SESSION_SECRET, bearer, { audience });
+  const resolved = audience ? verified : (verified ?? claims);
   if (!resolved) return undefined;
   return (await assertSourcePatActive(resolved)) ? resolved : undefined;
 }
 
+export const CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE =
+  "This version of the Trigger.dev CLI can no longer log in. Upgrade to the latest version (npx trigger.dev@latest login) and try again.";
+
+/** Whether codes minted without a PKCE challenge, by CLIs that predate it, are still honoured. */
+export function isLegacyCliLoginAllowed(now = new Date()) {
+  return now < new Date(env.CLI_LOGIN_LEGACY_UNTIL);
+}
+
+/** Uppercase without 0, 1, I and O, so an approval code survives being read and retyped. */
+const approvalCodeGenerator = customAlphabet("23456789ABCDEFGHJKLMNPQRSTUVWXYZ", 12);
+
+/** Formats an approval code for display as XXXX-XXXX-XXXX. */
+function formatApprovalCode(approvalCode: string) {
+  return approvalCode.match(/.{1,4}/g)!.join("-");
+}
+
+/** Accepts an approval code as typed or pasted: any case, with or without separators. */
+function normalizeApprovalCode(approvalCode: string) {
+  return approvalCode.toUpperCase().replace(/[^0-9A-Z]/g, "");
+}
+
+export function codeChallengeFor(codeVerifier: string) {
+  return createHash("sha256").update(codeVerifier).digest("base64url");
+}
+
+export function safeEqual(a: string, b: string) {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
 /**
- * Read-only check that an authorization code is still mintable: it exists, is
+ * Read-only lookup of an authorization code that is still mintable: it exists, is
  * unconsumed (`personalAccessTokenId: null`), and within the TTL. Lets the
  * consent-screen loader show Authorize vs expired/invalid without minting a PAT.
+ * Returns null when the code can't be approved.
  */
-export async function isAuthorizationCodeMintable(
+export async function getMintableAuthorizationCode(
   authorizationCode: string,
   prismaClient = prisma
-): Promise<boolean> {
+): Promise<{ legacy: boolean; createdAt: Date; requesterIp: string | null } | null> {
   const validAfter = new Date(Date.now() - AUTHORIZATION_CODE_TTL_MS);
   const code = await prismaClient.authorizationCode.findFirst({
     where: {
       code: authorizationCode,
       personalAccessTokenId: null,
+      oauthClientId: null,
       createdAt: { gte: validAfter },
     },
-    select: { id: true },
+    select: { codeChallenge: true, createdAt: true, requesterIp: true },
   });
-  return code !== null;
+
+  if (!code) {
+    return null;
+  }
+
+  const legacy = code.codeChallenge === null;
+  if (legacy && !isLegacyCliLoginAllowed()) {
+    return null;
+  }
+
+  return { legacy, createdAt: code.createdAt, requesterIp: code.requesterIp };
 }
 
-export function createAuthorizationCode() {
+/**
+ * The requester IP is shown on the consent page and in the authorized-login email, so a value
+ * that isn't an IP address (a forged `X-Forwarded-For` on an install without a proxy) isn't stored.
+ */
+export function createAuthorizationCode(
+  options: Partial<Pick<CreateAuthorizationCodeRequest, "codeChallenge" | "callbackPort">> & {
+    requesterIp?: string | null;
+  } = {}
+) {
+  const requesterIp = options.requesterIp?.trim();
   return prisma.authorizationCode.create({
     data: {
       code: nanoid(64),
+      codeChallenge: options.codeChallenge,
+      callbackPort: options.callbackPort,
+      requesterIp: requesterIp && isIP(requesterIp) !== 0 ? requesterIp : undefined,
     },
   });
 }
 
-/** Creates a PersonalAccessToken from an Auth Code, and return the token. We only ever return the unencrypted token once. */
+/** The approver is on a different network from the one that started the login and hasn't confirmed it. */
+export class CliLoginNetworkConfirmationRequiredError extends Error {
+  constructor() {
+    super(
+      "This login was started from a different network. Confirm you started it on another machine before authorizing it."
+    );
+    this.name = "CliLoginNetworkConfirmationRequiredError";
+  }
+}
+
+/**
+ * Mints a new PersonalAccessToken for an Auth Code. Every authorization gets its own token, so a
+ * login never hands out a secret that another CLI or MCP client is already using.
+ *
+ * For a code minted with a PKCE challenge it also issues the approval code the client needs to
+ * exchange the code. The caller hands it to the approving browser only: by redirect to the
+ * client's loopback `callbackPort`, or on the page for the user to paste.
+ *
+ * Compares the approver's network with the one that minted the code. With
+ * `CLI_LOGIN_NETWORK_CHECK=confirm` a login from another network needs `confirmedDifferentNetwork`;
+ * with `log` only the outcome (never the addresses) is logged.
+ */
 export async function createPersonalAccessTokenFromAuthorizationCode(
   authorizationCode: string,
-  userId: string
+  userId: string,
+  approval: { approverIp?: string | null; confirmedDifferentNetwork?: boolean } = {}
 ) {
   // Only allow authorization codes created within the short consent window.
   const validAfter = new Date(Date.now() - AUTHORIZATION_CODE_TTL_MS);
@@ -365,6 +734,7 @@ export async function createPersonalAccessTokenFromAuthorizationCode(
     where: {
       code: authorizationCode,
       personalAccessTokenId: null,
+      oauthClientId: null,
       createdAt: {
         gte: validAfter,
       },
@@ -375,79 +745,155 @@ export async function createPersonalAccessTokenFromAuthorizationCode(
     throw new Error("Invalid authorization code, code already used, or code expired");
   }
 
-  const existingCliPersonalAccessToken = await prisma.personalAccessToken.findFirst({
-    where: {
-      userId,
-      name: "cli",
-    },
-  });
+  if (!code.codeChallenge && !isLegacyCliLoginAllowed()) {
+    throw new Error(CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE);
+  }
 
-  //we only allow you to have one CLI PAT at a time, so return this
-  if (existingCliPersonalAccessToken) {
-    //associate this authorization code with the existing personal access token
-    await prisma.authorizationCode.update({
-      where: {
-        code: authorizationCode,
-      },
-      data: {
-        personalAccessTokenId: existingCliPersonalAccessToken.id,
-      },
+  const approvalCode = code.codeChallenge ? approvalCodeGenerator() : undefined;
+
+  const networkMatch = compareCliLoginNetworks(code.requesterIp, approval.approverIp);
+
+  if (env.CLI_LOGIN_NETWORK_CHECK !== "off") {
+    logger.info("CLI login network check", {
+      networkMatch,
+      mode: env.CLI_LOGIN_NETWORK_CHECK,
+      confirmedDifferentNetwork: approval.confirmedDifferentNetwork === true,
     });
+  }
 
-    if (existingCliPersonalAccessToken.revokedAt) {
-      // re-activate revoked CLI PAT so we can use it again
-      await prisma.personalAccessToken.update({
-        where: {
-          id: existingCliPersonalAccessToken.id,
-        },
-        data: {
-          revokedAt: null,
-        },
-      });
-    }
-
-    //we don't return the decrypted token
-    return {
-      id: existingCliPersonalAccessToken.id,
-      name: existingCliPersonalAccessToken.name,
-      userId: existingCliPersonalAccessToken.userId,
-      obfuscateToken: existingCliPersonalAccessToken.obfuscatedToken,
-    };
+  if (
+    env.CLI_LOGIN_NETWORK_CHECK === "confirm" &&
+    needsNetworkConfirmation(networkMatch) &&
+    approval.confirmedDifferentNetwork !== true
+  ) {
+    throw new CliLoginNetworkConfirmationRequiredError();
   }
 
   const token = await createPersonalAccessToken({
     name: "cli",
     userId,
+    auditLogSource: "cli",
+    auditSource: { ip: approval.approverIp ?? null, userAgent: null },
+    idleTimeoutSeconds:
+      env.CLI_LOGIN_IDLE_TIMEOUT_DAYS > 0
+        ? env.CLI_LOGIN_IDLE_TIMEOUT_DAYS * SECONDS_PER_DAY
+        : undefined,
   });
 
-  await prisma.authorizationCode.update({
+  const bound = await prisma.authorizationCode.updateMany({
     where: {
-      code: authorizationCode,
+      id: code.id,
+      personalAccessTokenId: null,
     },
     data: {
       personalAccessTokenId: token.id,
+      approvalCodeHash: approvalCode ? hashToken(approvalCode) : undefined,
     },
   });
 
-  return token;
+  if (bound.count === 0) {
+    await revokePersonalAccessToken(token.id, userId);
+    throw new Error("Invalid authorization code, code already used, or code expired");
+  }
+
+  return {
+    ...token,
+    requesterIp: code.requesterIp,
+    networkMatch,
+    approval: approvalCode
+      ? { approvalCode: formatApprovalCode(approvalCode), callbackPort: code.callbackPort }
+      : undefined,
+  };
+}
+
+/** Deletes one page of authorization codes created before the cutoff. */
+function deleteExpiredAuthorizationCodesPage(
+  prismaClient: PrismaClientOrTransaction,
+  cutoff: Date,
+  batchSize: number
+): Promise<number> {
+  return prismaClient.$executeRaw`
+    WITH page AS (
+      SELECT id FROM "AuthorizationCode"
+      WHERE "createdAt" < ${cutoff}
+      LIMIT ${batchSize}
+      FOR UPDATE SKIP LOCKED
+    )
+    DELETE FROM "AuthorizationCode" a
+    USING page WHERE a.id = page.id
+  `;
+}
+
+/**
+ * Deletes authorization codes past their TTL, which can no longer be approved or exchanged, so
+ * abandoned logins don't keep their requester IP. Bounded per run so a large backlog drains over
+ * several runs.
+ */
+export async function sweepExpiredAuthorizationCodes(
+  prismaClient: PrismaClientOrTransaction = prisma,
+  options: { batchSize?: number; maxPages?: number; now?: Date } = {}
+): Promise<{ deleted: number; pages: number }> {
+  const { batchSize = 1000, maxPages = 50, now = new Date() } = options;
+  const cutoff = new Date(now.getTime() - AUTHORIZATION_CODE_TTL_MS);
+  let deleted = 0;
+  let pages = 0;
+
+  while (pages < maxPages) {
+    const count = await deleteExpiredAuthorizationCodesPage(prismaClient, cutoff, batchSize);
+    pages++;
+    deleted += count;
+    if (count < batchSize) break;
+  }
+
+  if (deleted > 0) {
+    logger.info("Deleted expired authorization codes", { deleted, pages });
+  }
+
+  return { deleted, pages };
 }
 
 /** Created a new PersonalAccessToken, and return the token. We only ever return the unencrypted token once. */
-export async function createPersonalAccessToken({
-  name,
-  userId,
-  roleId,
-}: CreatePersonalAccessTokenOptions) {
+export async function createPersonalAccessToken(
+  {
+    name,
+    userId,
+    roleId,
+    auditSource,
+    expiresAt,
+    idleTimeoutSeconds,
+    oauthClientId,
+    skipAudit,
+    auditLogSource,
+  }: CreatePersonalAccessTokenOptions,
+  prismaClient: PrismaClientOrTransaction = prisma
+) {
   const token = createToken();
-  const encryptedToken = encryptToken(token, env.ENCRYPTION_KEY);
+  const encryptedToken = encryptToken(token, env.ENCRYPTION_KEYRING);
+  // The id is chosen here so the token's fingerprint can name it.
+  const tokenId = cuid();
+  await saveCredentialFingerprint({
+    kind: "pat",
+    value: token,
+    organizationId: null,
+    projectId: null,
+    environmentId: null,
+    credentialId: tokenId,
+    name,
+    createdBy: userActor(userId),
+    expiresAt,
+  });
 
-  const personalAccessToken = await prisma.personalAccessToken.create({
+  const personalAccessToken = await prismaClient.personalAccessToken.create({
     data: {
+      id: tokenId,
       name,
       userId,
       encryptedToken,
       obfuscatedToken: obfuscateToken(token),
       hashedToken: hashToken(token),
+      oauthClientId,
+      expiresAt,
+      idleTimeoutSeconds,
     },
   });
 
@@ -481,6 +927,10 @@ export async function createPersonalAccessToken({
             deleteError: err instanceof Error ? err.message : String(err),
           });
         });
+      markCredentialHashRevoked(personalAccessToken.hashedToken, {
+        revokedBy: SYSTEM_ACTOR,
+        reason: "revoked",
+      });
       throw new Error(`Failed to assign role to access token: ${roleResult.error}`);
     }
   } else if (roleId) {
@@ -490,12 +940,29 @@ export async function createPersonalAccessToken({
     });
   }
 
+  if (!skipAudit) {
+    void recordAdminPatCreated({
+      userId,
+      tokenId: personalAccessToken.id,
+      name,
+      source: auditSource,
+    });
+    auditLogs.record({
+      category: "credentials",
+      action: "pat.created",
+      ...patAuditFields(personalAccessToken, userActor(userId)),
+      ...(auditLogSource ? { source: auditLogSource } : {}),
+      changes: { expiresAt: personalAccessToken.expiresAt?.toISOString() ?? null },
+    });
+  }
+
   return {
     id: personalAccessToken.id,
     name,
     userId,
     token,
     obfuscatedToken: personalAccessToken.obfuscatedToken,
+    expiresAt: personalAccessToken.expiresAt,
   };
 }
 
@@ -523,11 +990,6 @@ function decryptPersonalAccessToken(personalAccessToken: PersonalAccessToken) {
     );
   }
 
-  const decryptedToken = decryptToken(
-    encryptedData.data.nonce,
-    encryptedData.data.ciphertext,
-    encryptedData.data.tag,
-    env.ENCRYPTION_KEY
-  );
+  const decryptedToken = decryptToken(encryptedData.data, env.ENCRYPTION_KEYRING);
   return decryptedToken;
 }
